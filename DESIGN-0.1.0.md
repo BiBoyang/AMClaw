@@ -64,7 +64,7 @@
 
 建议采用单进程、分层模块架构（保持 Demo 简洁）：
 
-1. `wechat_gateway`：微信登录、轮询、发送回执。
+1. `chat_gateway`：聊天应用登录、轮询、发送回执。
 2. `command_router`：解析微信文本，抽取 URL 与命令。
 3. `task_store`：SQLite 持久化任务、文章、日志。
 4. `scheduler`：每日定时触发整理任务。
@@ -78,7 +78,7 @@
 
 ### 5.1 实时入库流
 
-1. 微信消息进入 `wechat_gateway`。
+1. 微信消息进入 `chat_gateway`。
 2. `command_router` 提取 URL。
 3. 规范化 URL（去尾斜杠、去追踪参数等策略待定）。
 4. 写入 `articles` 与 `tasks`，初始状态 `pending`。

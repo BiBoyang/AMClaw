@@ -28,10 +28,10 @@
 1. `src/main.rs`
    - 进程入口与信号处理
    - 调用微信运行入口
-2. `src/wechat/`
+2. `src/chat_adapter/`
    - 现有实现：登录、轮询、消息收发
-3. `src/wechat_gateway/`
-   - 架构目标：微信接入层（替代/演进当前 wechat 模块）
+3. `src/chat_gateway/`
+   - 架构目标：多聊天应用接入层（替代/演进当前 chat_adapter 模块）
 4. `src/command_router/`
    - 架构目标：消息命令解析与 URL 提取
 5. `src/task_store/`
@@ -69,3 +69,35 @@ cargo clippy --all-targets --all-features
 ```bash
 cargo run
 ```
+
+## 大改动全流程回归（必须）
+
+当出现以下任一情况，视为“大改动”，必须执行一次完整人工回归后再合并：
+
+1. 改动 `src/chat_adapter/` 或 `src/chat_gateway/` 的登录、轮询、收发逻辑。
+2. 改动消息解析、去重、`context_token` 相关逻辑。
+3. 改动主流程入口（`src/main.rs`）或关键配置字段。
+4. 改动可能影响端到端链路稳定性的依赖与网络调用代码。
+
+执行步骤（按顺序）：
+
+1. 执行基础静态校验：
+   ```bash
+   cargo check
+   cargo fmt --check
+   cargo clippy --all-targets --all-features
+   ```
+2. 启动程序并走登录流程：
+   ```bash
+   cargo run
+   ```
+3. 看到终端输出二维码 URL，使用微信扫码并确认登录。
+4. 验证登录成功日志（含 bot_id / user_id），并进入“开始接收消息，长轮询中”状态。
+5. 从微信发送一条文本消息（如“你好”），验证程序收到消息并自动回复。
+6. 再发送同一条消息或触发重复投递场景，验证不会重复回复。
+7. 使用 `Ctrl+C` 结束进程，验证出现优雅退出日志且进程正常结束。
+
+通过标准：
+
+1. 登录、收消息、回复、去重、优雅退出 5 个环节全部通过。
+2. 终端无 panic、无未处理错误退出。

@@ -1,5 +1,7 @@
 # AGENTS.md
 
+@scope:src/chat_adapter:v1
+
 ## 模块定位
 
 当前微信能力实现目录，负责 iLink 登录、长轮询、消息解析与发送回复。

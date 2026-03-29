@@ -1,5 +1,7 @@
 # AGENTS.md
 
+@scope:src/command_router:v1
+
 ## 模块定位
 
 命令路由层，负责从微信文本中提取命令与 URL。

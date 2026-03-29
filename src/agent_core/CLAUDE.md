@@ -1,5 +1,7 @@
 # AGENTS.md
 
+@scope:src/agent_core:v1
+
 ## 模块定位
 
 Agent 核心编排层，负责 LLM 调用、工具调度与结果整合。

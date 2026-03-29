@@ -1,5 +1,7 @@
 # AGENTS.md
 
+@scope:src/tool_registry:v1
+
 ## 模块定位
 
 工具注册层，声明可用工具、参数契约与风险等级。

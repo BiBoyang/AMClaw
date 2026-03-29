@@ -1,5 +1,7 @@
 # AGENTS.md
 
+@scope:src/chat_gateway:v1
+
 ## 模块定位
 
 聊天应用接入层，承接“登录、收消息、发消息”的对外边界。

@@ -1,3 +1,4 @@
+use crate::agent_core::AgentCore;
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -312,6 +313,7 @@ impl ILinkClient {
 }
 
 struct WeChatBot {
+    agent_core: AgentCore,
     client: ILinkClient,
     context_token_map: HashMap<String, String>,
     cursor: String,
@@ -322,7 +324,9 @@ struct WeChatBot {
 
 impl WeChatBot {
     fn new(running: Arc<AtomicBool>) -> Result<Self> {
+        let workspace_root = std::env::current_dir().context("获取工作目录失败")?;
         Ok(Self {
+            agent_core: AgentCore::new(workspace_root)?,
             client: ILinkClient::new()?,
             context_token_map: HashMap::new(),
             cursor: String::new(),
@@ -445,6 +449,12 @@ impl WeChatBot {
     }
 
     fn generate_reply(&self, user_text: &str) -> String {
+        if is_agent_command(user_text) {
+            return match self.agent_core.run(user_text) {
+                Ok(result) => result,
+                Err(err) => format!("执行失败: {err}"),
+            };
+        }
         if user_text == "hello" || user_text == "你好" {
             return "你好！我是 iLink Bot Demo（Rust版），有什么可以帮你的？".to_string();
         }
@@ -458,6 +468,20 @@ impl WeChatBot {
         }
         format!("Echo: {user_text}")
     }
+}
+
+fn is_agent_command(text: &str) -> bool {
+    let raw = text.trim();
+    raw.starts_with("读文件 ")
+        || raw.starts_with("创建文件 ")
+        || raw.starts_with("写文件 ")
+        || raw.starts_with("read ")
+        || raw.starts_with("create ")
+        || raw.starts_with("write ")
+        || raw.starts_with("帮我运行：")
+        || raw.starts_with("帮我运行:")
+        || raw.starts_with("请帮我运行：")
+        || raw.starts_with("请帮我运行:")
 }
 
 fn assert_ok(resp: &Value, action: &str) -> Result<()> {

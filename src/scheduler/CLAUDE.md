@@ -1,5 +1,7 @@
 # AGENTS.md
 
+@scope:src/scheduler:v1
+
 ## 模块定位
 
 定时调度层，触发每日汇总与周期性后台任务。

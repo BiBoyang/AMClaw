@@ -1,5 +1,7 @@
 # AGENTS.md
 
+@scope:src/task_store:v1
+
 ## 模块定位
 
 持久化层，管理文章、任务、去重记录与报告索引。

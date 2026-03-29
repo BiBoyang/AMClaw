@@ -1,5 +1,7 @@
 # AGENTS.md
 
+@scope:src/mode_policy:v1
+
 ## 模块定位
 
 模式策略层，统一判定 restricted/unrestricted 下的行为权限。

@@ -1,9 +1,19 @@
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+mod agent_core;
 mod chat_adapter;
+mod tool_registry;
 
 fn main() -> Result<()> {
+    if let Ok(command) = std::env::var("AMCLAW_AGENT_DEMO_COMMAND") {
+        let workspace_root = std::env::current_dir().context("获取当前目录失败")?;
+        let agent = agent_core::AgentCore::new(workspace_root)?;
+        let output = agent.run(&command)?;
+        println!("[AgentDemo] {output}");
+        return Ok(());
+    }
+
     let running = Arc::new(AtomicBool::new(true));
     {
         let running = Arc::clone(&running);

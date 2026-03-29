@@ -1,5 +1,7 @@
 # AGENTS.md
 
+@scope:src/reporter:v1
+
 ## 模块定位
 
 报告层，负责每日汇总内容生成与输出格式组织。

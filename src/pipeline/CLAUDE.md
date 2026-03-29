@@ -1,5 +1,7 @@
 # AGENTS.md
 
+@scope:src/pipeline:v1
+
 ## 模块定位
 
 处理流水线层，负责“快照 -> 抽取 -> 分类 -> 归档”。

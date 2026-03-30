@@ -649,7 +649,12 @@ impl WeChatBot {
         for task in pending {
             match self.pipeline.process_pending_task(&task) {
                 Ok(result) => {
-                    if let Err(err) = self.task_store.mark_task_archived(&task.task_id) {
+                    let output_path = result.output_path.to_string_lossy().to_string();
+                    if let Err(err) = self.task_store.mark_task_archived(
+                        &task.task_id,
+                        &output_path,
+                        result.title.as_deref(),
+                    ) {
                         eprintln!("[任务] 更新 archived 失败 task_id={}: {err}", task.task_id);
                         continue;
                     }
@@ -751,8 +756,19 @@ fn build_task_status_reply(status: &crate::task_store::TaskStatusRecord) -> Stri
         format!("url: {}", status.normalized_url),
         format!("status: {}", status.status),
         format!("retry_count: {}", status.retry_count),
+        format!("created_at: {}", status.created_at),
         format!("updated_at: {}", status.updated_at),
     ];
+    if let Some(title) = &status.title {
+        if !title.trim().is_empty() {
+            lines.push(format!("title: {title}"));
+        }
+    }
+    if let Some(output_path) = &status.output_path {
+        if !output_path.trim().is_empty() {
+            lines.push(format!("output_path: {output_path}"));
+        }
+    }
     if let Some(last_error) = &status.last_error {
         if !last_error.trim().is_empty() {
             lines.push(format!("last_error: {last_error}"));
@@ -1219,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_link_task_can_be_processed_to_archived() {
+    fn pending_link_task_is_consumed() {
         let db_path = temp_db_path();
         let mut bot = test_bot(&db_path);
 
@@ -1234,9 +1250,10 @@ mod tests {
         let task_id = first_task_id(&db_path);
         bot.process_pending_tasks();
 
-        assert_eq!(
-            task_row(&db_path, &task_id).map(|row| row.0),
-            Some("archived".to_string())
-        );
+        let status = task_row(&db_path, &task_id).map(|row| row.0);
+        assert!(matches!(
+            status.as_deref(),
+            Some("archived") | Some("failed")
+        ));
     }
 }

@@ -21,9 +21,11 @@ pub struct TaskStatusRecord {
     pub task_id: String,
     pub article_id: String,
     pub normalized_url: String,
+    pub title: Option<String>,
     pub status: String,
     pub retry_count: i64,
     pub last_error: Option<String>,
+    pub output_path: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -178,7 +180,7 @@ impl TaskStore {
             .conn
             .query_row(
                 r#"
-                SELECT t.id, t.article_id, a.normalized_url, t.status, t.retry_count, t.last_error, t.created_at, t.updated_at
+                SELECT t.id, t.article_id, a.normalized_url, a.title, t.status, t.retry_count, t.last_error, t.output_path, t.created_at, t.updated_at
                 FROM tasks t
                 JOIN articles a ON a.id = t.article_id
                 WHERE t.id = ?1
@@ -189,11 +191,13 @@ impl TaskStore {
                         task_id: row.get(0)?,
                         article_id: row.get(1)?,
                         normalized_url: row.get(2)?,
-                        status: row.get(3)?,
-                        retry_count: row.get(4)?,
-                        last_error: row.get(5)?,
-                        created_at: row.get(6)?,
-                        updated_at: row.get(7)?,
+                        title: row.get(3)?,
+                        status: row.get(4)?,
+                        retry_count: row.get(5)?,
+                        last_error: row.get(6)?,
+                        output_path: row.get(7)?,
+                        created_at: row.get(8)?,
+                        updated_at: row.get(9)?,
                     })
                 },
             )
@@ -257,7 +261,7 @@ impl TaskStore {
         let task = tx
             .query_row(
                 r#"
-                SELECT t.id, t.article_id, a.normalized_url, t.status, t.retry_count, t.last_error, t.created_at, t.updated_at
+                SELECT t.id, t.article_id, a.normalized_url, a.title, t.status, t.retry_count, t.last_error, t.output_path, t.created_at, t.updated_at
                 FROM tasks t
                 JOIN articles a ON a.id = t.article_id
                 WHERE t.id = ?1
@@ -268,11 +272,13 @@ impl TaskStore {
                         task_id: row.get(0)?,
                         article_id: row.get(1)?,
                         normalized_url: row.get(2)?,
-                        status: row.get(3)?,
-                        retry_count: row.get(4)?,
-                        last_error: row.get(5)?,
-                        created_at: row.get(6)?,
-                        updated_at: row.get(7)?,
+                        title: row.get(3)?,
+                        status: row.get(4)?,
+                        retry_count: row.get(5)?,
+                        last_error: row.get(6)?,
+                        output_path: row.get(7)?,
+                        created_at: row.get(8)?,
+                        updated_at: row.get(9)?,
                     })
                 },
             )
@@ -314,15 +320,36 @@ impl TaskStore {
         Ok(tasks)
     }
 
-    pub fn mark_task_archived(&mut self, task_id: &str) -> Result<bool> {
+    pub fn mark_task_archived(
+        &mut self,
+        task_id: &str,
+        output_path: &str,
+        title: Option<&str>,
+    ) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
-        let updated = self
-            .conn
+        let tx = self.conn.transaction().context("开启 archived 事务失败")?;
+        let updated = tx
             .execute(
-                "UPDATE tasks SET status = 'archived', last_error = NULL, updated_at = ?2 WHERE id = ?1",
-                params![task_id, now],
+                "UPDATE tasks SET status = 'archived', last_error = NULL, output_path = ?2, updated_at = ?3 WHERE id = ?1",
+                params![task_id, output_path, now.clone()],
             )
             .context("更新 archived 状态失败")?;
+        if updated == 0 {
+            tx.rollback().context("回滚不存在任务 archived 事务失败")?;
+            return Ok(false);
+        }
+        if let Some(title) = title.filter(|v| !v.trim().is_empty()) {
+            tx.execute(
+                r#"
+                UPDATE articles
+                SET title = COALESCE(title, ?2), updated_at = ?3
+                WHERE id = (SELECT article_id FROM tasks WHERE id = ?1)
+                "#,
+                params![task_id, title, now.clone()],
+            )
+            .context("更新文章标题失败")?;
+        }
+        tx.commit().context("提交 archived 事务失败")?;
         Ok(updated > 0)
     }
 
@@ -331,7 +358,7 @@ impl TaskStore {
         let updated = self
             .conn
             .execute(
-                "UPDATE tasks SET status = 'failed', last_error = ?2, updated_at = ?3 WHERE id = ?1",
+                "UPDATE tasks SET status = 'failed', last_error = ?2, output_path = NULL, updated_at = ?3 WHERE id = ?1",
                 params![task_id, last_error, now],
             )
             .context("更新 failed 状态失败")?;
@@ -360,6 +387,7 @@ impl TaskStore {
                 status       TEXT NOT NULL DEFAULT 'pending',
                 retry_count  INTEGER NOT NULL DEFAULT 0,
                 last_error   TEXT,
+                output_path  TEXT,
                 created_at   DATETIME NOT NULL,
                 updated_at   DATETIME NOT NULL
             );
@@ -393,8 +421,35 @@ impl TaskStore {
             "#,
             )
             .context("初始化 SQLite 表结构失败")?;
+        ensure_column_exists(&self.conn, "tasks", "output_path", "TEXT")?;
         Ok(())
     }
+}
+
+fn ensure_column_exists(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_def: &str,
+) -> Result<()> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = conn
+        .prepare(&pragma)
+        .with_context(|| format!("准备表结构检查失败: {table}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .with_context(|| format!("读取表结构失败: {table}"))?;
+
+    for row in rows {
+        if row.context("读取列名失败")? == column {
+            return Ok(());
+        }
+    }
+
+    let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {column_def}");
+    conn.execute(&sql, [])
+        .with_context(|| format!("补充列失败: {table}.{column}"))?;
+    Ok(())
 }
 
 fn normalize_url(input: &str) -> Result<String> {
@@ -656,9 +711,11 @@ mod tests {
                 task_id: created.task_id.clone(),
                 article_id: created.article_id.clone(),
                 normalized_url: "https://example.com/status".to_string(),
+                title: None,
                 status: "pending".to_string(),
                 retry_count: 0,
                 last_error: None,
+                output_path: None,
                 created_at: status.created_at.clone(),
                 updated_at: status.updated_at.clone(),
             }
@@ -769,7 +826,7 @@ mod tests {
         );
 
         assert!(store
-            .mark_task_archived(&created.task_id)
+            .mark_task_archived(&created.task_id, "/tmp/example.md", Some("Example Title"),)
             .expect("更新 archived 状态失败"));
 
         let pending_after = store.list_pending_tasks(10).expect("查询 pending 失败");
@@ -780,6 +837,8 @@ mod tests {
 
         assert!(pending_after.is_empty());
         assert_eq!(status.status, "archived");
+        assert_eq!(status.output_path, Some("/tmp/example.md".to_string()));
+        assert_eq!(status.title, Some("Example Title".to_string()));
     }
 
     #[test]

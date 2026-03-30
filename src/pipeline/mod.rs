@@ -1,8 +1,13 @@
 use crate::task_store::PendingTaskRecord;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
+use reqwest::blocking::Client;
+use reqwest::header::LOCATION;
+use reqwest::redirect::Policy;
+use reqwest::Url;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct Pipeline {
@@ -12,6 +17,8 @@ pub struct Pipeline {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineResult {
     pub output_path: PathBuf,
+    pub raw_path: PathBuf,
+    pub title: Option<String>,
 }
 
 impl Pipeline {
@@ -22,30 +29,153 @@ impl Pipeline {
     }
 
     pub fn process_pending_task(&self, task: &PendingTaskRecord) -> Result<PipelineResult> {
+        let html = self.fetch_html(&task.normalized_url)?;
+        self.archive_html(task, &html)
+    }
+
+    fn fetch_html(&self, url: &str) -> Result<String> {
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .redirect(Policy::none())
+            .build()
+            .context("创建 pipeline HTTP 客户端失败")?;
+        let response = client
+            .get(url)
+            .send()
+            .with_context(|| format!("抓取页面失败: {url}"))?;
+        let status = response.status();
+        if status.is_redirection() {
+            if let Some(location) = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|v| v.to_str().ok())
+            {
+                detect_wechat_redirect(location)?;
+            }
+            bail!("抓取页面失败: HTTP {} {}", status.as_u16(), url);
+        }
+        if !status.is_success() {
+            bail!("抓取页面失败: HTTP {} {}", status.as_u16(), url);
+        }
+        let html = response.text().context("读取页面正文失败")?;
+        detect_wechat_error_page(url, &html)?;
+        Ok(html)
+    }
+
+    fn archive_html(&self, task: &PendingTaskRecord, html: &str) -> Result<PipelineResult> {
         let day = Utc::now().format("%Y-%m-%d").to_string();
+        let raw_dir = self.root_dir.join("raw").join(&day);
         let output_dir = self.root_dir.join("processed").join(day);
+        fs::create_dir_all(&raw_dir)
+            .with_context(|| format!("创建原始目录失败: {}", raw_dir.display()))?;
         fs::create_dir_all(&output_dir)
             .with_context(|| format!("创建归档目录失败: {}", output_dir.display()))?;
 
+        let raw_path = raw_dir.join(format!("{}.html", task.task_id));
         let output_path = output_dir.join(format!("{}.md", task.task_id));
+        fs::write(&raw_path, html)
+            .with_context(|| format!("写入原始文件失败: {}", raw_path.display()))?;
+
+        let title = extract_html_title(html);
         let content = format!(
-            "# Archived Link\n\n- task_id: {}\n- article_id: {}\n- normalized_url: {}\n- original_url: {}\n- archived_at: {}\n",
+            "# Archived Link\n\n- task_id: {}\n- article_id: {}\n- normalized_url: {}\n- original_url: {}\n- title: {}\n- archived_at: {}\n\n## Preview\n\n{}\n",
             task.task_id,
             task.article_id,
             task.normalized_url,
             task.original_url,
-            Utc::now().to_rfc3339()
+            title.clone().unwrap_or_else(|| "(none)".to_string()),
+            Utc::now().to_rfc3339(),
+            preview_text(html),
         );
         fs::write(&output_path, content)
             .with_context(|| format!("写入归档文件失败: {}", output_path.display()))?;
 
-        Ok(PipelineResult { output_path })
+        Ok(PipelineResult {
+            output_path,
+            raw_path,
+            title,
+        })
     }
+}
+
+fn extract_html_title(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let start = lower.find("<title>")?;
+    let end = lower[start + 7..].find("</title>")?;
+    let raw = &html[start + 7..start + 7 + end];
+    let title = raw.replace('\n', " ").replace('\r', " ");
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty() {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+fn preview_text(html: &str) -> String {
+    let text = html
+        .replace('\n', " ")
+        .replace('\r', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut preview: String = text.chars().take(240).collect();
+    if text.chars().count() > 240 {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn detect_wechat_redirect(location: &str) -> Result<()> {
+    let parsed = Url::parse(location)
+        .or_else(|_| Url::parse(&format!("https://mp.weixin.qq.com{location}")))
+        .ok();
+    let Some(url) = parsed else {
+        return Ok(());
+    };
+    if url.domain() != Some("mp.weixin.qq.com") {
+        return Ok(());
+    }
+    let path = url.path();
+    if path.contains("wappoc_appmsgcaptcha") {
+        bail!("微信公众号页面需要验证码验证");
+    }
+    if path.contains("mp/appmsg/show") || path.contains("mp/profile_ext") {
+        bail!("微信公众号页面跳转到受限页面");
+    }
+    Ok(())
+}
+
+fn detect_wechat_error_page(url: &str, html: &str) -> Result<()> {
+    let parsed = Url::parse(url).ok();
+    if parsed.as_ref().and_then(Url::domain) != Some("mp.weixin.qq.com") {
+        return Ok(());
+    }
+
+    let title = extract_html_title(html).unwrap_or_default();
+    let text = preview_text(html);
+
+    if title.contains("未知错误") || text.contains("未知错误，请稍后再试") {
+        bail!("微信公众号页面返回错误页");
+    }
+    if text.contains("你暂无权限查看此页面内容") || text.contains("失效的验证页面")
+    {
+        bail!("微信公众号页面暂无访问权限");
+    }
+    if text.contains("微信公众平台安全验证")
+        || text.contains("请输入图中的验证码")
+        || text.contains("poc_token")
+    {
+        bail!("微信公众号页面需要验证码验证");
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Pipeline;
+    use super::{detect_wechat_error_page, detect_wechat_redirect, extract_html_title, Pipeline};
     use crate::task_store::PendingTaskRecord;
     use std::fs;
     use uuid::Uuid;
@@ -68,12 +198,49 @@ mod tests {
         };
 
         let result = pipeline
-            .process_pending_task(&task)
+            .archive_html(
+                &task,
+                "<html><head><title>Hello World</title></head><body>content</body></html>",
+            )
             .expect("处理 pending 任务失败");
         let content = fs::read_to_string(&result.output_path).expect("读取归档文件失败");
+        let raw = fs::read_to_string(&result.raw_path).expect("读取原始文件失败");
 
         assert!(result.output_path.starts_with(root.join("processed")));
+        assert!(result.raw_path.starts_with(root.join("raw")));
         assert!(content.contains("task-1"));
         assert!(content.contains("https://example.com"));
+        assert!(content.contains("Hello World"));
+        assert_eq!(result.title, Some("Hello World".to_string()));
+        assert!(raw.contains("<title>Hello World</title>"));
+    }
+
+    #[test]
+    fn title_extraction_handles_missing_title() {
+        assert_eq!(
+            extract_html_title("<html><body>no title</body></html>"),
+            None
+        );
+    }
+
+    #[test]
+    fn wechat_error_page_is_rejected() {
+        let err = detect_wechat_error_page(
+            "https://mp.weixin.qq.com/s/abc",
+            "<html><head><title>未知错误</title></head><body>你暂无权限查看此页面内容。</body></html>",
+        )
+        .expect_err("应识别公众号错误页");
+
+        assert!(err.to_string().contains("微信公众"));
+    }
+
+    #[test]
+    fn wechat_captcha_redirect_is_rejected() {
+        let err = detect_wechat_redirect(
+            "https://mp.weixin.qq.com/mp/wappoc_appmsgcaptcha?poc_token=abc&target_url=https%3A%2F%2Fmp.weixin.qq.com%2Fs%2Fxyz",
+        )
+        .expect_err("应识别公众号验证码跳转");
+
+        assert!(err.to_string().contains("验证码"));
     }
 }

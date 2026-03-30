@@ -449,11 +449,19 @@ impl WeChatBot {
     }
 
     fn generate_reply(&self, user_text: &str) -> String {
-        if is_agent_command(user_text) {
-            return match self.agent_core.run(user_text) {
-                Ok(result) => result,
-                Err(err) => format!("执行失败: {err}"),
-            };
+        match self.agent_core.run(user_text) {
+            Ok(result) => return result,
+            Err(err) => {
+                let err_text = err.to_string();
+                if is_agent_command(user_text) {
+                    return format!("执行失败: {err_text}");
+                }
+                if is_llm_auth_error(&err_text) {
+                    return "LLM 鉴权失败（401），请检查 MOONSHOT_* / DEEPSEEK_* / OPENAI_* 配置"
+                        .to_string();
+                }
+                eprintln!("[Bot] agent_fallback reason={}", err_text);
+            }
         }
         if user_text == "hello" || user_text == "你好" {
             return "你好！我是 iLink Bot Demo（Rust版），有什么可以帮你的？".to_string();
@@ -482,6 +490,10 @@ fn is_agent_command(text: &str) -> bool {
         || raw.starts_with("帮我运行:")
         || raw.starts_with("请帮我运行：")
         || raw.starts_with("请帮我运行:")
+}
+
+fn is_llm_auth_error(err: &str) -> bool {
+    err.contains("HTTP 401") || err.contains("Authentication Fails")
 }
 
 fn assert_ok(resp: &Value, action: &str) -> Result<()> {

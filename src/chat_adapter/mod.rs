@@ -608,6 +608,7 @@ impl WeChatBot {
                         result.title.as_deref(),
                         Some("manual_input"),
                         None,
+                        Some("manual_input"),
                     ) {
                         Ok(true) => format!(
                             "已写入人工补正文\ntask_id: {task_id}\noutput_path: {output_path}"
@@ -698,6 +699,11 @@ impl WeChatBot {
                         result.title.as_deref(),
                         Some("article"),
                         snapshot_path.as_deref(),
+                        Some(if result.snapshot_path.is_some() {
+                            "browser_capture"
+                        } else {
+                            "http"
+                        }),
                     ) {
                         eprintln!("[任务] 更新 archived 失败 task_id={}: {err}", task.task_id);
                         continue;
@@ -818,6 +824,10 @@ fn build_task_status_reply(status: &crate::task_store::TaskStatusRecord) -> Stri
         "任务状态".to_string(),
         format!("task_id: {}", status.task_id),
         format!("url: {}", status.normalized_url),
+        format!(
+            "source: {}",
+            status.content_source.as_deref().unwrap_or("unknown")
+        ),
         format!(
             "page_kind: {}",
             status.page_kind.as_deref().unwrap_or("unknown")

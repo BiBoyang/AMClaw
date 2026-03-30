@@ -22,6 +22,7 @@ pub struct TaskStatusRecord {
     pub article_id: String,
     pub normalized_url: String,
     pub title: Option<String>,
+    pub content_source: Option<String>,
     pub page_kind: Option<String>,
     pub status: String,
     pub retry_count: i64,
@@ -191,7 +192,7 @@ impl TaskStore {
             .conn
             .query_row(
                 r#"
-                SELECT t.id, t.article_id, a.normalized_url, a.title, t.page_kind, t.status, t.retry_count, t.last_error, t.output_path, t.snapshot_path, t.created_at, t.updated_at
+                SELECT t.id, t.article_id, a.normalized_url, a.title, t.content_source, t.page_kind, t.status, t.retry_count, t.last_error, t.output_path, t.snapshot_path, t.created_at, t.updated_at
                 FROM tasks t
                 JOIN articles a ON a.id = t.article_id
                 WHERE t.id = ?1
@@ -203,14 +204,15 @@ impl TaskStore {
                         article_id: row.get(1)?,
                         normalized_url: row.get(2)?,
                         title: row.get(3)?,
-                        page_kind: row.get(4)?,
-                        status: row.get(5)?,
-                        retry_count: row.get(6)?,
-                        last_error: row.get(7)?,
-                        output_path: row.get(8)?,
-                        snapshot_path: row.get(9)?,
-                        created_at: row.get(10)?,
-                        updated_at: row.get(11)?,
+                        content_source: row.get(4)?,
+                        page_kind: row.get(5)?,
+                        status: row.get(6)?,
+                        retry_count: row.get(7)?,
+                        last_error: row.get(8)?,
+                        output_path: row.get(9)?,
+                        snapshot_path: row.get(10)?,
+                        created_at: row.get(11)?,
+                        updated_at: row.get(12)?,
                     })
                 },
             )
@@ -303,7 +305,7 @@ impl TaskStore {
         let task = tx
             .query_row(
                 r#"
-                SELECT t.id, t.article_id, a.normalized_url, a.title, t.page_kind, t.status, t.retry_count, t.last_error, t.output_path, t.snapshot_path, t.created_at, t.updated_at
+                SELECT t.id, t.article_id, a.normalized_url, a.title, t.content_source, t.page_kind, t.status, t.retry_count, t.last_error, t.output_path, t.snapshot_path, t.created_at, t.updated_at
                 FROM tasks t
                 JOIN articles a ON a.id = t.article_id
                 WHERE t.id = ?1
@@ -315,14 +317,15 @@ impl TaskStore {
                         article_id: row.get(1)?,
                         normalized_url: row.get(2)?,
                         title: row.get(3)?,
-                        page_kind: row.get(4)?,
-                        status: row.get(5)?,
-                        retry_count: row.get(6)?,
-                        last_error: row.get(7)?,
-                        output_path: row.get(8)?,
-                        snapshot_path: row.get(9)?,
-                        created_at: row.get(10)?,
-                        updated_at: row.get(11)?,
+                        content_source: row.get(4)?,
+                        page_kind: row.get(5)?,
+                        status: row.get(6)?,
+                        retry_count: row.get(7)?,
+                        last_error: row.get(8)?,
+                        output_path: row.get(9)?,
+                        snapshot_path: row.get(10)?,
+                        created_at: row.get(11)?,
+                        updated_at: row.get(12)?,
                     })
                 },
             )
@@ -371,13 +374,14 @@ impl TaskStore {
         title: Option<&str>,
         page_kind: Option<&str>,
         snapshot_path: Option<&str>,
+        content_source: Option<&str>,
     ) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
         let tx = self.conn.transaction().context("开启 archived 事务失败")?;
         let updated = tx
             .execute(
-                "UPDATE tasks SET status = 'archived', last_error = NULL, output_path = ?2, page_kind = COALESCE(?3, page_kind), snapshot_path = ?4, updated_at = ?5 WHERE id = ?1",
-                params![task_id, output_path, page_kind, snapshot_path, now.clone()],
+                "UPDATE tasks SET status = 'archived', last_error = NULL, output_path = ?2, page_kind = COALESCE(?3, page_kind), snapshot_path = ?4, content_source = COALESCE(?5, content_source), updated_at = ?6 WHERE id = ?1",
+                params![task_id, output_path, page_kind, snapshot_path, content_source, now.clone()],
             )
             .context("更新 archived 状态失败")?;
         if updated == 0 {
@@ -422,7 +426,7 @@ impl TaskStore {
         let updated = self
             .conn
             .execute(
-                "UPDATE tasks SET status = 'failed', last_error = ?2, page_kind = NULL, output_path = NULL, snapshot_path = NULL, updated_at = ?3 WHERE id = ?1",
+                "UPDATE tasks SET status = 'failed', last_error = ?2, page_kind = NULL, output_path = NULL, snapshot_path = NULL, content_source = NULL, updated_at = ?3 WHERE id = ?1",
                 params![task_id, last_error, now],
             )
             .context("更新 failed 状态失败")?;
@@ -451,6 +455,7 @@ impl TaskStore {
                 status       TEXT NOT NULL DEFAULT 'pending',
                 retry_count  INTEGER NOT NULL DEFAULT 0,
                 last_error   TEXT,
+                content_source TEXT,
                 page_kind    TEXT,
                 output_path  TEXT,
                 snapshot_path TEXT,
@@ -487,6 +492,7 @@ impl TaskStore {
             "#,
             )
             .context("初始化 SQLite 表结构失败")?;
+        ensure_column_exists(&self.conn, "tasks", "content_source", "TEXT")?;
         ensure_column_exists(&self.conn, "tasks", "page_kind", "TEXT")?;
         ensure_column_exists(&self.conn, "tasks", "output_path", "TEXT")?;
         ensure_column_exists(&self.conn, "tasks", "snapshot_path", "TEXT")?;
@@ -780,6 +786,7 @@ mod tests {
                 article_id: created.article_id.clone(),
                 normalized_url: "https://example.com/status".to_string(),
                 title: None,
+                content_source: None,
                 page_kind: None,
                 status: "pending".to_string(),
                 retry_count: 0,
@@ -860,6 +867,7 @@ mod tests {
 
         assert_eq!(retried.status, "pending");
         assert_eq!(retried.normalized_url, "https://example.com/retry");
+        assert_eq!(retried.content_source, None);
         assert_eq!(retried.page_kind, None);
         assert_eq!(retried.retry_count, 3);
         assert_eq!(retried.last_error, None);
@@ -905,6 +913,7 @@ mod tests {
                 Some("Example Title"),
                 Some("article"),
                 Some("/tmp/example.png"),
+                Some("browser_capture"),
             )
             .expect("更新 archived 状态失败"));
 
@@ -916,6 +925,7 @@ mod tests {
 
         assert!(pending_after.is_empty());
         assert_eq!(status.status, "archived");
+        assert_eq!(status.content_source, Some("browser_capture".to_string()));
         assert_eq!(status.page_kind, Some("article".to_string()));
         assert_eq!(status.output_path, Some("/tmp/example.md".to_string()));
         assert_eq!(status.snapshot_path, Some("/tmp/example.png".to_string()));
@@ -940,6 +950,7 @@ mod tests {
             .expect("应存在任务");
 
         assert_eq!(status.status, "failed");
+        assert_eq!(status.content_source, None);
         assert_eq!(status.last_error, Some("network fail".to_string()));
     }
 
@@ -966,6 +977,7 @@ mod tests {
             .expect("应存在任务");
 
         assert_eq!(status.status, "awaiting_manual_input");
+        assert_eq!(status.content_source, None);
         assert_eq!(status.page_kind, Some("wechat_captcha".to_string()));
         assert_eq!(
             status.last_error,

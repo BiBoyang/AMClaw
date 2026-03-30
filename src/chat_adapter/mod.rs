@@ -1,4 +1,8 @@
 use crate::agent_core::AgentCore;
+use crate::command_router;
+use crate::config::AppConfig;
+use crate::session_router::{SessionEvent, SessionRouter};
+use crate::task_store::TaskStore;
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -13,16 +17,17 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::sleep;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const BASE_URL: &str = "https://ilinkai.weixin.qq.com";
-const CHANNEL_VERSION: &str = "1.0.0";
 const MAX_SEEN_IDS: usize = 1000;
 const TRIM_SEEN_IDS_TO: usize = 500;
+const DEFAULT_GET_UPDATES_TIMEOUT: Duration = Duration::from_secs(70);
+const MIN_GET_UPDATES_TIMEOUT: Duration = Duration::from_millis(200);
 
-pub fn run(running: Arc<AtomicBool>) -> Result<()> {
-    let mut bot = WeChatBot::new(running)?;
+pub fn run(config: AppConfig, running: Arc<AtomicBool>) -> Result<()> {
+    let mut bot = WeChatBot::new(config, running)?;
     bot.start()
 }
 
@@ -106,10 +111,11 @@ struct ILinkClient {
     ilink_bot_id: String,
     ilink_user_id: String,
     wechat_uin: String,
+    channel_version: String,
 }
 
 impl ILinkClient {
-    fn new() -> Result<Self> {
+    fn new(channel_version: impl Into<String>) -> Result<Self> {
         let http = Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(70))
@@ -127,6 +133,7 @@ impl ILinkClient {
             ilink_bot_id: String::new(),
             ilink_user_id: String::new(),
             wechat_uin: BASE64_STANDARD.encode(wechat_uin.to_string()),
+            channel_version: channel_version.into(),
         })
     }
 
@@ -141,6 +148,16 @@ impl ILinkClient {
     }
 
     fn request(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+        self.request_with_timeout(method, path, body, None)
+    }
+
+    fn request_with_timeout(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        timeout: Option<Duration>,
+    ) -> Result<Value> {
         let method_name = method.as_str().to_string();
         let mut req = self
             .http
@@ -148,6 +165,10 @@ impl ILinkClient {
             .header(CONTENT_TYPE, "application/json")
             .header("iLink-App-ClientVersion", "1")
             .header("X-WECHAT-UIN", &self.wechat_uin);
+
+        if let Some(timeout) = timeout {
+            req = req.timeout(timeout);
+        }
 
         if let Some(token) = self.bot_token.as_deref().filter(|v| !v.trim().is_empty()) {
             req = req
@@ -256,14 +277,19 @@ impl ILinkClient {
         bail!("登录被中止")
     }
 
-    fn get_updates(&self, cursor: &str) -> Result<GetUpdatesResult> {
+    fn get_updates(&self, cursor: &str, timeout: Duration) -> Result<GetUpdatesResult> {
         let body = json!({
             "get_updates_buf": cursor,
             "base_info": {
-                "channel_version": CHANNEL_VERSION
+                "channel_version": self.channel_version
             }
         });
-        let resp = self.request(Method::POST, "/ilink/bot/getupdates", Some(body))?;
+        let resp = self.request_with_timeout(
+            Method::POST,
+            "/ilink/bot/getupdates",
+            Some(body),
+            Some(timeout),
+        )?;
         assert_ok(&resp, "getupdates")?;
 
         println!(
@@ -303,7 +329,7 @@ impl ILinkClient {
                 ]
             },
             "base_info": {
-                "channel_version": CHANNEL_VERSION
+                "channel_version": self.channel_version
             }
         });
 
@@ -315,23 +341,28 @@ impl ILinkClient {
 struct WeChatBot {
     agent_core: AgentCore,
     client: ILinkClient,
+    task_store: TaskStore,
     context_token_map: HashMap<String, String>,
     cursor: String,
     seen_ids: HashSet<String>,
     seen_order: VecDeque<String>,
+    session_router: SessionRouter,
     running: Arc<AtomicBool>,
 }
 
 impl WeChatBot {
-    fn new(running: Arc<AtomicBool>) -> Result<Self> {
+    fn new(config: AppConfig, running: Arc<AtomicBool>) -> Result<Self> {
         let workspace_root = std::env::current_dir().context("获取工作目录失败")?;
+        let db_path = config.db_path();
         Ok(Self {
             agent_core: AgentCore::new(workspace_root)?,
-            client: ILinkClient::new()?,
+            client: ILinkClient::new(config.wechat.channel_version.clone())?,
+            task_store: TaskStore::open(&db_path)?,
             context_token_map: HashMap::new(),
             cursor: String::new(),
             seen_ids: HashSet::new(),
             seen_order: VecDeque::new(),
+            session_router: SessionRouter::new(config.session_merge_timeout()),
             running,
         })
     }
@@ -346,7 +377,10 @@ impl WeChatBot {
 
     fn poll_loop(&mut self) {
         while self.running.load(Ordering::Relaxed) {
-            match self.client.get_updates(&self.cursor) {
+            self.flush_expired_sessions();
+
+            let poll_timeout = self.next_poll_timeout();
+            match self.client.get_updates(&self.cursor, poll_timeout) {
                 Ok(result) => {
                     if !result.cursor.is_empty() && result.cursor != self.cursor {
                         self.cursor = result.cursor;
@@ -356,6 +390,9 @@ impl WeChatBot {
                     }
                 }
                 Err(err) => {
+                    if is_poll_timeout_error(&err) {
+                        continue;
+                    }
                     eprintln!("[轮询] 错误: {err}");
                     println!("[轮询] 5秒后重试...");
                     sleep(Duration::from_secs(5));
@@ -371,11 +408,6 @@ impl WeChatBot {
             if message_type != 1 {
                 return;
             }
-        }
-
-        let msg_id = self.extract_message_id(wire);
-        if !self.mark_seen(msg_id) {
-            return;
         }
 
         let from_user_id = wire.from_user_id.trim();
@@ -394,18 +426,17 @@ impl WeChatBot {
             return;
         }
 
-        println!("[收到消息] {from_user_id}: {text}");
-
-        let reply = self.generate_reply(&text);
-        let Some(token) = self.context_token_map.get(from_user_id).cloned() else {
-            println!("[警告] 无 {from_user_id} 的 context_token，跳过回复");
+        let msg_id = self.extract_message_id(wire);
+        if !self.mark_seen(&msg_id, from_user_id, &text) {
             return;
-        };
-
-        match self.client.send_text_message(from_user_id, &reply, &token) {
-            Ok(()) => println!("[已回复] {from_user_id}: {reply}"),
-            Err(err) => eprintln!("[发送失败] {err}"),
         }
+
+        println!("[收到消息] {from_user_id}: {text}");
+        let intent = command_router::route_text(&text);
+        let event = self
+            .session_router
+            .on_intent(from_user_id, intent, Instant::now());
+        self.handle_session_event(event);
     }
 
     fn extract_message_id(&self, msg: &WireMessage) -> String {
@@ -427,7 +458,22 @@ impl WeChatBot {
         format!("{sender}:{ts}")
     }
 
-    fn mark_seen(&mut self, id: String) -> bool {
+    fn mark_seen(&mut self, id: &str, from_user_id: &str, text: &str) -> bool {
+        let is_new = match self
+            .task_store
+            .record_inbound_message(id, from_user_id, text)
+        {
+            Ok(inserted) => inserted,
+            Err(err) => {
+                eprintln!("[去重] 数据库写入失败: {err}");
+                true
+            }
+        };
+        if !is_new {
+            return false;
+        }
+
+        let id = id.to_string();
         if self.seen_ids.contains(&id) {
             return false;
         }
@@ -476,6 +522,53 @@ impl WeChatBot {
         }
         format!("Echo: {user_text}")
     }
+
+    fn handle_session_event(&mut self, event: SessionEvent) {
+        if let SessionEvent::FlushNow {
+            user_id,
+            merged_text,
+        } = event
+        {
+            self.send_generated_reply(&user_id, &merged_text);
+        }
+    }
+
+    fn flush_expired_sessions(&mut self) {
+        for item in self.session_router.flush_expired(Instant::now()) {
+            self.send_generated_reply(&item.user_id, &item.merged_text);
+        }
+    }
+
+    fn next_poll_timeout(&self) -> Duration {
+        self.session_router
+            .next_flush_delay(Instant::now())
+            .map(|delay| {
+                delay
+                    .max(MIN_GET_UPDATES_TIMEOUT)
+                    .min(DEFAULT_GET_UPDATES_TIMEOUT)
+            })
+            .unwrap_or(DEFAULT_GET_UPDATES_TIMEOUT)
+    }
+
+    fn send_generated_reply(&mut self, user_id: &str, merged_text: &str) {
+        if merged_text.trim().is_empty() {
+            return;
+        }
+
+        let display_text = merged_text.replace('\n', "\\n");
+        println!("[会话提交] {user_id}: {display_text}");
+
+        let reply = self.generate_reply(merged_text);
+        let Some(token) = self.context_token_map.get(user_id).cloned() else {
+            println!("[警告] 无 {user_id} 的 context_token，跳过回复");
+            return;
+        };
+
+        match self.client.send_text_message(user_id, &reply, &token) {
+            Ok(()) => println!("[已回复] {user_id}: {reply}"),
+            Err(err) => eprintln!("[发送失败] {err}"),
+        }
+    }
 }
 
 fn is_agent_command(text: &str) -> bool {
@@ -494,6 +587,12 @@ fn is_agent_command(text: &str) -> bool {
 
 fn is_llm_auth_error(err: &str) -> bool {
     err.contains("HTTP 401") || err.contains("Authentication Fails")
+}
+
+fn is_poll_timeout_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .any(reqwest::Error::is_timeout)
 }
 
 fn assert_ok(resp: &Value, action: &str) -> Result<()> {
@@ -596,4 +695,128 @@ fn now_epoch_ms() -> i64 {
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_millis();
     i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ILinkClient, WeChatBot, WireMessage};
+    use crate::agent_core::AgentCore;
+    use crate::session_router::SessionRouter;
+    use crate::task_store::TaskStore;
+    use rusqlite::Connection;
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    fn temp_dir() -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("amclaw_chat_adapter_test_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("创建测试目录失败");
+        root
+    }
+
+    fn temp_db_path() -> std::path::PathBuf {
+        temp_dir().join("amclaw.db")
+    }
+
+    fn test_bot(db_path: &std::path::Path) -> WeChatBot {
+        let workspace_root = temp_dir();
+        WeChatBot {
+            agent_core: AgentCore::new(workspace_root).expect("初始化 agent 失败"),
+            client: ILinkClient::new("1.0.0").expect("初始化 iLink 客户端失败"),
+            task_store: TaskStore::open(db_path).expect("初始化 task store 失败"),
+            context_token_map: HashMap::new(),
+            cursor: String::new(),
+            seen_ids: HashSet::new(),
+            seen_order: VecDeque::new(),
+            session_router: SessionRouter::new(Duration::from_secs(5)),
+            running: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn message_row(
+        db_path: &std::path::Path,
+        message_id: &str,
+    ) -> Option<(String, String, String)> {
+        let conn = Connection::open(db_path).expect("打开数据库失败");
+        conn.query_row(
+            "SELECT message_id, from_user_id, text FROM inbound_messages WHERE message_id = ?1",
+            [message_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok()
+    }
+
+    fn message_count(db_path: &std::path::Path, message_id: &str) -> i64 {
+        let conn = Connection::open(db_path).expect("打开数据库失败");
+        conn.query_row(
+            "SELECT COUNT(*) FROM inbound_messages WHERE message_id = ?1",
+            [message_id],
+            |row| row.get(0),
+        )
+        .expect("查询消息数量失败")
+    }
+
+    #[test]
+    fn handle_message_persists_inbound_text() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            context_token: "ctx-1".to_string(),
+            text: "hello world".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-1".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        assert_eq!(
+            message_row(&db_path, "msg-1"),
+            Some((
+                "msg-1".to_string(),
+                "user-a".to_string(),
+                "hello world".to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn duplicate_message_is_ignored_by_handle_message() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        let message = WireMessage {
+            from_user_id: "user-a".to_string(),
+            context_token: "ctx-1".to_string(),
+            text: "hello world".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-2".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        };
+
+        bot.handle_message(message.clone());
+        bot.handle_message(message);
+
+        assert_eq!(message_count(&db_path, "msg-2"), 1);
+    }
+
+    #[test]
+    fn empty_text_is_not_persisted() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            context_token: "ctx-1".to_string(),
+            text: "   ".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-3".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        assert_eq!(message_count(&db_path, "msg-3"), 0);
+    }
 }

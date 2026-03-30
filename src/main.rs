@@ -1,16 +1,23 @@
 use anyhow::{Context, Result};
+use config::AppConfig;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 mod agent_core;
 mod chat_adapter;
+mod command_router;
+mod config;
+mod session_router;
+mod task_store;
 mod tool_registry;
 
 fn main() -> Result<()> {
     load_startup_env_files()?;
+    let workspace_root = std::env::current_dir().context("获取当前目录失败")?;
+    let app_config = AppConfig::load_or_create(workspace_root.join("config.toml"))?;
+
     if let Ok(command) = std::env::var("AMCLAW_AGENT_DEMO_COMMAND") {
-        let workspace_root = std::env::current_dir().context("获取当前目录失败")?;
         let agent = agent_core::AgentCore::new(workspace_root)?;
         let output = agent.run(&command)?;
         println!("[AgentDemo] {output}");
@@ -27,7 +34,7 @@ fn main() -> Result<()> {
         .context("注册 Ctrl-C 处理器失败")?;
     }
 
-    if let Err(err) = chat_adapter::run(running) {
+    if let Err(err) = chat_adapter::run(app_config, running) {
         eprintln!("[启动失败] {err:#}");
         std::process::exit(1);
     }

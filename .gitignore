@@ -4,3 +4,4 @@ target/
 .env.deepseek.local
 config.toml
 data/
+tools/browser_worker/node_modules/

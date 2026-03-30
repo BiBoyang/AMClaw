@@ -1,6 +1,6 @@
 use crate::agent_core::AgentCore;
 use crate::command_router;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ResolvedBrowserConfig};
 use crate::pipeline::Pipeline;
 use crate::session_router::{SessionEvent, SessionRouter};
 use crate::task_store::TaskStore;
@@ -27,8 +27,12 @@ const TRIM_SEEN_IDS_TO: usize = 500;
 const DEFAULT_GET_UPDATES_TIMEOUT: Duration = Duration::from_secs(70);
 const MIN_GET_UPDATES_TIMEOUT: Duration = Duration::from_millis(200);
 
-pub fn run(config: AppConfig, running: Arc<AtomicBool>) -> Result<()> {
-    let mut bot = WeChatBot::new(config, running)?;
+pub fn run(
+    config: AppConfig,
+    browser: Option<ResolvedBrowserConfig>,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut bot = WeChatBot::new(config, browser, running)?;
     bot.start()
 }
 
@@ -353,14 +357,18 @@ struct WeChatBot {
 }
 
 impl WeChatBot {
-    fn new(config: AppConfig, running: Arc<AtomicBool>) -> Result<Self> {
+    fn new(
+        config: AppConfig,
+        browser: Option<ResolvedBrowserConfig>,
+        running: Arc<AtomicBool>,
+    ) -> Result<Self> {
         let workspace_root = std::env::current_dir().context("获取工作目录失败")?;
         let db_path = config.db_path();
         let root_dir = config.resolved_root_dir();
         Ok(Self {
             agent_core: AgentCore::new(workspace_root)?,
             client: ILinkClient::new(config.wechat.channel_version.clone())?,
-            pipeline: Pipeline::new(root_dir),
+            pipeline: Pipeline::new(root_dir, browser),
             task_store: TaskStore::open(&db_path)?,
             context_token_map: HashMap::new(),
             cursor: String::new(),
@@ -599,6 +607,7 @@ impl WeChatBot {
                         &output_path,
                         result.title.as_deref(),
                         Some("manual_input"),
+                        None,
                     ) {
                         Ok(true) => format!(
                             "已写入人工补正文\ntask_id: {task_id}\noutput_path: {output_path}"
@@ -679,11 +688,16 @@ impl WeChatBot {
             match self.pipeline.process_pending_task(&task) {
                 Ok(result) => {
                     let output_path = result.output_path.to_string_lossy().to_string();
+                    let snapshot_path = result
+                        .snapshot_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().to_string());
                     if let Err(err) = self.task_store.mark_task_archived(
                         &task.task_id,
                         &output_path,
                         result.title.as_deref(),
                         Some("article"),
+                        snapshot_path.as_deref(),
                     ) {
                         eprintln!("[任务] 更新 archived 失败 task_id={}: {err}", task.task_id);
                         continue;
@@ -973,6 +987,7 @@ fn now_epoch_ms() -> i64 {
 mod tests {
     use super::{ILinkClient, WeChatBot, WireMessage};
     use crate::agent_core::AgentCore;
+    use crate::config::ResolvedBrowserConfig;
     use crate::pipeline::Pipeline;
     use crate::session_router::SessionRouter;
     use crate::task_store::TaskStore;
@@ -999,7 +1014,7 @@ mod tests {
         WeChatBot {
             agent_core: AgentCore::new(workspace_root).expect("初始化 agent 失败"),
             client: ILinkClient::new("1.0.0").expect("初始化 iLink 客户端失败"),
-            pipeline: Pipeline::new(temp_dir()),
+            pipeline: Pipeline::new(temp_dir(), None::<ResolvedBrowserConfig>),
             task_store: TaskStore::open(db_path).expect("初始化 task store 失败"),
             context_token_map: HashMap::new(),
             cursor: String::new(),

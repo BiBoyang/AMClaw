@@ -370,13 +370,14 @@ impl TaskStore {
         output_path: &str,
         title: Option<&str>,
         page_kind: Option<&str>,
+        snapshot_path: Option<&str>,
     ) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
         let tx = self.conn.transaction().context("开启 archived 事务失败")?;
         let updated = tx
             .execute(
-                "UPDATE tasks SET status = 'archived', last_error = NULL, output_path = ?2, page_kind = COALESCE(?3, page_kind), updated_at = ?4 WHERE id = ?1",
-                params![task_id, output_path, page_kind, now.clone()],
+                "UPDATE tasks SET status = 'archived', last_error = NULL, output_path = ?2, page_kind = COALESCE(?3, page_kind), snapshot_path = ?4, updated_at = ?5 WHERE id = ?1",
+                params![task_id, output_path, page_kind, snapshot_path, now.clone()],
             )
             .context("更新 archived 状态失败")?;
         if updated == 0 {
@@ -903,6 +904,7 @@ mod tests {
                 "/tmp/example.md",
                 Some("Example Title"),
                 Some("article"),
+                Some("/tmp/example.png"),
             )
             .expect("更新 archived 状态失败"));
 
@@ -916,6 +918,7 @@ mod tests {
         assert_eq!(status.status, "archived");
         assert_eq!(status.page_kind, Some("article".to_string()));
         assert_eq!(status.output_path, Some("/tmp/example.md".to_string()));
+        assert_eq!(status.snapshot_path, Some("/tmp/example.png".to_string()));
         assert_eq!(status.title, Some("Example Title".to_string()));
     }
 

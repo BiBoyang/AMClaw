@@ -1,3 +1,4 @@
+use crate::config::ResolvedBrowserConfig;
 use crate::task_store::{PendingTaskRecord, TaskContentRecord};
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -5,22 +6,57 @@ use reqwest::blocking::Client;
 use reqwest::header::LOCATION;
 use reqwest::redirect::Policy;
 use reqwest::Url;
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct Pipeline {
     root_dir: PathBuf,
+    browser: Option<ResolvedBrowserConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineResult {
     pub output_path: PathBuf,
     pub raw_path: PathBuf,
+    pub snapshot_path: Option<PathBuf>,
     pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BrowserCaptureRequest {
+    url: String,
+    html_path: PathBuf,
+    screenshot_path: PathBuf,
+    timeout_ms: u64,
+    headless: bool,
+    mobile_viewport: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BrowserCaptureResponse {
+    ok: bool,
+    page_kind: String,
+    final_url: String,
+    title: Option<String>,
+    html_path: PathBuf,
+    screenshot_path: PathBuf,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserCaptureResult {
+    page_kind: String,
+    final_url: String,
+    title: Option<String>,
+    html_path: PathBuf,
+    screenshot_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,9 +98,10 @@ impl fmt::Display for PipelineTaskError {
 impl Error for PipelineTaskError {}
 
 impl Pipeline {
-    pub fn new(root_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(root_dir: impl Into<PathBuf>, browser: Option<ResolvedBrowserConfig>) -> Self {
         Self {
             root_dir: root_dir.into(),
+            browser,
         }
     }
 
@@ -72,6 +109,15 @@ impl Pipeline {
         &self,
         task: &PendingTaskRecord,
     ) -> std::result::Result<PipelineResult, PipelineTaskError> {
+        if should_prefer_browser_capture(&task.normalized_url) {
+            if let Some(browser) = &self.browser {
+                let capture = self.run_browser_capture(browser, task)?;
+                return self.archive_browser_capture(task, &capture).map_err(|err| {
+                    PipelineTaskError::failed(format!("归档浏览器抓取结果失败: {err}"))
+                });
+            }
+        }
+
         let html = self.fetch_html(&task.normalized_url)?;
         self.archive_html(task, &html)
             .map_err(|err| PipelineTaskError::failed(format!("归档页面失败: {err}")))
@@ -117,6 +163,7 @@ impl Pipeline {
         Ok(PipelineResult {
             output_path,
             raw_path,
+            snapshot_path: None,
             title,
         })
     }
@@ -163,6 +210,133 @@ impl Pipeline {
         Ok(html)
     }
 
+    fn run_browser_capture(
+        &self,
+        browser: &ResolvedBrowserConfig,
+        task: &PendingTaskRecord,
+    ) -> std::result::Result<BrowserCaptureResult, PipelineTaskError> {
+        let day = Utc::now().format("%Y-%m-%d").to_string();
+        let raw_dir = self.root_dir.join("raw").join(&day);
+        let snapshot_dir = self.root_dir.join("snapshots").join(day);
+        fs::create_dir_all(&raw_dir)
+            .map_err(|err| PipelineTaskError::failed(format!("创建浏览器 raw 目录失败: {err}")))?;
+        fs::create_dir_all(&snapshot_dir).map_err(|err| {
+            PipelineTaskError::failed(format!("创建浏览器 snapshot 目录失败: {err}"))
+        })?;
+
+        let request = BrowserCaptureRequest {
+            url: task.normalized_url.clone(),
+            html_path: raw_dir.join(format!("{}.browser.html", task.task_id)),
+            screenshot_path: snapshot_dir.join(format!("{}.png", task.task_id)),
+            timeout_ms: u64::try_from(browser.timeout.as_millis()).unwrap_or(u64::MAX),
+            headless: browser.headless,
+            mobile_viewport: browser.mobile_viewport,
+        };
+
+        let mut child = Command::new(&browser.command)
+            .arg(&browser.worker_script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| {
+                PipelineTaskError::awaiting_manual_input(
+                    "browser_worker_unavailable",
+                    format!("启动浏览器 worker 失败: {err}"),
+                )
+            })?;
+
+        if let Some(stdin) = child.stdin.as_mut() {
+            let payload = serde_json::to_vec(&request).map_err(|err| {
+                PipelineTaskError::failed(format!("序列化浏览器抓取请求失败: {err}"))
+            })?;
+            stdin.write_all(&payload).map_err(|err| {
+                PipelineTaskError::failed(format!("写入浏览器抓取请求失败: {err}"))
+            })?;
+        }
+
+        let output = child.wait_with_output().map_err(|err| {
+            PipelineTaskError::failed(format!("等待浏览器 worker 结束失败: {err}"))
+        })?;
+        let stdout = String::from_utf8(output.stdout).map_err(|err| {
+            PipelineTaskError::failed(format!("浏览器 worker 输出非 UTF-8: {err}"))
+        })?;
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+        if !output.status.success() && stdout.trim().is_empty() {
+            return Err(PipelineTaskError::awaiting_manual_input(
+                "browser_worker_failed",
+                format!(
+                    "浏览器 worker 执行失败: {}",
+                    if stderr.is_empty() {
+                        "unknown"
+                    } else {
+                        &stderr
+                    }
+                ),
+            ));
+        }
+
+        let response: BrowserCaptureResponse =
+            serde_json::from_str(stdout.trim()).map_err(|err| {
+                PipelineTaskError::failed(format!("解析浏览器 worker 返回失败: {err}"))
+            })?;
+
+        if response.ok {
+            return Ok(BrowserCaptureResult {
+                page_kind: response.page_kind,
+                final_url: response.final_url,
+                title: response.title,
+                html_path: response.html_path,
+                screenshot_path: response.screenshot_path,
+            });
+        }
+
+        Err(PipelineTaskError::awaiting_manual_input(
+            response.page_kind,
+            response
+                .reason
+                .unwrap_or_else(|| "浏览器抓取未成功".to_string()),
+        ))
+    }
+
+    fn archive_browser_capture(
+        &self,
+        task: &PendingTaskRecord,
+        capture: &BrowserCaptureResult,
+    ) -> Result<PipelineResult> {
+        let html = fs::read_to_string(&capture.html_path).with_context(|| {
+            format!("读取浏览器抓取 HTML 失败: {}", capture.html_path.display())
+        })?;
+        let day = Utc::now().format("%Y-%m-%d").to_string();
+        let output_dir = self.root_dir.join("processed").join(day);
+        fs::create_dir_all(&output_dir)
+            .with_context(|| format!("创建归档目录失败: {}", output_dir.display()))?;
+        let output_path = output_dir.join(format!("{}.md", task.task_id));
+        let content = format!(
+            "# Archived Link\n\n- task_id: {}\n- article_id: {}\n- normalized_url: {}\n- original_url: {}\n- final_url: {}\n- title: {}\n- archived_at: {}\n- source: browser_capture\n- page_kind: {}\n- screenshot_path: {}\n\n## Preview\n\n{}\n",
+            task.task_id,
+            task.article_id,
+            task.normalized_url,
+            task.original_url,
+            capture.final_url,
+            capture.title.clone().unwrap_or_else(|| "(none)".to_string()),
+            Utc::now().to_rfc3339(),
+            capture.page_kind,
+            capture.screenshot_path.display(),
+            preview_text(&html),
+        );
+        fs::write(&output_path, content)
+            .with_context(|| format!("写入浏览器归档文件失败: {}", output_path.display()))?;
+
+        Ok(PipelineResult {
+            output_path,
+            raw_path: capture.html_path.clone(),
+            snapshot_path: Some(capture.screenshot_path.clone()),
+            title: capture.title.clone(),
+        })
+    }
+
     fn archive_html(&self, task: &PendingTaskRecord, html: &str) -> Result<PipelineResult> {
         let day = Utc::now().format("%Y-%m-%d").to_string();
         let raw_dir = self.root_dir.join("raw").join(&day);
@@ -194,6 +368,7 @@ impl Pipeline {
         Ok(PipelineResult {
             output_path,
             raw_path,
+            snapshot_path: None,
             title,
         })
     }
@@ -225,6 +400,13 @@ fn preview_text(html: &str) -> String {
         preview.push_str("...");
     }
     preview
+}
+
+fn should_prefer_browser_capture(url: &str) -> bool {
+    Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.domain().map(|domain| domain == "mp.weixin.qq.com"))
+        .unwrap_or(false)
 }
 
 fn extract_manual_title(content: &str) -> Option<String> {
@@ -299,8 +481,8 @@ fn detect_wechat_error_page(url: &str, html: &str) -> std::result::Result<(), Pi
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_wechat_error_page, detect_wechat_redirect, extract_html_title, Pipeline,
-        PipelineFailureKind,
+        detect_wechat_error_page, detect_wechat_redirect, extract_html_title,
+        should_prefer_browser_capture, Pipeline, PipelineFailureKind,
     };
     use crate::task_store::{PendingTaskRecord, TaskContentRecord};
     use std::fs;
@@ -315,7 +497,7 @@ mod tests {
     #[test]
     fn processing_pending_task_creates_markdown_file() {
         let root = temp_dir();
-        let pipeline = Pipeline::new(&root);
+        let pipeline = Pipeline::new(&root, None);
         let task = PendingTaskRecord {
             task_id: "task-1".to_string(),
             article_id: "article-1".to_string(),
@@ -352,7 +534,7 @@ mod tests {
     #[test]
     fn manual_content_creates_archive() {
         let root = temp_dir();
-        let pipeline = Pipeline::new(&root);
+        let pipeline = Pipeline::new(&root, None);
         let task = TaskContentRecord {
             task_id: "task-manual".to_string(),
             article_id: "article-1".to_string(),
@@ -395,6 +577,16 @@ mod tests {
         assert!(matches!(
             err.kind,
             PipelineFailureKind::AwaitingManualInput { .. }
+        ));
+    }
+
+    #[test]
+    fn wechat_domain_prefers_browser_capture() {
+        assert!(should_prefer_browser_capture(
+            "https://mp.weixin.qq.com/s/YUvXg9i31QuQN6t-zRTe8g"
+        ));
+        assert!(!should_prefer_browser_capture(
+            "https://example.com/article"
         ));
     }
 }

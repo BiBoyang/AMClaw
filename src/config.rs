@@ -11,6 +11,7 @@ pub struct AppConfig {
     pub storage: StorageConfig,
     pub scheduler: SchedulerConfig,
     pub llm: LlmConfig,
+    pub browser: BrowserConfig,
     pub wechat: WechatConfig,
     pub session: SessionConfig,
     #[serde(skip)]
@@ -53,8 +54,28 @@ pub struct WechatConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct BrowserConfig {
+    pub enabled: bool,
+    pub command: String,
+    pub worker_script: PathBuf,
+    pub timeout_secs: u64,
+    pub headless: bool,
+    pub mobile_viewport: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SessionConfig {
     pub merge_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedBrowserConfig {
+    pub command: String,
+    pub worker_script: PathBuf,
+    pub timeout: Duration,
+    pub headless: bool,
+    pub mobile_viewport: bool,
 }
 
 impl Default for AppConfig {
@@ -64,6 +85,7 @@ impl Default for AppConfig {
             storage: StorageConfig::default(),
             scheduler: SchedulerConfig::default(),
             llm: LlmConfig::default(),
+            browser: BrowserConfig::default(),
             wechat: WechatConfig::default(),
             session: SessionConfig::default(),
             base_dir: PathBuf::new(),
@@ -115,6 +137,19 @@ impl Default for WechatConfig {
     }
 }
 
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            command: "node".to_string(),
+            worker_script: PathBuf::from("./tools/browser_worker/worker.mjs"),
+            timeout_secs: 45,
+            headless: true,
+            mobile_viewport: true,
+        }
+    }
+}
+
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
@@ -158,6 +193,19 @@ impl AppConfig {
     pub fn session_merge_timeout(&self) -> Duration {
         Duration::from_secs(self.session.merge_timeout_secs)
     }
+
+    pub fn resolved_browser(&self) -> Option<ResolvedBrowserConfig> {
+        if !self.browser.enabled {
+            return None;
+        }
+        Some(ResolvedBrowserConfig {
+            command: self.browser.command.clone(),
+            worker_script: resolve_path(&self.base_dir, &self.browser.worker_script),
+            timeout: Duration::from_secs(self.browser.timeout_secs),
+            headless: self.browser.headless,
+            mobile_viewport: self.browser.mobile_viewport,
+        })
+    }
 }
 
 fn resolve_path(base_dir: &Path, path: &Path) -> PathBuf {
@@ -191,6 +239,7 @@ mod tests {
         assert!(config_path.exists());
         assert_eq!(config.wechat.channel_version, "1.0.0");
         assert_eq!(config.db_path(), root.join("data").join("amclaw.db"));
+        assert_eq!(config.resolved_browser(), None);
     }
 
     #[test]
@@ -203,6 +252,10 @@ mod tests {
 [storage]
 root_dir = "./custom-data"
 
+[browser]
+enabled = true
+worker_script = "./tools/browser_worker/worker.mjs"
+
 [session]
 merge_timeout_secs = 9
 "#,
@@ -213,6 +266,13 @@ merge_timeout_secs = 9
 
         assert_eq!(config.db_path(), root.join("custom-data").join("amclaw.db"));
         assert_eq!(config.session_merge_timeout(), Duration::from_secs(9));
+        assert_eq!(
+            config
+                .resolved_browser()
+                .expect("应启用浏览器配置")
+                .worker_script,
+            root.join("tools/browser_worker/worker.mjs")
+        );
     }
 
     #[test]

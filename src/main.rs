@@ -8,6 +8,7 @@ mod agent_core;
 mod chat_adapter;
 mod command_router;
 mod config;
+mod pipeline;
 mod session_router;
 mod task_store;
 mod tool_registry;

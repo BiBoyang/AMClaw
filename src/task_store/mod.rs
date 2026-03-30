@@ -1,8 +1,46 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use reqwest::Url;
+use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
 use std::path::Path;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkTaskRecord {
+    pub article_id: String,
+    pub task_id: String,
+    pub normalized_url: String,
+    pub original_url: String,
+    pub created_new: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskStatusRecord {
+    pub task_id: String,
+    pub article_id: String,
+    pub status: String,
+    pub retry_count: i64,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentTaskRecord {
+    pub task_id: String,
+    pub status: String,
+    pub normalized_url: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTaskRecord {
+    pub task_id: String,
+    pub article_id: String,
+    pub normalized_url: String,
+    pub original_url: String,
+}
 
 #[derive(Debug)]
 pub struct TaskStore {
@@ -57,6 +95,243 @@ impl TaskStore {
         Ok(true)
     }
 
+    pub fn record_link_submission(&mut self, original_url: &str) -> Result<LinkTaskRecord> {
+        let normalized_url = normalize_url(original_url)?;
+        let source_domain = source_domain(&normalized_url);
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.transaction().context("开启链接写入事务失败")?;
+
+        let existing_article_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM articles WHERE normalized_url = ?1",
+                [&normalized_url],
+                |row| row.get(0),
+            )
+            .ok();
+
+        let (article_id, created_new) = if let Some(article_id) = existing_article_id {
+            tx.execute(
+                "UPDATE articles SET updated_at = ?2 WHERE id = ?1",
+                params![article_id, now.clone()],
+            )
+            .context("更新文章时间失败")?;
+            (article_id, false)
+        } else {
+            let article_id = Uuid::new_v4().to_string();
+            tx.execute(
+                r#"
+                INSERT INTO articles (
+                    id, normalized_url, original_url, title, source_domain, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)
+                "#,
+                params![
+                    article_id,
+                    normalized_url,
+                    original_url,
+                    source_domain,
+                    now.clone(),
+                    now.clone()
+                ],
+            )
+            .context("写入文章失败")?;
+            (article_id, true)
+        };
+
+        let existing_task_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM tasks WHERE article_id = ?1 ORDER BY created_at ASC LIMIT 1",
+                [&article_id],
+                |row| row.get(0),
+            )
+            .ok();
+
+        let task_id = if let Some(task_id) = existing_task_id {
+            task_id
+        } else {
+            let task_id = Uuid::new_v4().to_string();
+            tx.execute(
+                r#"
+                INSERT INTO tasks (
+                    id, article_id, status, retry_count, last_error, created_at, updated_at
+                ) VALUES (?1, ?2, 'pending', 0, NULL, ?3, ?4)
+                "#,
+                params![task_id, article_id, now.clone(), now.clone()],
+            )
+            .context("写入任务失败")?;
+            task_id
+        };
+
+        tx.commit().context("提交链接写入事务失败")?;
+        Ok(LinkTaskRecord {
+            article_id,
+            task_id,
+            normalized_url,
+            original_url: original_url.to_string(),
+            created_new,
+        })
+    }
+
+    pub fn get_task_status(&self, task_id: &str) -> Result<Option<TaskStatusRecord>> {
+        let task = self
+            .conn
+            .query_row(
+                r#"
+                SELECT id, article_id, status, retry_count, last_error, created_at, updated_at
+                FROM tasks
+                WHERE id = ?1
+                "#,
+                [task_id],
+                |row| {
+                    Ok(TaskStatusRecord {
+                        task_id: row.get(0)?,
+                        article_id: row.get(1)?,
+                        status: row.get(2)?,
+                        retry_count: row.get(3)?,
+                        last_error: row.get(4)?,
+                        created_at: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .context("查询任务状态失败")?;
+        Ok(task)
+    }
+
+    pub fn list_recent_tasks(&self, limit: usize) -> Result<Vec<RecentTaskRecord>> {
+        let limit = i64::try_from(limit).context("recent task limit 超出范围")?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+                SELECT t.id, t.status, a.normalized_url, t.updated_at
+                FROM tasks t
+                JOIN articles a ON a.id = t.article_id
+                ORDER BY t.updated_at DESC, t.created_at DESC
+                LIMIT ?1
+                "#,
+            )
+            .context("准备最近任务查询失败")?;
+        let rows = stmt
+            .query_map([limit], |row| {
+                Ok(RecentTaskRecord {
+                    task_id: row.get(0)?,
+                    status: row.get(1)?,
+                    normalized_url: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            })
+            .context("查询最近任务失败")?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks.push(row.context("读取最近任务记录失败")?);
+        }
+        Ok(tasks)
+    }
+
+    pub fn retry_task(&mut self, task_id: &str) -> Result<Option<TaskStatusRecord>> {
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.transaction().context("开启重试事务失败")?;
+        let updated = tx
+            .execute(
+                r#"
+                UPDATE tasks
+                SET status = 'pending',
+                    retry_count = retry_count + 1,
+                    last_error = NULL,
+                    updated_at = ?2
+                WHERE id = ?1
+                "#,
+                params![task_id, now],
+            )
+            .context("更新任务重试状态失败")?;
+        if updated == 0 {
+            tx.rollback().context("回滚不存在任务事务失败")?;
+            return Ok(None);
+        }
+        let task = tx
+            .query_row(
+                r#"
+                SELECT id, article_id, status, retry_count, last_error, created_at, updated_at
+                FROM tasks
+                WHERE id = ?1
+                "#,
+                [task_id],
+                |row| {
+                    Ok(TaskStatusRecord {
+                        task_id: row.get(0)?,
+                        article_id: row.get(1)?,
+                        status: row.get(2)?,
+                        retry_count: row.get(3)?,
+                        last_error: row.get(4)?,
+                        created_at: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                },
+            )
+            .context("读取重试后的任务状态失败")?;
+        tx.commit().context("提交重试事务失败")?;
+        Ok(Some(task))
+    }
+
+    pub fn list_pending_tasks(&self, limit: usize) -> Result<Vec<PendingTaskRecord>> {
+        let limit = i64::try_from(limit).context("pending task limit 超出范围")?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+                SELECT t.id, t.article_id, a.normalized_url, a.original_url
+                FROM tasks t
+                JOIN articles a ON a.id = t.article_id
+                WHERE t.status = 'pending'
+                ORDER BY t.created_at ASC
+                LIMIT ?1
+                "#,
+            )
+            .context("准备 pending 任务查询失败")?;
+        let rows = stmt
+            .query_map([limit], |row| {
+                Ok(PendingTaskRecord {
+                    task_id: row.get(0)?,
+                    article_id: row.get(1)?,
+                    normalized_url: row.get(2)?,
+                    original_url: row.get(3)?,
+                })
+            })
+            .context("查询 pending 任务失败")?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks.push(row.context("读取 pending 任务记录失败")?);
+        }
+        Ok(tasks)
+    }
+
+    pub fn mark_task_archived(&mut self, task_id: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE tasks SET status = 'archived', last_error = NULL, updated_at = ?2 WHERE id = ?1",
+                params![task_id, now],
+            )
+            .context("更新 archived 状态失败")?;
+        Ok(updated > 0)
+    }
+
+    pub fn mark_task_failed(&mut self, task_id: &str, last_error: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE tasks SET status = 'failed', last_error = ?2, updated_at = ?3 WHERE id = ?1",
+                params![task_id, last_error, now],
+            )
+            .context("更新 failed 状态失败")?;
+        Ok(updated > 0)
+    }
+
     fn init_schema(&self) -> Result<()> {
         self.conn
             .execute_batch(
@@ -103,6 +378,12 @@ impl TaskStore {
                 summary     TEXT,
                 created_at  DATETIME NOT NULL
             );
+
+            CREATE INDEX IF NOT EXISTS idx_articles_normalized_url ON articles(normalized_url);
+            CREATE INDEX IF NOT EXISTS idx_tasks_article_id ON tasks(article_id);
+            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+            CREATE INDEX IF NOT EXISTS idx_tasks_updated_at ON tasks(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_inbound_messages_received_at ON inbound_messages(received_at);
             "#,
             )
             .context("初始化 SQLite 表结构失败")?;
@@ -110,9 +391,25 @@ impl TaskStore {
     }
 }
 
+fn normalize_url(input: &str) -> Result<String> {
+    let mut url = Url::parse(input).with_context(|| format!("无效 URL: {input}"))?;
+    url.set_fragment(None);
+    let mut normalized = url.to_string();
+    if url.path() == "/" && url.query().is_none() && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    Ok(normalized)
+}
+
+fn source_domain(normalized_url: &str) -> Option<String> {
+    Url::parse(normalized_url)
+        .ok()
+        .and_then(|url| url.host_str().map(ToOwned::to_owned))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::TaskStore;
+    use super::{LinkTaskRecord, PendingTaskRecord, RecentTaskRecord, TaskStatusRecord, TaskStore};
     use rusqlite::Connection;
     use std::fs;
     use uuid::Uuid;
@@ -219,5 +516,237 @@ mod tests {
 
         assert_eq!(count, 1);
         assert_eq!(text, "first");
+    }
+
+    #[test]
+    fn link_submission_creates_article_and_task() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let record = store
+            .record_link_submission("https://example.com/path?q=1")
+            .expect("写入链接失败");
+        drop(store);
+
+        let conn = Connection::open(&db_path).expect("打开数据库失败");
+        let article_row: (String, String) = conn
+            .query_row(
+                "SELECT id, normalized_url FROM articles WHERE id = ?1",
+                [record.article_id.clone()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("查询文章失败");
+        let task_row: (String, String) = conn
+            .query_row(
+                "SELECT id, article_id FROM tasks WHERE id = ?1",
+                [record.task_id.clone()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("查询任务失败");
+
+        assert_eq!(article_row.0, record.article_id);
+        assert_eq!(article_row.1, "https://example.com/path?q=1");
+        assert_eq!(task_row.0, record.task_id);
+        assert_eq!(task_row.1, record.article_id);
+        assert!(record.created_new);
+    }
+
+    #[test]
+    fn duplicate_link_returns_existing_article_and_task() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let first = store
+            .record_link_submission("https://example.com")
+            .expect("首次写入链接失败");
+        let second = store
+            .record_link_submission("https://example.com/")
+            .expect("重复写入链接失败");
+        drop(store);
+
+        let conn = Connection::open(&db_path).expect("打开数据库失败");
+        let article_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM articles", [], |row| row.get(0))
+            .expect("查询文章数量失败");
+        let task_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .expect("查询任务数量失败");
+
+        assert_eq!(
+            second,
+            LinkTaskRecord {
+                article_id: first.article_id.clone(),
+                task_id: first.task_id.clone(),
+                normalized_url: "https://example.com".to_string(),
+                original_url: "https://example.com/".to_string(),
+                created_new: false,
+            }
+        );
+        assert_eq!(article_count, 1);
+        assert_eq!(task_count, 1);
+    }
+
+    #[test]
+    fn task_status_can_be_queried() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let created = store
+            .record_link_submission("https://example.com/status")
+            .expect("写入链接失败");
+        let status = store
+            .get_task_status(&created.task_id)
+            .expect("查询任务状态失败")
+            .expect("应存在任务状态");
+
+        assert_eq!(
+            status,
+            TaskStatusRecord {
+                task_id: created.task_id.clone(),
+                article_id: created.article_id.clone(),
+                status: "pending".to_string(),
+                retry_count: 0,
+                last_error: None,
+                created_at: status.created_at.clone(),
+                updated_at: status.updated_at.clone(),
+            }
+        );
+    }
+
+    #[test]
+    fn querying_missing_task_returns_none() {
+        let db_path = temp_db_path();
+        let store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let status = store
+            .get_task_status("missing-task")
+            .expect("查询不存在任务失败");
+
+        assert_eq!(status, None);
+    }
+
+    #[test]
+    fn recent_tasks_returns_latest_first() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let first = store
+            .record_link_submission("https://example.com/one")
+            .expect("写入第一条链接失败");
+        let second = store
+            .record_link_submission("https://example.com/two")
+            .expect("写入第二条链接失败");
+
+        let tasks = store.list_recent_tasks(10).expect("查询最近任务失败");
+
+        assert_eq!(
+            tasks,
+            vec![
+                RecentTaskRecord {
+                    task_id: second.task_id,
+                    status: "pending".to_string(),
+                    normalized_url: "https://example.com/two".to_string(),
+                    updated_at: tasks[0].updated_at.clone(),
+                },
+                RecentTaskRecord {
+                    task_id: first.task_id,
+                    status: "pending".to_string(),
+                    normalized_url: "https://example.com/one".to_string(),
+                    updated_at: tasks[1].updated_at.clone(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn retry_task_resets_status_and_clears_error() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        let created = store
+            .record_link_submission("https://example.com/retry")
+            .expect("写入链接失败");
+
+        let conn = Connection::open(&db_path).expect("打开数据库失败");
+        conn.execute(
+            "UPDATE tasks SET status = 'failed', retry_count = 2, last_error = 'boom' WHERE id = ?1",
+            [created.task_id.as_str()],
+        )
+        .expect("准备失败任务状态失败");
+        drop(conn);
+
+        let retried = store
+            .retry_task(&created.task_id)
+            .expect("重试任务失败")
+            .expect("应存在任务");
+
+        assert_eq!(retried.status, "pending");
+        assert_eq!(retried.retry_count, 3);
+        assert_eq!(retried.last_error, None);
+    }
+
+    #[test]
+    fn retry_missing_task_returns_none() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let retried = store
+            .retry_task("missing-task")
+            .expect("重试不存在任务失败");
+
+        assert_eq!(retried, None);
+    }
+
+    #[test]
+    fn pending_tasks_can_be_listed_and_archived() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        let created = store
+            .record_link_submission("https://example.com/pending")
+            .expect("写入链接失败");
+
+        let pending = store.list_pending_tasks(10).expect("查询 pending 失败");
+        assert_eq!(
+            pending,
+            vec![PendingTaskRecord {
+                task_id: created.task_id.clone(),
+                article_id: created.article_id.clone(),
+                normalized_url: "https://example.com/pending".to_string(),
+                original_url: "https://example.com/pending".to_string(),
+            }]
+        );
+
+        assert!(store
+            .mark_task_archived(&created.task_id)
+            .expect("更新 archived 状态失败"));
+
+        let pending_after = store.list_pending_tasks(10).expect("查询 pending 失败");
+        let status = store
+            .get_task_status(&created.task_id)
+            .expect("查询状态失败")
+            .expect("应存在任务");
+
+        assert!(pending_after.is_empty());
+        assert_eq!(status.status, "archived");
+    }
+
+    #[test]
+    fn task_can_be_marked_failed() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        let created = store
+            .record_link_submission("https://example.com/fail")
+            .expect("写入链接失败");
+
+        assert!(store
+            .mark_task_failed(&created.task_id, "network fail")
+            .expect("更新 failed 状态失败"));
+
+        let status = store
+            .get_task_status(&created.task_id)
+            .expect("查询状态失败")
+            .expect("应存在任务");
+
+        assert_eq!(status.status, "failed");
+        assert_eq!(status.last_error, Some("network fail".to_string()));
     }
 }

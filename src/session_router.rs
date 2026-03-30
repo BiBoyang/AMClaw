@@ -43,7 +43,11 @@ impl SessionRouter {
         }
 
         match intent {
-            RouteIntent::Ignore => SessionEvent::Noop,
+            RouteIntent::Ignore
+            | RouteIntent::LinkSubmission { .. }
+            | RouteIntent::TaskStatusQuery { .. }
+            | RouteIntent::TaskRetryRequest { .. }
+            | RouteIntent::RecentTasksQuery => SessionEvent::Noop,
             RouteIntent::ChatContinue { text } | RouteIntent::ChatPending { text } => {
                 self.push_text(user_id, text, now);
                 SessionEvent::Noop

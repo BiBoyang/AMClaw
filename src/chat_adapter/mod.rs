@@ -1,6 +1,7 @@
 use crate::agent_core::AgentCore;
 use crate::command_router;
 use crate::config::AppConfig;
+use crate::pipeline::Pipeline;
 use crate::session_router::{SessionEvent, SessionRouter};
 use crate::task_store::TaskStore;
 use anyhow::{bail, Context, Result};
@@ -341,6 +342,7 @@ impl ILinkClient {
 struct WeChatBot {
     agent_core: AgentCore,
     client: ILinkClient,
+    pipeline: Pipeline,
     task_store: TaskStore,
     context_token_map: HashMap<String, String>,
     cursor: String,
@@ -354,9 +356,11 @@ impl WeChatBot {
     fn new(config: AppConfig, running: Arc<AtomicBool>) -> Result<Self> {
         let workspace_root = std::env::current_dir().context("获取工作目录失败")?;
         let db_path = config.db_path();
+        let root_dir = config.resolved_root_dir();
         Ok(Self {
             agent_core: AgentCore::new(workspace_root)?,
             client: ILinkClient::new(config.wechat.channel_version.clone())?,
+            pipeline: Pipeline::new(root_dir),
             task_store: TaskStore::open(&db_path)?,
             context_token_map: HashMap::new(),
             cursor: String::new(),
@@ -378,6 +382,7 @@ impl WeChatBot {
     fn poll_loop(&mut self) {
         while self.running.load(Ordering::Relaxed) {
             self.flush_expired_sessions();
+            self.process_pending_tasks();
 
             let poll_timeout = self.next_poll_timeout();
             match self.client.get_updates(&self.cursor, poll_timeout) {
@@ -388,6 +393,7 @@ impl WeChatBot {
                     for msg in result.messages {
                         self.handle_message(msg);
                     }
+                    self.process_pending_tasks();
                 }
                 Err(err) => {
                     if is_poll_timeout_error(&err) {
@@ -433,10 +439,26 @@ impl WeChatBot {
 
         println!("[收到消息] {from_user_id}: {text}");
         let intent = command_router::route_text(&text);
-        let event = self
-            .session_router
-            .on_intent(from_user_id, intent, Instant::now());
-        self.handle_session_event(event);
+        match intent {
+            command_router::RouteIntent::TaskRetryRequest { task_id } => {
+                self.handle_task_retry(from_user_id, &task_id);
+            }
+            command_router::RouteIntent::RecentTasksQuery => {
+                self.handle_recent_tasks_query(from_user_id);
+            }
+            command_router::RouteIntent::TaskStatusQuery { task_id } => {
+                self.handle_task_status_query(from_user_id, &task_id);
+            }
+            command_router::RouteIntent::LinkSubmission { urls } => {
+                self.handle_link_submission(from_user_id, urls);
+            }
+            other => {
+                let event = self
+                    .session_router
+                    .on_intent(from_user_id, other, Instant::now());
+                self.handle_session_event(event);
+            }
+        }
     }
 
     fn extract_message_id(&self, msg: &WireMessage) -> String {
@@ -517,10 +539,51 @@ impl WeChatBot {
             return format!("现在是 {}", now.format("%Y-%m-%d %H:%M:%S"));
         }
         if user_text == "帮助" || user_text == "help" {
-            return "可用命令:\n- hello / 你好\n- 时间\n- 帮助 / help\n- 其他文字我会 echo 回复"
+            return "可用命令:\n- hello / 你好\n- 时间\n- 帮助 / help\n- 发送链接或 收藏 <url>\n- 状态 <task_id>\n- 最近任务\n- 重试 <task_id>\n- 其他文字我会 echo 回复"
                 .to_string();
         }
         format!("Echo: {user_text}")
+    }
+
+    fn handle_link_submission(&mut self, user_id: &str, urls: Vec<String>) {
+        let mut records = Vec::new();
+        let mut failures = Vec::new();
+
+        for url in urls {
+            match self.task_store.record_link_submission(&url) {
+                Ok(record) => records.push(record),
+                Err(err) => failures.push(format!("{url} => {err}")),
+            }
+        }
+
+        let reply = build_link_submission_reply(&records, &failures);
+        self.send_reply_text(user_id, &reply);
+    }
+
+    fn handle_task_status_query(&self, user_id: &str, task_id: &str) {
+        let reply = match self.task_store.get_task_status(task_id) {
+            Ok(Some(status)) => build_task_status_reply(&status),
+            Ok(None) => format!("未找到对应任务: {task_id}"),
+            Err(err) => format!("查询任务状态失败: {err}"),
+        };
+        self.send_reply_text(user_id, &reply);
+    }
+
+    fn handle_recent_tasks_query(&self, user_id: &str) {
+        let reply = match self.task_store.list_recent_tasks(5) {
+            Ok(tasks) => build_recent_tasks_reply(&tasks),
+            Err(err) => format!("查询最近任务失败: {err}"),
+        };
+        self.send_reply_text(user_id, &reply);
+    }
+
+    fn handle_task_retry(&mut self, user_id: &str, task_id: &str) {
+        let reply = match self.task_store.retry_task(task_id) {
+            Ok(Some(status)) => build_task_retry_reply(&status),
+            Ok(None) => format!("未找到对应任务: {task_id}"),
+            Err(err) => format!("重试任务失败: {err}"),
+        };
+        self.send_reply_text(user_id, &reply);
     }
 
     fn handle_session_event(&mut self, event: SessionEvent) {
@@ -559,6 +622,10 @@ impl WeChatBot {
         println!("[会话提交] {user_id}: {display_text}");
 
         let reply = self.generate_reply(merged_text);
+        self.send_reply_text(user_id, &reply);
+    }
+
+    fn send_reply_text(&self, user_id: &str, reply: &str) {
         let Some(token) = self.context_token_map.get(user_id).cloned() else {
             println!("[警告] 无 {user_id} 的 context_token，跳过回复");
             return;
@@ -567,6 +634,48 @@ impl WeChatBot {
         match self.client.send_text_message(user_id, &reply, &token) {
             Ok(()) => println!("[已回复] {user_id}: {reply}"),
             Err(err) => eprintln!("[发送失败] {err}"),
+        }
+    }
+
+    fn process_pending_tasks(&mut self) {
+        let pending = match self.task_store.list_pending_tasks(5) {
+            Ok(tasks) => tasks,
+            Err(err) => {
+                eprintln!("[任务] 查询 pending 失败: {err}");
+                return;
+            }
+        };
+
+        for task in pending {
+            match self.pipeline.process_pending_task(&task) {
+                Ok(result) => {
+                    if let Err(err) = self.task_store.mark_task_archived(&task.task_id) {
+                        eprintln!("[任务] 更新 archived 失败 task_id={}: {err}", task.task_id);
+                        continue;
+                    }
+                    println!(
+                        "[任务] 已归档 task_id={} output={}",
+                        task.task_id,
+                        result.output_path.display()
+                    );
+                }
+                Err(err) => {
+                    let err_text = err.to_string();
+                    if let Err(mark_err) =
+                        self.task_store.mark_task_failed(&task.task_id, &err_text)
+                    {
+                        eprintln!(
+                            "[任务] 更新 failed 失败 task_id={} error={} mark_error={}",
+                            task.task_id, err_text, mark_err
+                        );
+                    } else {
+                        eprintln!(
+                            "[任务] 处理失败 task_id={} error={}",
+                            task.task_id, err_text
+                        );
+                    }
+                }
+            }
         }
     }
 }
@@ -593,6 +702,87 @@ fn is_poll_timeout_error(err: &anyhow::Error) -> bool {
     err.chain()
         .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
         .any(reqwest::Error::is_timeout)
+}
+
+fn build_link_submission_reply(
+    records: &[crate::task_store::LinkTaskRecord],
+    failures: &[String],
+) -> String {
+    let mut lines = Vec::new();
+    if !records.is_empty() {
+        if records.len() == 1 && failures.is_empty() {
+            let record = &records[0];
+            let status = if record.created_new {
+                "已收录链接"
+            } else {
+                "链接已存在"
+            };
+            lines.push(status.to_string());
+            lines.push(format!("url: {}", record.normalized_url));
+            lines.push(format!("task_id: {}", record.task_id));
+        } else {
+            lines.push("链接处理结果:".to_string());
+            for record in records {
+                let status = if record.created_new {
+                    "新建"
+                } else {
+                    "已存在"
+                };
+                lines.push(format!(
+                    "- {status} {} task_id={}",
+                    record.normalized_url, record.task_id
+                ));
+            }
+        }
+    }
+    for failure in failures {
+        lines.push(format!("- 失败 {failure}"));
+    }
+    if lines.is_empty() {
+        return "没有可入库的链接".to_string();
+    }
+    lines.join("\n")
+}
+
+fn build_task_status_reply(status: &crate::task_store::TaskStatusRecord) -> String {
+    let mut lines = vec![
+        "任务状态".to_string(),
+        format!("task_id: {}", status.task_id),
+        format!("status: {}", status.status),
+        format!("retry_count: {}", status.retry_count),
+        format!("updated_at: {}", status.updated_at),
+    ];
+    if let Some(last_error) = &status.last_error {
+        if !last_error.trim().is_empty() {
+            lines.push(format!("last_error: {last_error}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn build_recent_tasks_reply(tasks: &[crate::task_store::RecentTaskRecord]) -> String {
+    if tasks.is_empty() {
+        return "最近没有任务".to_string();
+    }
+
+    let mut lines = vec!["最近任务:".to_string()];
+    for task in tasks {
+        lines.push(format!(
+            "- {} {} task_id={}",
+            task.status, task.normalized_url, task.task_id
+        ));
+    }
+    lines.join("\n")
+}
+
+fn build_task_retry_reply(status: &crate::task_store::TaskStatusRecord) -> String {
+    [
+        "任务已重置为 pending".to_string(),
+        format!("task_id: {}", status.task_id),
+        format!("retry_count: {}", status.retry_count),
+        format!("updated_at: {}", status.updated_at),
+    ]
+    .join("\n")
 }
 
 fn assert_ok(resp: &Value, action: &str) -> Result<()> {
@@ -701,6 +891,7 @@ fn now_epoch_ms() -> i64 {
 mod tests {
     use super::{ILinkClient, WeChatBot, WireMessage};
     use crate::agent_core::AgentCore;
+    use crate::pipeline::Pipeline;
     use crate::session_router::SessionRouter;
     use crate::task_store::TaskStore;
     use rusqlite::Connection;
@@ -726,6 +917,7 @@ mod tests {
         WeChatBot {
             agent_core: AgentCore::new(workspace_root).expect("初始化 agent 失败"),
             client: ILinkClient::new("1.0.0").expect("初始化 iLink 客户端失败"),
+            pipeline: Pipeline::new(temp_dir()),
             task_store: TaskStore::open(db_path).expect("初始化 task store 失败"),
             context_token_map: HashMap::new(),
             cursor: String::new(),
@@ -757,6 +949,50 @@ mod tests {
             |row| row.get(0),
         )
         .expect("查询消息数量失败")
+    }
+
+    fn article_count(db_path: &std::path::Path) -> i64 {
+        let conn = Connection::open(db_path).expect("打开数据库失败");
+        conn.query_row("SELECT COUNT(*) FROM articles", [], |row| row.get(0))
+            .expect("查询文章数量失败")
+    }
+
+    fn task_count(db_path: &std::path::Path) -> i64 {
+        let conn = Connection::open(db_path).expect("打开数据库失败");
+        conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .expect("查询任务数量失败")
+    }
+
+    fn first_task_id(db_path: &std::path::Path) -> String {
+        let conn = Connection::open(db_path).expect("打开数据库失败");
+        conn.query_row("SELECT id FROM tasks LIMIT 1", [], |row| row.get(0))
+            .expect("应存在任务")
+    }
+
+    fn task_row(db_path: &std::path::Path, task_id: &str) -> Option<(String, i64, Option<String>)> {
+        let conn = Connection::open(db_path).expect("打开数据库失败");
+        conn.query_row(
+            "SELECT status, retry_count, last_error FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok()
+    }
+
+    fn first_article_and_task(db_path: &std::path::Path) -> Option<(String, String, String)> {
+        let conn = Connection::open(db_path).expect("打开数据库失败");
+        conn.query_row(
+            r#"
+            SELECT a.normalized_url, a.original_url, t.status
+            FROM articles a
+            JOIN tasks t ON t.article_id = a.id
+            ORDER BY a.created_at ASC
+            LIMIT 1
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok()
     }
 
     #[test]
@@ -818,5 +1054,188 @@ mod tests {
         });
 
         assert_eq!(message_count(&db_path, "msg-3"), 0);
+    }
+
+    #[test]
+    fn link_message_creates_article_and_task() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "收藏 https://example.com/path?q=1".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-4".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        assert_eq!(article_count(&db_path), 1);
+        assert_eq!(task_count(&db_path), 1);
+        assert_eq!(
+            first_article_and_task(&db_path),
+            Some((
+                "https://example.com/path?q=1".to_string(),
+                "https://example.com/path?q=1".to_string(),
+                "pending".to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn duplicate_link_messages_do_not_create_second_article_or_task() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "https://example.com".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-5".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "https://example.com/".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-6".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        assert_eq!(article_count(&db_path), 1);
+        assert_eq!(task_count(&db_path), 1);
+    }
+
+    #[test]
+    fn status_query_does_not_create_article_or_task() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "状态 task-unknown".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-7".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        assert_eq!(article_count(&db_path), 0);
+        assert_eq!(task_count(&db_path), 0);
+        assert_eq!(message_count(&db_path, "msg-7"), 1);
+    }
+
+    #[test]
+    fn status_query_after_link_keeps_single_task() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "https://example.com/status-check".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-8".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let conn = Connection::open(&db_path).expect("打开数据库失败");
+        let task_id: String = conn
+            .query_row("SELECT id FROM tasks LIMIT 1", [], |row| row.get(0))
+            .expect("应存在任务");
+        drop(conn);
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: format!("状态 {task_id}"),
+            message_id: Some(super::FlexibleId::Str("msg-9".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        assert_eq!(article_count(&db_path), 1);
+        assert_eq!(task_count(&db_path), 1);
+        assert_eq!(message_count(&db_path, "msg-9"), 1);
+    }
+
+    #[test]
+    fn recent_tasks_query_does_not_create_new_tasks() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "https://example.com/recent".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-10".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "最近任务".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-11".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        assert_eq!(article_count(&db_path), 1);
+        assert_eq!(task_count(&db_path), 1);
+        assert_eq!(message_count(&db_path, "msg-11"), 1);
+    }
+
+    #[test]
+    fn retry_command_resets_task_to_pending() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "https://example.com/retry-chat".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-12".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let task_id = first_task_id(&db_path);
+        let conn = Connection::open(&db_path).expect("打开数据库失败");
+        conn.execute(
+            "UPDATE tasks SET status = 'failed', retry_count = 1, last_error = 'boom' WHERE id = ?1",
+            [task_id.as_str()],
+        )
+        .expect("准备失败任务失败");
+        drop(conn);
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: format!("重试 {task_id}"),
+            message_id: Some(super::FlexibleId::Str("msg-13".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        assert_eq!(
+            task_row(&db_path, &task_id),
+            Some(("pending".to_string(), 2, None))
+        );
+        assert_eq!(message_count(&db_path, "msg-13"), 1);
+    }
+
+    #[test]
+    fn pending_link_task_can_be_processed_to_archived() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "https://example.com/archive-me".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-14".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let task_id = first_task_id(&db_path);
+        bot.process_pending_tasks();
+
+        assert_eq!(
+            task_row(&db_path, &task_id).map(|row| row.0),
+            Some("archived".to_string())
+        );
     }
 }

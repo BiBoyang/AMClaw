@@ -1,5 +1,9 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteIntent {
+    TaskRetryRequest { task_id: String },
+    RecentTasksQuery,
+    TaskStatusQuery { task_id: String },
+    LinkSubmission { urls: Vec<String> },
     ChatContinue { text: String },
     ChatCommit { text: String },
     ChatPending { text: String },
@@ -10,6 +14,23 @@ pub fn route_text(input: &str) -> RouteIntent {
     let text = input.trim();
     if text.is_empty() {
         return RouteIntent::Ignore;
+    }
+
+    if is_recent_tasks_query(text) {
+        return RouteIntent::RecentTasksQuery;
+    }
+
+    if let Some(task_id) = parse_retry_query(text) {
+        return RouteIntent::TaskRetryRequest { task_id };
+    }
+
+    if let Some(task_id) = parse_status_query(text) {
+        return RouteIntent::TaskStatusQuery { task_id };
+    }
+
+    let urls = extract_urls(text);
+    if !urls.is_empty() {
+        return RouteIntent::LinkSubmission { urls };
     }
 
     if text.ends_with("..") {
@@ -36,9 +57,163 @@ fn strip_suffix_and_trim(input: &str, suffix: &str) -> Option<String> {
     Some(stripped.to_string())
 }
 
+fn parse_status_query(input: &str) -> Option<String> {
+    let rest = input
+        .strip_prefix("状态 ")
+        .or_else(|| input.strip_prefix("status "))?;
+    let task_id = rest.trim();
+    if task_id.is_empty() {
+        return None;
+    }
+    Some(task_id.to_string())
+}
+
+fn parse_retry_query(input: &str) -> Option<String> {
+    let rest = input
+        .strip_prefix("重试 ")
+        .or_else(|| input.strip_prefix("retry "))?;
+    let task_id = rest.trim();
+    if task_id.is_empty() {
+        return None;
+    }
+    Some(task_id.to_string())
+}
+
+fn is_recent_tasks_query(input: &str) -> bool {
+    matches!(input, "最近任务" | "最新任务" | "recent tasks" | "recent")
+}
+
+fn extract_urls(input: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    for token in input.split_whitespace() {
+        let candidate = token
+            .trim_matches(is_opening_wrapper)
+            .trim_end_matches(is_trailing_wrapper_or_punct)
+            .trim();
+        if is_supported_url(candidate) && !urls.iter().any(|v| v == candidate) {
+            urls.push(candidate.to_string());
+        }
+    }
+    urls
+}
+
+fn is_supported_url(input: &str) -> bool {
+    input.starts_with("http://") || input.starts_with("https://")
+}
+
+fn is_opening_wrapper(ch: char) -> bool {
+    matches!(
+        ch,
+        '"' | '\'' | '<' | '(' | '[' | '{' | '“' | '‘' | '（' | '【' | '《'
+    )
+}
+
+fn is_trailing_wrapper_or_punct(ch: char) -> bool {
+    matches!(
+        ch,
+        '"' | '\''
+            | '>'
+            | ')'
+            | ']'
+            | '}'
+            | ','
+            | '.'
+            | '!'
+            | '?'
+            | ';'
+            | ':'
+            | '”'
+            | '’'
+            | '）'
+            | '】'
+            | '》'
+            | '，'
+            | '。'
+            | '！'
+            | '？'
+            | '；'
+            | '：'
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{route_text, RouteIntent};
+
+    #[test]
+    fn url_becomes_link_submission() {
+        assert_eq!(
+            route_text("https://example.com"),
+            RouteIntent::LinkSubmission {
+                urls: vec!["https://example.com".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn status_command_becomes_task_query() {
+        assert_eq!(
+            route_text("状态 task-123"),
+            RouteIntent::TaskStatusQuery {
+                task_id: "task-123".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn english_status_command_is_supported() {
+        assert_eq!(
+            route_text("status task-456"),
+            RouteIntent::TaskStatusQuery {
+                task_id: "task-456".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn retry_command_becomes_task_retry() {
+        assert_eq!(
+            route_text("重试 task-123"),
+            RouteIntent::TaskRetryRequest {
+                task_id: "task-123".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn recent_tasks_command_is_supported() {
+        assert_eq!(route_text("最近任务"), RouteIntent::RecentTasksQuery);
+    }
+
+    #[test]
+    fn mixed_text_with_url_becomes_link_submission() {
+        assert_eq!(
+            route_text("看看这个 https://example.com/path?q=1"),
+            RouteIntent::LinkSubmission {
+                urls: vec!["https://example.com/path?q=1".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn trailing_punctuation_is_removed_from_url() {
+        assert_eq!(
+            route_text("收藏 https://example.com/abc!!"),
+            RouteIntent::LinkSubmission {
+                urls: vec!["https://example.com/abc".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn duplicate_urls_are_deduplicated() {
+        assert_eq!(
+            route_text("https://example.com https://example.com"),
+            RouteIntent::LinkSubmission {
+                urls: vec!["https://example.com".to_string()]
+            }
+        );
+    }
 
     #[test]
     fn plain_text_becomes_pending() {

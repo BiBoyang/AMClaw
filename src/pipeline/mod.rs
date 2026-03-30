@@ -313,8 +313,9 @@ impl Pipeline {
         fs::create_dir_all(&output_dir)
             .with_context(|| format!("创建归档目录失败: {}", output_dir.display()))?;
         let output_path = output_dir.join(format!("{}.md", task.task_id));
+        let body = extract_primary_body(&html).unwrap_or_else(|| preview_text(&html));
         let content = format!(
-            "# Archived Link\n\n- task_id: {}\n- article_id: {}\n- normalized_url: {}\n- original_url: {}\n- final_url: {}\n- title: {}\n- archived_at: {}\n- source: browser_capture\n- page_kind: {}\n- screenshot_path: {}\n\n## Preview\n\n{}\n",
+            "# Archived Link\n\n- task_id: {}\n- article_id: {}\n- normalized_url: {}\n- original_url: {}\n- final_url: {}\n- title: {}\n- archived_at: {}\n- source: browser_capture\n- page_kind: {}\n- screenshot_path: {}\n\n## Content\n\n{}\n",
             task.task_id,
             task.article_id,
             task.normalized_url,
@@ -324,7 +325,7 @@ impl Pipeline {
             Utc::now().to_rfc3339(),
             capture.page_kind,
             capture.screenshot_path.display(),
-            preview_text(&html),
+            body,
         );
         fs::write(&output_path, content)
             .with_context(|| format!("写入浏览器归档文件失败: {}", output_path.display()))?;
@@ -400,6 +401,98 @@ fn preview_text(html: &str) -> String {
         preview.push_str("...");
     }
     preview
+}
+
+fn extract_primary_body(html: &str) -> Option<String> {
+    let activity_title = extract_element_text_by_id(html, "activity-name");
+    let body = extract_element_inner_html_by_id(html, "js_content")
+        .map(|fragment| html_fragment_to_text(&fragment))
+        .filter(|text| !text.trim().is_empty());
+
+    match (activity_title, body) {
+        (Some(title), Some(body)) => Some(format!("## {}\n\n{}", title.trim(), body.trim())),
+        (None, Some(body)) => Some(body.trim().to_string()),
+        (Some(title), None) => Some(format!("## {}", title.trim())),
+        (None, None) => None,
+    }
+}
+
+fn extract_element_text_by_id(html: &str, element_id: &str) -> Option<String> {
+    extract_element_inner_html_by_id(html, element_id)
+        .map(|fragment| html_fragment_to_text(&fragment))
+}
+
+fn extract_element_inner_html_by_id(html: &str, element_id: &str) -> Option<String> {
+    let id_patterns = [format!("id=\"{element_id}\""), format!("id='{element_id}'")];
+    let mut start_idx = None;
+    for pattern in id_patterns {
+        if let Some(found) = html.find(&pattern) {
+            start_idx = Some(found);
+            break;
+        }
+    }
+    let start_idx = start_idx?;
+    let tag_open_start = html[..start_idx].rfind('<')?;
+    let tag_open_end = html[start_idx..].find('>')? + start_idx;
+    let tag_name = html[tag_open_start + 1..]
+        .split_whitespace()
+        .next()?
+        .trim_start_matches('/')
+        .trim_end_matches('>');
+    let close_tag = format!("</{tag_name}>");
+    let content_start = tag_open_end + 1;
+    let content_end = html[content_start..].find(&close_tag)? + content_start;
+    html.get(content_start..content_end).map(ToOwned::to_owned)
+}
+
+fn html_fragment_to_text(fragment: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    let mut in_entity = false;
+    let mut entity = String::new();
+
+    for ch in fragment.chars() {
+        if in_tag {
+            if ch == '>' {
+                in_tag = false;
+                out.push('\n');
+            }
+            continue;
+        }
+        if in_entity {
+            if ch == ';' {
+                out.push_str(decode_html_entity(&entity));
+                entity.clear();
+                in_entity = false;
+            } else {
+                entity.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '<' => in_tag = true,
+            '&' => in_entity = true,
+            _ => out.push(ch),
+        }
+    }
+
+    out.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn decode_html_entity(entity: &str) -> &str {
+    match entity {
+        "nbsp" => " ",
+        "amp" => "&",
+        "lt" => "<",
+        "gt" => ">",
+        "quot" => "\"",
+        "#39" => "'",
+        _ => "",
+    }
 }
 
 fn should_prefer_browser_capture(url: &str) -> bool {
@@ -481,8 +574,8 @@ fn detect_wechat_error_page(url: &str, html: &str) -> std::result::Result<(), Pi
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_wechat_error_page, detect_wechat_redirect, extract_html_title,
-        should_prefer_browser_capture, Pipeline, PipelineFailureKind,
+        detect_wechat_error_page, detect_wechat_redirect, extract_html_title, extract_primary_body,
+        should_prefer_browser_capture, BrowserCaptureResult, Pipeline, PipelineFailureKind,
     };
     use crate::task_store::{PendingTaskRecord, TaskContentRecord};
     use std::fs;
@@ -588,5 +681,71 @@ mod tests {
         assert!(!should_prefer_browser_capture(
             "https://example.com/article"
         ));
+    }
+
+    #[test]
+    fn primary_body_extracts_wechat_title_and_content() {
+        let html = r#"
+<html>
+  <body>
+    <h1 id="activity-name">公众号标题</h1>
+    <div id="js_content">
+      <p>第一段内容</p>
+      <p>第二段内容</p>
+    </div>
+  </body>
+</html>
+"#;
+
+        let body = extract_primary_body(html).expect("应提取出正文");
+
+        assert!(body.contains("## 公众号标题"));
+        assert!(body.contains("第一段内容"));
+        assert!(body.contains("第二段内容"));
+    }
+
+    #[test]
+    fn browser_capture_archive_uses_extracted_body() {
+        let root = temp_dir();
+        let pipeline = Pipeline::new(&root, None);
+        let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let raw_dir = root.join("raw").join(&day);
+        let output_dir = root.join("processed").join(day);
+        std::fs::create_dir_all(&raw_dir).expect("创建 raw 目录失败");
+        std::fs::create_dir_all(&output_dir).expect("创建 processed 目录失败");
+
+        let html_path = raw_dir.join("task-browser.browser.html");
+        let screenshot_path = root.join("snapshots").join("shot.png");
+        std::fs::create_dir_all(screenshot_path.parent().expect("应有父目录"))
+            .expect("创建 screenshot 目录失败");
+        std::fs::write(
+            &html_path,
+            r#"<html><body><h1 id="activity-name">公众号标题</h1><div id="js_content"><p>正文第一段</p></div></body></html>"#,
+        )
+        .expect("写 HTML 失败");
+        std::fs::write(&screenshot_path, "fake").expect("写 screenshot 失败");
+
+        let task = PendingTaskRecord {
+            task_id: "task-browser".to_string(),
+            article_id: "article-browser".to_string(),
+            normalized_url: "https://mp.weixin.qq.com/s/demo".to_string(),
+            original_url: "https://mp.weixin.qq.com/s/demo".to_string(),
+        };
+        let capture = BrowserCaptureResult {
+            page_kind: "article".to_string(),
+            final_url: "https://mp.weixin.qq.com/s/demo".to_string(),
+            title: Some("公众号标题".to_string()),
+            html_path,
+            screenshot_path,
+        };
+
+        let result = pipeline
+            .archive_browser_capture(&task, &capture)
+            .expect("归档浏览器抓取结果失败");
+        let content = std::fs::read_to_string(result.output_path).expect("读取归档文件失败");
+
+        assert!(content.contains("## 公众号标题"));
+        assert!(content.contains("正文第一段"));
+        assert!(content.contains("source: browser_capture"));
     }
 }

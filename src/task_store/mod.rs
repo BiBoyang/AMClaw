@@ -22,10 +22,12 @@ pub struct TaskStatusRecord {
     pub article_id: String,
     pub normalized_url: String,
     pub title: Option<String>,
+    pub page_kind: Option<String>,
     pub status: String,
     pub retry_count: i64,
     pub last_error: Option<String>,
     pub output_path: Option<String>,
+    pub snapshot_path: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -44,6 +46,15 @@ pub struct PendingTaskRecord {
     pub article_id: String,
     pub normalized_url: String,
     pub original_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskContentRecord {
+    pub task_id: String,
+    pub article_id: String,
+    pub normalized_url: String,
+    pub original_url: String,
+    pub title: Option<String>,
 }
 
 #[derive(Debug)]
@@ -180,7 +191,7 @@ impl TaskStore {
             .conn
             .query_row(
                 r#"
-                SELECT t.id, t.article_id, a.normalized_url, a.title, t.status, t.retry_count, t.last_error, t.output_path, t.created_at, t.updated_at
+                SELECT t.id, t.article_id, a.normalized_url, a.title, t.page_kind, t.status, t.retry_count, t.last_error, t.output_path, t.snapshot_path, t.created_at, t.updated_at
                 FROM tasks t
                 JOIN articles a ON a.id = t.article_id
                 WHERE t.id = ?1
@@ -192,17 +203,45 @@ impl TaskStore {
                         article_id: row.get(1)?,
                         normalized_url: row.get(2)?,
                         title: row.get(3)?,
-                        status: row.get(4)?,
-                        retry_count: row.get(5)?,
-                        last_error: row.get(6)?,
-                        output_path: row.get(7)?,
-                        created_at: row.get(8)?,
-                        updated_at: row.get(9)?,
+                        page_kind: row.get(4)?,
+                        status: row.get(5)?,
+                        retry_count: row.get(6)?,
+                        last_error: row.get(7)?,
+                        output_path: row.get(8)?,
+                        snapshot_path: row.get(9)?,
+                        created_at: row.get(10)?,
+                        updated_at: row.get(11)?,
                     })
                 },
             )
             .optional()
             .context("查询任务状态失败")?;
+        Ok(task)
+    }
+
+    pub fn get_task_content(&self, task_id: &str) -> Result<Option<TaskContentRecord>> {
+        let task = self
+            .conn
+            .query_row(
+                r#"
+                SELECT t.id, t.article_id, a.normalized_url, a.original_url, a.title
+                FROM tasks t
+                JOIN articles a ON a.id = t.article_id
+                WHERE t.id = ?1
+                "#,
+                [task_id],
+                |row| {
+                    Ok(TaskContentRecord {
+                        task_id: row.get(0)?,
+                        article_id: row.get(1)?,
+                        normalized_url: row.get(2)?,
+                        original_url: row.get(3)?,
+                        title: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .context("查询任务上下文失败")?;
         Ok(task)
     }
 
@@ -248,6 +287,9 @@ impl TaskStore {
                 SET status = 'pending',
                     retry_count = retry_count + 1,
                     last_error = NULL,
+                    page_kind = NULL,
+                    output_path = NULL,
+                    snapshot_path = NULL,
                     updated_at = ?2
                 WHERE id = ?1
                 "#,
@@ -261,7 +303,7 @@ impl TaskStore {
         let task = tx
             .query_row(
                 r#"
-                SELECT t.id, t.article_id, a.normalized_url, a.title, t.status, t.retry_count, t.last_error, t.output_path, t.created_at, t.updated_at
+                SELECT t.id, t.article_id, a.normalized_url, a.title, t.page_kind, t.status, t.retry_count, t.last_error, t.output_path, t.snapshot_path, t.created_at, t.updated_at
                 FROM tasks t
                 JOIN articles a ON a.id = t.article_id
                 WHERE t.id = ?1
@@ -273,12 +315,14 @@ impl TaskStore {
                         article_id: row.get(1)?,
                         normalized_url: row.get(2)?,
                         title: row.get(3)?,
-                        status: row.get(4)?,
-                        retry_count: row.get(5)?,
-                        last_error: row.get(6)?,
-                        output_path: row.get(7)?,
-                        created_at: row.get(8)?,
-                        updated_at: row.get(9)?,
+                        page_kind: row.get(4)?,
+                        status: row.get(5)?,
+                        retry_count: row.get(6)?,
+                        last_error: row.get(7)?,
+                        output_path: row.get(8)?,
+                        snapshot_path: row.get(9)?,
+                        created_at: row.get(10)?,
+                        updated_at: row.get(11)?,
                     })
                 },
             )
@@ -325,13 +369,14 @@ impl TaskStore {
         task_id: &str,
         output_path: &str,
         title: Option<&str>,
+        page_kind: Option<&str>,
     ) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
         let tx = self.conn.transaction().context("开启 archived 事务失败")?;
         let updated = tx
             .execute(
-                "UPDATE tasks SET status = 'archived', last_error = NULL, output_path = ?2, updated_at = ?3 WHERE id = ?1",
-                params![task_id, output_path, now.clone()],
+                "UPDATE tasks SET status = 'archived', last_error = NULL, output_path = ?2, page_kind = COALESCE(?3, page_kind), updated_at = ?4 WHERE id = ?1",
+                params![task_id, output_path, page_kind, now.clone()],
             )
             .context("更新 archived 状态失败")?;
         if updated == 0 {
@@ -353,12 +398,30 @@ impl TaskStore {
         Ok(updated > 0)
     }
 
+    pub fn mark_task_awaiting_manual_input(
+        &mut self,
+        task_id: &str,
+        last_error: &str,
+        page_kind: &str,
+        snapshot_path: Option<&str>,
+    ) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE tasks SET status = 'awaiting_manual_input', last_error = ?2, page_kind = ?3, snapshot_path = ?4, output_path = NULL, updated_at = ?5 WHERE id = ?1",
+                params![task_id, last_error, page_kind, snapshot_path, now],
+            )
+            .context("更新 awaiting_manual_input 状态失败")?;
+        Ok(updated > 0)
+    }
+
     pub fn mark_task_failed(&mut self, task_id: &str, last_error: &str) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
         let updated = self
             .conn
             .execute(
-                "UPDATE tasks SET status = 'failed', last_error = ?2, output_path = NULL, updated_at = ?3 WHERE id = ?1",
+                "UPDATE tasks SET status = 'failed', last_error = ?2, page_kind = NULL, output_path = NULL, snapshot_path = NULL, updated_at = ?3 WHERE id = ?1",
                 params![task_id, last_error, now],
             )
             .context("更新 failed 状态失败")?;
@@ -387,7 +450,9 @@ impl TaskStore {
                 status       TEXT NOT NULL DEFAULT 'pending',
                 retry_count  INTEGER NOT NULL DEFAULT 0,
                 last_error   TEXT,
+                page_kind    TEXT,
                 output_path  TEXT,
+                snapshot_path TEXT,
                 created_at   DATETIME NOT NULL,
                 updated_at   DATETIME NOT NULL
             );
@@ -421,7 +486,9 @@ impl TaskStore {
             "#,
             )
             .context("初始化 SQLite 表结构失败")?;
+        ensure_column_exists(&self.conn, "tasks", "page_kind", "TEXT")?;
         ensure_column_exists(&self.conn, "tasks", "output_path", "TEXT")?;
+        ensure_column_exists(&self.conn, "tasks", "snapshot_path", "TEXT")?;
         Ok(())
     }
 }
@@ -712,10 +779,12 @@ mod tests {
                 article_id: created.article_id.clone(),
                 normalized_url: "https://example.com/status".to_string(),
                 title: None,
+                page_kind: None,
                 status: "pending".to_string(),
                 retry_count: 0,
                 last_error: None,
                 output_path: None,
+                snapshot_path: None,
                 created_at: status.created_at.clone(),
                 updated_at: status.updated_at.clone(),
             }
@@ -790,8 +859,11 @@ mod tests {
 
         assert_eq!(retried.status, "pending");
         assert_eq!(retried.normalized_url, "https://example.com/retry");
+        assert_eq!(retried.page_kind, None);
         assert_eq!(retried.retry_count, 3);
         assert_eq!(retried.last_error, None);
+        assert_eq!(retried.output_path, None);
+        assert_eq!(retried.snapshot_path, None);
     }
 
     #[test]
@@ -826,7 +898,12 @@ mod tests {
         );
 
         assert!(store
-            .mark_task_archived(&created.task_id, "/tmp/example.md", Some("Example Title"),)
+            .mark_task_archived(
+                &created.task_id,
+                "/tmp/example.md",
+                Some("Example Title"),
+                Some("article"),
+            )
             .expect("更新 archived 状态失败"));
 
         let pending_after = store.list_pending_tasks(10).expect("查询 pending 失败");
@@ -837,6 +914,7 @@ mod tests {
 
         assert!(pending_after.is_empty());
         assert_eq!(status.status, "archived");
+        assert_eq!(status.page_kind, Some("article".to_string()));
         assert_eq!(status.output_path, Some("/tmp/example.md".to_string()));
         assert_eq!(status.title, Some("Example Title".to_string()));
     }
@@ -860,5 +938,35 @@ mod tests {
 
         assert_eq!(status.status, "failed");
         assert_eq!(status.last_error, Some("network fail".to_string()));
+    }
+
+    #[test]
+    fn task_can_be_marked_awaiting_manual_input() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        let created = store
+            .record_link_submission("https://mp.weixin.qq.com/s/manual")
+            .expect("写入链接失败");
+
+        assert!(store
+            .mark_task_awaiting_manual_input(
+                &created.task_id,
+                "微信公众号页面需要验证码验证",
+                "wechat_captcha",
+                None,
+            )
+            .expect("更新 awaiting_manual_input 状态失败"));
+
+        let status = store
+            .get_task_status(&created.task_id)
+            .expect("查询状态失败")
+            .expect("应存在任务");
+
+        assert_eq!(status.status, "awaiting_manual_input");
+        assert_eq!(status.page_kind, Some("wechat_captcha".to_string()));
+        assert_eq!(
+            status.last_error,
+            Some("微信公众号页面需要验证码验证".to_string())
+        );
     }
 }

@@ -1,5 +1,6 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteIntent {
+    ManualContentSubmission { task_id: String, content: String },
     TaskRetryRequest { task_id: String },
     RecentTasksQuery,
     TaskStatusQuery { task_id: String },
@@ -14,6 +15,10 @@ pub fn route_text(input: &str) -> RouteIntent {
     let text = input.trim();
     if text.is_empty() {
         return RouteIntent::Ignore;
+    }
+
+    if let Some((task_id, content)) = parse_manual_content_submission(text) {
+        return RouteIntent::ManualContentSubmission { task_id, content };
     }
 
     if is_recent_tasks_query(text) {
@@ -66,6 +71,17 @@ fn parse_status_query(input: &str) -> Option<String> {
         return None;
     }
     Some(task_id.to_string())
+}
+
+fn parse_manual_content_submission(input: &str) -> Option<(String, String)> {
+    let rest = input.strip_prefix("补正文 ")?;
+    let (task_id, content) = rest.split_once("::")?;
+    let task_id = task_id.trim();
+    let content = content.trim();
+    if task_id.is_empty() || content.is_empty() {
+        return None;
+    }
+    Some((task_id.to_string(), content.to_string()))
 }
 
 fn parse_retry_query(input: &str) -> Option<String> {
@@ -183,6 +199,17 @@ mod tests {
     #[test]
     fn recent_tasks_command_is_supported() {
         assert_eq!(route_text("最近任务"), RouteIntent::RecentTasksQuery);
+    }
+
+    #[test]
+    fn manual_content_submission_is_supported() {
+        assert_eq!(
+            route_text("补正文 task-123 :: 这是人工补录的正文"),
+            RouteIntent::ManualContentSubmission {
+                task_id: "task-123".to_string(),
+                content: "这是人工补录的正文".to_string()
+            }
+        );
     }
 
     #[test]

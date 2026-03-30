@@ -440,6 +440,9 @@ impl WeChatBot {
         println!("[收到消息] {from_user_id}: {text}");
         let intent = command_router::route_text(&text);
         match intent {
+            command_router::RouteIntent::ManualContentSubmission { task_id, content } => {
+                self.handle_manual_content_submission(from_user_id, &task_id, &content);
+            }
             command_router::RouteIntent::TaskRetryRequest { task_id } => {
                 self.handle_task_retry(from_user_id, &task_id);
             }
@@ -586,6 +589,32 @@ impl WeChatBot {
         self.send_reply_text(user_id, &reply);
     }
 
+    fn handle_manual_content_submission(&mut self, user_id: &str, task_id: &str, content: &str) {
+        let reply = match self.task_store.get_task_content(task_id) {
+            Ok(Some(task)) => match self.pipeline.archive_manual_content(&task, content) {
+                Ok(result) => {
+                    let output_path = result.output_path.to_string_lossy().to_string();
+                    match self.task_store.mark_task_archived(
+                        task_id,
+                        &output_path,
+                        result.title.as_deref(),
+                        Some("manual_input"),
+                    ) {
+                        Ok(true) => format!(
+                            "已写入人工补正文\ntask_id: {task_id}\noutput_path: {output_path}"
+                        ),
+                        Ok(false) => format!("未找到对应任务: {task_id}"),
+                        Err(err) => format!("更新任务状态失败: {err}"),
+                    }
+                }
+                Err(err) => format!("人工补录归档失败: {err}"),
+            },
+            Ok(None) => format!("未找到对应任务: {task_id}"),
+            Err(err) => format!("查询任务上下文失败: {err}"),
+        };
+        self.send_reply_text(user_id, &reply);
+    }
+
     fn handle_session_event(&mut self, event: SessionEvent) {
         if let SessionEvent::FlushNow {
             user_id,
@@ -654,6 +683,7 @@ impl WeChatBot {
                         &task.task_id,
                         &output_path,
                         result.title.as_deref(),
+                        Some("article"),
                     ) {
                         eprintln!("[任务] 更新 archived 失败 task_id={}: {err}", task.task_id);
                         continue;
@@ -664,22 +694,42 @@ impl WeChatBot {
                         result.output_path.display()
                     );
                 }
-                Err(err) => {
-                    let err_text = err.to_string();
-                    if let Err(mark_err) =
-                        self.task_store.mark_task_failed(&task.task_id, &err_text)
-                    {
-                        eprintln!(
-                            "[任务] 更新 failed 失败 task_id={} error={} mark_error={}",
-                            task.task_id, err_text, mark_err
-                        );
-                    } else {
-                        eprintln!(
-                            "[任务] 处理失败 task_id={} error={}",
-                            task.task_id, err_text
-                        );
+                Err(err) => match err.kind {
+                    crate::pipeline::PipelineFailureKind::AwaitingManualInput { page_kind } => {
+                        if let Err(mark_err) = self.task_store.mark_task_awaiting_manual_input(
+                            &task.task_id,
+                            &err.message,
+                            &page_kind,
+                            None,
+                        ) {
+                            eprintln!(
+                                    "[任务] 更新 awaiting_manual_input 失败 task_id={} error={} mark_error={}",
+                                    task.task_id, err.message, mark_err
+                                );
+                        } else {
+                            eprintln!(
+                                "[任务] 需人工补录 task_id={} page_kind={} error={}",
+                                task.task_id, page_kind, err.message
+                            );
+                        }
                     }
-                }
+                    crate::pipeline::PipelineFailureKind::Failed => {
+                        if let Err(mark_err) = self
+                            .task_store
+                            .mark_task_failed(&task.task_id, &err.message)
+                        {
+                            eprintln!(
+                                "[任务] 更新 failed 失败 task_id={} error={} mark_error={}",
+                                task.task_id, err.message, mark_err
+                            );
+                        } else {
+                            eprintln!(
+                                "[任务] 处理失败 task_id={} error={}",
+                                task.task_id, err.message
+                            );
+                        }
+                    }
+                },
             }
         }
     }
@@ -754,6 +804,10 @@ fn build_task_status_reply(status: &crate::task_store::TaskStatusRecord) -> Stri
         "任务状态".to_string(),
         format!("task_id: {}", status.task_id),
         format!("url: {}", status.normalized_url),
+        format!(
+            "page_kind: {}",
+            status.page_kind.as_deref().unwrap_or("unknown")
+        ),
         format!("status: {}", status.status),
         format!("retry_count: {}", status.retry_count),
         format!("created_at: {}", status.created_at),
@@ -769,10 +823,21 @@ fn build_task_status_reply(status: &crate::task_store::TaskStatusRecord) -> Stri
             lines.push(format!("output_path: {output_path}"));
         }
     }
+    if let Some(snapshot_path) = &status.snapshot_path {
+        if !snapshot_path.trim().is_empty() {
+            lines.push(format!("snapshot_path: {snapshot_path}"));
+        }
+    }
     if let Some(last_error) = &status.last_error {
         if !last_error.trim().is_empty() {
             lines.push(format!("last_error: {last_error}"));
         }
+    }
+    if status.status == "awaiting_manual_input" {
+        lines.push(format!(
+            "action_required: 请使用 补正文 {} :: <content>",
+            status.task_id
+        ));
     }
     lines.join("\n")
 }
@@ -992,6 +1057,19 @@ mod tests {
             "SELECT status, retry_count, last_error FROM tasks WHERE id = ?1",
             [task_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok()
+    }
+
+    fn task_status_details(
+        db_path: &std::path::Path,
+        task_id: &str,
+    ) -> Option<(String, Option<String>, Option<String>, Option<String>)> {
+        let conn = Connection::open(db_path).expect("打开数据库失败");
+        conn.query_row(
+            "SELECT status, page_kind, output_path, last_error FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .ok()
     }
@@ -1255,5 +1333,71 @@ mod tests {
             status.as_deref(),
             Some("archived") | Some("failed")
         ));
+    }
+
+    #[test]
+    fn task_status_can_reflect_awaiting_manual_input() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "https://mp.weixin.qq.com/s/YUvXg9i31QuQN6t-zRTe8g".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-15".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let task_id = first_task_id(&db_path);
+        bot.task_store
+            .mark_task_awaiting_manual_input(
+                &task_id,
+                "微信公众号页面需要验证码验证",
+                "wechat_captcha",
+                None,
+            )
+            .expect("更新 awaiting_manual_input 状态失败");
+
+        let details = task_status_details(&db_path, &task_id).expect("应存在任务状态");
+        assert_eq!(details.0, "awaiting_manual_input".to_string());
+        assert_eq!(details.1, Some("wechat_captcha".to_string()));
+        assert!(details.3.is_some());
+    }
+
+    #[test]
+    fn manual_content_submission_archives_task() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "https://mp.weixin.qq.com/s/YUvXg9i31QuQN6t-zRTe8g".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-16".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let task_id = first_task_id(&db_path);
+        bot.task_store
+            .mark_task_awaiting_manual_input(
+                &task_id,
+                "微信公众号页面需要验证码验证",
+                "wechat_captcha",
+                None,
+            )
+            .expect("更新 awaiting_manual_input 状态失败");
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: format!("补正文 {task_id} :: 这是人工补录的公众号正文"),
+            message_id: Some(super::FlexibleId::Str("msg-17".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let details = task_status_details(&db_path, &task_id).expect("应存在任务状态");
+        assert_eq!(details.0, "archived".to_string());
+        assert_eq!(details.1, Some("manual_input".to_string()));
+        assert!(details.2.is_some());
     }
 }

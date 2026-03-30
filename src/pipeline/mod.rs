@@ -1,10 +1,12 @@
-use crate::task_store::PendingTaskRecord;
-use anyhow::{bail, Context, Result};
+use crate::task_store::{PendingTaskRecord, TaskContentRecord};
+use anyhow::{Context, Result};
 use chrono::Utc;
 use reqwest::blocking::Client;
 use reqwest::header::LOCATION;
 use reqwest::redirect::Policy;
 use reqwest::Url;
+use std::error::Error;
+use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -21,6 +23,44 @@ pub struct PipelineResult {
     pub title: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipelineFailureKind {
+    AwaitingManualInput { page_kind: String },
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelineTaskError {
+    pub kind: PipelineFailureKind,
+    pub message: String,
+}
+
+impl PipelineTaskError {
+    fn failed(message: impl Into<String>) -> Self {
+        Self {
+            kind: PipelineFailureKind::Failed,
+            message: message.into(),
+        }
+    }
+
+    fn awaiting_manual_input(page_kind: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind: PipelineFailureKind::AwaitingManualInput {
+                page_kind: page_kind.into(),
+            },
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for PipelineTaskError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for PipelineTaskError {}
+
 impl Pipeline {
     pub fn new(root_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -28,22 +68,72 @@ impl Pipeline {
         }
     }
 
-    pub fn process_pending_task(&self, task: &PendingTaskRecord) -> Result<PipelineResult> {
+    pub fn process_pending_task(
+        &self,
+        task: &PendingTaskRecord,
+    ) -> std::result::Result<PipelineResult, PipelineTaskError> {
         let html = self.fetch_html(&task.normalized_url)?;
         self.archive_html(task, &html)
+            .map_err(|err| PipelineTaskError::failed(format!("归档页面失败: {err}")))
     }
 
-    fn fetch_html(&self, url: &str) -> Result<String> {
+    pub fn archive_manual_content(
+        &self,
+        task: &TaskContentRecord,
+        content: &str,
+    ) -> Result<PipelineResult> {
+        let day = Utc::now().format("%Y-%m-%d").to_string();
+        let raw_dir = self.root_dir.join("raw").join(&day);
+        let output_dir = self.root_dir.join("processed").join(day);
+        fs::create_dir_all(&raw_dir)
+            .with_context(|| format!("创建原始目录失败: {}", raw_dir.display()))?;
+        fs::create_dir_all(&output_dir)
+            .with_context(|| format!("创建归档目录失败: {}", output_dir.display()))?;
+
+        let raw_path = raw_dir.join(format!("{}.manual.txt", task.task_id));
+        let output_path = output_dir.join(format!("{}.md", task.task_id));
+        fs::write(&raw_path, content)
+            .with_context(|| format!("写入人工正文失败: {}", raw_path.display()))?;
+
+        let title = task
+            .title
+            .clone()
+            .or_else(|| extract_manual_title(content))
+            .filter(|v| !v.trim().is_empty());
+        let body = content.trim();
+        let content = format!(
+            "# Archived Link\n\n- task_id: {}\n- article_id: {}\n- normalized_url: {}\n- original_url: {}\n- title: {}\n- archived_at: {}\n- source: manual_input\n\n## Content\n\n{}\n",
+            task.task_id,
+            task.article_id,
+            task.normalized_url,
+            task.original_url,
+            title.clone().unwrap_or_else(|| "(none)".to_string()),
+            Utc::now().to_rfc3339(),
+            body,
+        );
+        fs::write(&output_path, content)
+            .with_context(|| format!("写入人工归档文件失败: {}", output_path.display()))?;
+
+        Ok(PipelineResult {
+            output_path,
+            raw_path,
+            title,
+        })
+    }
+
+    fn fetch_html(&self, url: &str) -> std::result::Result<String, PipelineTaskError> {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
             .redirect(Policy::none())
             .build()
-            .context("创建 pipeline HTTP 客户端失败")?;
+            .map_err(|err| {
+                PipelineTaskError::failed(format!("创建 pipeline HTTP 客户端失败: {err}"))
+            })?;
         let response = client
             .get(url)
             .send()
-            .with_context(|| format!("抓取页面失败: {url}"))?;
+            .map_err(|err| PipelineTaskError::failed(format!("抓取页面失败: {url} ({err})")))?;
         let status = response.status();
         if status.is_redirection() {
             if let Some(location) = response
@@ -53,12 +143,22 @@ impl Pipeline {
             {
                 detect_wechat_redirect(location)?;
             }
-            bail!("抓取页面失败: HTTP {} {}", status.as_u16(), url);
+            return Err(PipelineTaskError::failed(format!(
+                "抓取页面失败: HTTP {} {}",
+                status.as_u16(),
+                url
+            )));
         }
         if !status.is_success() {
-            bail!("抓取页面失败: HTTP {} {}", status.as_u16(), url);
+            return Err(PipelineTaskError::failed(format!(
+                "抓取页面失败: HTTP {} {}",
+                status.as_u16(),
+                url
+            )));
         }
-        let html = response.text().context("读取页面正文失败")?;
+        let html = response
+            .text()
+            .map_err(|err| PipelineTaskError::failed(format!("读取页面正文失败: {err}")))?;
         detect_wechat_error_page(url, &html)?;
         Ok(html)
     }
@@ -127,7 +227,15 @@ fn preview_text(html: &str) -> String {
     preview
 }
 
-fn detect_wechat_redirect(location: &str) -> Result<()> {
+fn extract_manual_title(content: &str) -> Option<String> {
+    content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(80).collect::<String>())
+}
+
+fn detect_wechat_redirect(location: &str) -> std::result::Result<(), PipelineTaskError> {
     let parsed = Url::parse(location)
         .or_else(|_| Url::parse(&format!("https://mp.weixin.qq.com{location}")))
         .ok();
@@ -139,15 +247,21 @@ fn detect_wechat_redirect(location: &str) -> Result<()> {
     }
     let path = url.path();
     if path.contains("wappoc_appmsgcaptcha") {
-        bail!("微信公众号页面需要验证码验证");
+        return Err(PipelineTaskError::awaiting_manual_input(
+            "wechat_captcha",
+            "微信公众号页面需要验证码验证",
+        ));
     }
     if path.contains("mp/appmsg/show") || path.contains("mp/profile_ext") {
-        bail!("微信公众号页面跳转到受限页面");
+        return Err(PipelineTaskError::awaiting_manual_input(
+            "wechat_permission_denied",
+            "微信公众号页面跳转到受限页面",
+        ));
     }
     Ok(())
 }
 
-fn detect_wechat_error_page(url: &str, html: &str) -> Result<()> {
+fn detect_wechat_error_page(url: &str, html: &str) -> std::result::Result<(), PipelineTaskError> {
     let parsed = Url::parse(url).ok();
     if parsed.as_ref().and_then(Url::domain) != Some("mp.weixin.qq.com") {
         return Ok(());
@@ -157,17 +271,26 @@ fn detect_wechat_error_page(url: &str, html: &str) -> Result<()> {
     let text = preview_text(html);
 
     if title.contains("未知错误") || text.contains("未知错误，请稍后再试") {
-        bail!("微信公众号页面返回错误页");
+        return Err(PipelineTaskError::awaiting_manual_input(
+            "wechat_error",
+            "微信公众号页面返回错误页",
+        ));
     }
     if text.contains("你暂无权限查看此页面内容") || text.contains("失效的验证页面")
     {
-        bail!("微信公众号页面暂无访问权限");
+        return Err(PipelineTaskError::awaiting_manual_input(
+            "wechat_permission_denied",
+            "微信公众号页面暂无访问权限",
+        ));
     }
     if text.contains("微信公众平台安全验证")
         || text.contains("请输入图中的验证码")
         || text.contains("poc_token")
     {
-        bail!("微信公众号页面需要验证码验证");
+        return Err(PipelineTaskError::awaiting_manual_input(
+            "wechat_captcha",
+            "微信公众号页面需要验证码验证",
+        ));
     }
 
     Ok(())
@@ -175,8 +298,11 @@ fn detect_wechat_error_page(url: &str, html: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_wechat_error_page, detect_wechat_redirect, extract_html_title, Pipeline};
-    use crate::task_store::PendingTaskRecord;
+    use super::{
+        detect_wechat_error_page, detect_wechat_redirect, extract_html_title, Pipeline,
+        PipelineFailureKind,
+    };
+    use crate::task_store::{PendingTaskRecord, TaskContentRecord};
     use std::fs;
     use uuid::Uuid;
 
@@ -224,6 +350,28 @@ mod tests {
     }
 
     #[test]
+    fn manual_content_creates_archive() {
+        let root = temp_dir();
+        let pipeline = Pipeline::new(&root);
+        let task = TaskContentRecord {
+            task_id: "task-manual".to_string(),
+            article_id: "article-1".to_string(),
+            normalized_url: "https://mp.weixin.qq.com/s/abc".to_string(),
+            original_url: "https://mp.weixin.qq.com/s/abc".to_string(),
+            title: None,
+        };
+
+        let result = pipeline
+            .archive_manual_content(&task, "这是人工补录的正文\n第二行")
+            .expect("人工补录归档失败");
+        let content = fs::read_to_string(&result.output_path).expect("读取归档文件失败");
+
+        assert!(content.contains("source: manual_input"));
+        assert!(content.contains("这是人工补录的正文"));
+        assert_eq!(result.title, Some("这是人工补录的正文".to_string()));
+    }
+
+    #[test]
     fn wechat_error_page_is_rejected() {
         let err = detect_wechat_error_page(
             "https://mp.weixin.qq.com/s/abc",
@@ -231,7 +379,10 @@ mod tests {
         )
         .expect_err("应识别公众号错误页");
 
-        assert!(err.to_string().contains("微信公众"));
+        assert!(matches!(
+            err.kind,
+            PipelineFailureKind::AwaitingManualInput { .. }
+        ));
     }
 
     #[test]
@@ -241,6 +392,9 @@ mod tests {
         )
         .expect_err("应识别公众号验证码跳转");
 
-        assert!(err.to_string().contains("验证码"));
+        assert!(matches!(
+            err.kind,
+            PipelineFailureKind::AwaitingManualInput { .. }
+        ));
     }
 }

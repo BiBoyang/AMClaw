@@ -45,6 +45,7 @@ impl SessionRouter {
         match intent {
             RouteIntent::Ignore
             | RouteIntent::LinkSubmission { .. }
+            | RouteIntent::ManualContentSubmission { .. }
             | RouteIntent::TaskStatusQuery { .. }
             | RouteIntent::TaskRetryRequest { .. }
             | RouteIntent::RecentTasksQuery => SessionEvent::Noop,

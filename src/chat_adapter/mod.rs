@@ -748,6 +748,7 @@ fn build_task_status_reply(status: &crate::task_store::TaskStatusRecord) -> Stri
     let mut lines = vec![
         "任务状态".to_string(),
         format!("task_id: {}", status.task_id),
+        format!("url: {}", status.normalized_url),
         format!("status: {}", status.status),
         format!("retry_count: {}", status.retry_count),
         format!("updated_at: {}", status.updated_at),

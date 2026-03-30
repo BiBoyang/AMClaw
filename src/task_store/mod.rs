@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use reqwest::Url;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use uuid::Uuid;
@@ -19,6 +20,7 @@ pub struct LinkTaskRecord {
 pub struct TaskStatusRecord {
     pub task_id: String,
     pub article_id: String,
+    pub normalized_url: String,
     pub status: String,
     pub retry_count: i64,
     pub last_error: Option<String>,
@@ -176,20 +178,22 @@ impl TaskStore {
             .conn
             .query_row(
                 r#"
-                SELECT id, article_id, status, retry_count, last_error, created_at, updated_at
-                FROM tasks
-                WHERE id = ?1
+                SELECT t.id, t.article_id, a.normalized_url, t.status, t.retry_count, t.last_error, t.created_at, t.updated_at
+                FROM tasks t
+                JOIN articles a ON a.id = t.article_id
+                WHERE t.id = ?1
                 "#,
                 [task_id],
                 |row| {
                     Ok(TaskStatusRecord {
                         task_id: row.get(0)?,
                         article_id: row.get(1)?,
-                        status: row.get(2)?,
-                        retry_count: row.get(3)?,
-                        last_error: row.get(4)?,
-                        created_at: row.get(5)?,
-                        updated_at: row.get(6)?,
+                        normalized_url: row.get(2)?,
+                        status: row.get(3)?,
+                        retry_count: row.get(4)?,
+                        last_error: row.get(5)?,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
                     })
                 },
             )
@@ -253,20 +257,22 @@ impl TaskStore {
         let task = tx
             .query_row(
                 r#"
-                SELECT id, article_id, status, retry_count, last_error, created_at, updated_at
-                FROM tasks
-                WHERE id = ?1
+                SELECT t.id, t.article_id, a.normalized_url, t.status, t.retry_count, t.last_error, t.created_at, t.updated_at
+                FROM tasks t
+                JOIN articles a ON a.id = t.article_id
+                WHERE t.id = ?1
                 "#,
                 [task_id],
                 |row| {
                     Ok(TaskStatusRecord {
                         task_id: row.get(0)?,
                         article_id: row.get(1)?,
-                        status: row.get(2)?,
-                        retry_count: row.get(3)?,
-                        last_error: row.get(4)?,
-                        created_at: row.get(5)?,
-                        updated_at: row.get(6)?,
+                        normalized_url: row.get(2)?,
+                        status: row.get(3)?,
+                        retry_count: row.get(4)?,
+                        last_error: row.get(5)?,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
                     })
                 },
             )
@@ -394,11 +400,39 @@ impl TaskStore {
 fn normalize_url(input: &str) -> Result<String> {
     let mut url = Url::parse(input).with_context(|| format!("无效 URL: {input}"))?;
     url.set_fragment(None);
+    strip_tracking_query_pairs(&mut url);
     let mut normalized = url.to_string();
     if url.path() == "/" && url.query().is_none() && normalized.ends_with('/') {
         normalized.pop();
     }
     Ok(normalized)
+}
+
+fn strip_tracking_query_pairs(url: &mut Url) {
+    let tracking_keys: HashSet<&str> = [
+        "fbclid", "gclid", "mc_cid", "mc_eid", "mkt_tok", "spm", "si",
+    ]
+    .into_iter()
+    .collect();
+
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(key, _)| {
+            let key = key.as_ref();
+            !key.starts_with("utm_") && !tracking_keys.contains(key)
+        })
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+
+    url.set_query(None);
+    if pairs.is_empty() {
+        return;
+    }
+
+    let mut query_pairs = url.query_pairs_mut();
+    for (key, value) in pairs {
+        query_pairs.append_pair(&key, &value);
+    }
 }
 
 fn source_domain(normalized_url: &str) -> Option<String> {
@@ -587,6 +621,23 @@ mod tests {
     }
 
     #[test]
+    fn tracking_query_params_are_removed_during_normalization() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let first = store
+            .record_link_submission("https://example.com/page?utm_source=x&gclid=1&id=42")
+            .expect("首次写入链接失败");
+        let second = store
+            .record_link_submission("https://example.com/page?id=42&utm_medium=email")
+            .expect("重复写入链接失败");
+
+        assert_eq!(first.normalized_url, "https://example.com/page?id=42");
+        assert_eq!(second.normalized_url, "https://example.com/page?id=42");
+        assert!(!second.created_new);
+    }
+
+    #[test]
     fn task_status_can_be_queried() {
         let db_path = temp_db_path();
         let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
@@ -604,6 +655,7 @@ mod tests {
             TaskStatusRecord {
                 task_id: created.task_id.clone(),
                 article_id: created.article_id.clone(),
+                normalized_url: "https://example.com/status".to_string(),
                 status: "pending".to_string(),
                 retry_count: 0,
                 last_error: None,
@@ -680,6 +732,7 @@ mod tests {
             .expect("应存在任务");
 
         assert_eq!(retried.status, "pending");
+        assert_eq!(retried.normalized_url, "https://example.com/retry");
         assert_eq!(retried.retry_count, 3);
         assert_eq!(retried.last_error, None);
     }

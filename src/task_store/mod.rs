@@ -406,6 +406,29 @@ impl TaskStore {
         Ok(tasks)
     }
 
+    pub fn get_pending_task(&self, task_id: &str) -> Result<Option<PendingTaskRecord>> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT t.id, t.article_id, a.normalized_url, a.original_url
+                FROM tasks t
+                JOIN articles a ON a.id = t.article_id
+                WHERE t.id = ?1 AND t.status = 'pending'
+                "#,
+                [task_id],
+                |row| {
+                    Ok(PendingTaskRecord {
+                        task_id: row.get(0)?,
+                        article_id: row.get(1)?,
+                        normalized_url: row.get(2)?,
+                        original_url: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .context("查询指定 pending 任务失败")
+    }
+
     pub fn mark_task_archived(
         &mut self,
         task_id: &str,

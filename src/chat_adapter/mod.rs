@@ -606,7 +606,11 @@ impl WeChatBot {
 
     fn handle_task_retry(&mut self, user_id: &str, task_id: &str) {
         let reply = match self.task_store.retry_task(task_id) {
-            Ok(Some(status)) => build_task_retry_reply(&status),
+            Ok(Some(_status)) => match self.process_pending_task_by_id(task_id) {
+                Ok(Some(final_status)) => build_task_retry_reply(&final_status),
+                Ok(None) => format!("未找到对应任务: {task_id}"),
+                Err(err) => format!("任务已重置为 pending，但重试处理失败: {err}"),
+            },
             Ok(None) => format!("未找到对应任务: {task_id}"),
             Err(err) => format!("重试任务失败: {err}"),
         };
@@ -710,14 +714,36 @@ impl WeChatBot {
         };
 
         for task in pending {
-            match self.pipeline.process_pending_task(&task) {
-                Ok(result) => {
-                    let output_path = result.output_path.to_string_lossy().to_string();
-                    let snapshot_path = result
-                        .snapshot_path
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().to_string());
-                    if let Err(err) = self.task_store.mark_task_archived(
+            if let Err(err) = self.process_single_pending_task(&task) {
+                eprintln!("[任务] 处理 pending 失败 task_id={} error={err}", task.task_id);
+            }
+        }
+    }
+
+    fn process_pending_task_by_id(
+        &mut self,
+        task_id: &str,
+    ) -> Result<Option<crate::task_store::TaskStatusRecord>> {
+        let Some(task) = self.task_store.get_pending_task(task_id)? else {
+            return self.task_store.get_task_status(task_id);
+        };
+        self.process_single_pending_task(&task)?;
+        self.task_store.get_task_status(task_id)
+    }
+
+    fn process_single_pending_task(
+        &mut self,
+        task: &crate::task_store::PendingTaskRecord,
+    ) -> Result<()> {
+        match self.pipeline.process_pending_task(task) {
+            Ok(result) => {
+                let output_path = result.output_path.to_string_lossy().to_string();
+                let snapshot_path = result
+                    .snapshot_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string());
+                self.task_store
+                    .mark_task_archived(
                         &task.task_id,
                         &output_path,
                         result.title.as_deref(),
@@ -728,60 +754,47 @@ impl WeChatBot {
                         } else {
                             "http"
                         }),
-                    ) {
-                        eprintln!("[任务] 更新 archived 失败 task_id={}: {err}", task.task_id);
-                        continue;
-                    }
-                    println!(
-                        "[任务] 已归档 task_id={} output={}",
-                        task.task_id,
-                        result.output_path.display()
-                    );
-                }
-                Err(err) => match err.kind {
-                    crate::pipeline::PipelineFailureKind::AwaitingManualInput { page_kind } => {
-                        let snapshot_path = err
-                            .snapshot_path
-                            .as_ref()
-                            .map(|path| path.to_string_lossy().to_string());
-                        let content_source = err.content_source.clone();
-                        if let Err(mark_err) = self.task_store.mark_task_awaiting_manual_input(
+                    )
+                    .with_context(|| format!("更新 archived 失败 task_id={}", task.task_id))?;
+                println!(
+                    "[任务] 已归档 task_id={} output={}",
+                    task.task_id,
+                    result.output_path.display()
+                );
+            }
+            Err(err) => match err.kind {
+                crate::pipeline::PipelineFailureKind::AwaitingManualInput { page_kind } => {
+                    let snapshot_path = err
+                        .snapshot_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().to_string());
+                    let content_source = err.content_source.clone();
+                    self.task_store
+                        .mark_task_awaiting_manual_input(
                             &task.task_id,
                             &err.message,
                             &page_kind,
                             snapshot_path.as_deref(),
                             content_source.as_deref(),
-                        ) {
-                            eprintln!(
-                                    "[任务] 更新 awaiting_manual_input 失败 task_id={} error={} mark_error={}",
-                                    task.task_id, err.message, mark_err
-                                );
-                        } else {
-                            eprintln!(
-                                "[任务] 需人工补录 task_id={} page_kind={} error={}",
-                                task.task_id, page_kind, err.message
-                            );
-                        }
-                    }
-                    crate::pipeline::PipelineFailureKind::Failed => {
-                        if let Err(mark_err) = self
-                            .task_store
-                            .mark_task_failed(&task.task_id, &err.message)
-                        {
-                            eprintln!(
-                                "[任务] 更新 failed 失败 task_id={} error={} mark_error={}",
-                                task.task_id, err.message, mark_err
-                            );
-                        } else {
-                            eprintln!(
-                                "[任务] 处理失败 task_id={} error={}",
-                                task.task_id, err.message
-                            );
-                        }
-                    }
-                },
-            }
+                        )
+                        .with_context(|| {
+                            format!("更新 awaiting_manual_input 失败 task_id={}", task.task_id)
+                        })?;
+                    eprintln!(
+                        "[任务] 需人工补录 task_id={} page_kind={} error={}",
+                        task.task_id, page_kind, err.message
+                    );
+                }
+                crate::pipeline::PipelineFailureKind::Failed => {
+                    self.task_store
+                        .mark_task_failed(&task.task_id, &err.message)
+                        .with_context(|| format!("更新 failed 失败 task_id={}", task.task_id))?;
+                    eprintln!("[任务] 处理失败 task_id={} error={}", task.task_id, err.message);
+                }
+            },
         }
+
+        Ok(())
     }
 }
 
@@ -935,13 +948,7 @@ fn build_manual_tasks_reply(tasks: &[crate::task_store::RecentTaskRecord]) -> St
 }
 
 fn build_task_retry_reply(status: &crate::task_store::TaskStatusRecord) -> String {
-    [
-        "任务已重置为 pending".to_string(),
-        format!("task_id: {}", status.task_id),
-        format!("retry_count: {}", status.retry_count),
-        format!("updated_at: {}", status.updated_at),
-    ]
-    .join("\n")
+    format!("任务已重试\n{}", build_task_status_reply(status))
 }
 
 fn assert_ok(resp: &Value, action: &str) -> Result<()> {
@@ -1354,7 +1361,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_command_resets_task_to_pending() {
+    fn retry_command_processes_task_immediately() {
         let db_path = temp_db_path();
         let mut bot = test_bot(&db_path);
 
@@ -1383,10 +1390,9 @@ mod tests {
             ..WireMessage::default()
         });
 
-        assert_eq!(
-            task_row(&db_path, &task_id),
-            Some(("pending".to_string(), 2, None))
-        );
+        let row = task_row(&db_path, &task_id).expect("应存在任务");
+        assert_eq!(row.1, 2);
+        assert_ne!(row.0, "pending");
         assert_eq!(message_count(&db_path, "msg-13"), 1);
     }
 

@@ -1,3 +1,5 @@
+use reqwest::Url;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteIntent {
     ManualContentSubmission { task_id: String, content: String },
@@ -118,15 +120,47 @@ fn extract_urls(input: &str) -> Vec<String> {
             .trim_matches(is_opening_wrapper)
             .trim_end_matches(is_trailing_wrapper_or_punct)
             .trim();
-        if is_supported_url(candidate) && !urls.iter().any(|v| v == candidate) {
-            urls.push(candidate.to_string());
+        if let Some(url) = normalize_supported_url(candidate) {
+            if !urls.iter().any(|v| v == &url) {
+                urls.push(url);
+            }
         }
     }
     urls
 }
 
-fn is_supported_url(input: &str) -> bool {
-    input.starts_with("http://") || input.starts_with("https://")
+fn normalize_supported_url(input: &str) -> Option<String> {
+    if input.starts_with("http://") || input.starts_with("https://") {
+        return Some(input.to_string());
+    }
+
+    if input.is_empty() || input.contains('@') || input.contains("://") {
+        return None;
+    }
+
+    let prefixed = format!("https://{input}");
+    let parsed = Url::parse(&prefixed).ok()?;
+    let host = parsed.host_str()?;
+    if !looks_like_supported_host(host) {
+        return None;
+    }
+
+    Some(prefixed)
+}
+
+fn looks_like_supported_host(host: &str) -> bool {
+    host.contains('.')
+        && host.chars().any(|ch| ch.is_ascii_alphabetic())
+        && host.split('.').all(is_valid_host_label)
+}
+
+fn is_valid_host_label(label: &str) -> bool {
+    !label.is_empty()
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
 }
 
 fn is_opening_wrapper(ch: char) -> bool {
@@ -255,6 +289,36 @@ mod tests {
             route_text("https://example.com https://example.com"),
             RouteIntent::LinkSubmission {
                 urls: vec!["https://example.com".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn bare_domain_becomes_link_submission() {
+        assert_eq!(
+            route_text("mp.weixin.qq.com"),
+            RouteIntent::LinkSubmission {
+                urls: vec!["https://mp.weixin.qq.com".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn bare_domain_with_path_becomes_link_submission() {
+        assert_eq!(
+            route_text("看看这个 mp.weixin.qq.com/s/abc?scene=1"),
+            RouteIntent::LinkSubmission {
+                urls: vec!["https://mp.weixin.qq.com/s/abc?scene=1".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn email_like_text_is_not_treated_as_link() {
+        assert_eq!(
+            route_text("test@example.com"),
+            RouteIntent::ChatPending {
+                text: "test@example.com".to_string()
             }
         );
     }

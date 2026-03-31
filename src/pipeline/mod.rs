@@ -406,7 +406,7 @@ fn preview_text(html: &str) -> String {
 fn extract_primary_body(html: &str) -> Option<String> {
     let activity_title = extract_element_text_by_id(html, "activity-name");
     let body = extract_element_inner_html_by_id(html, "js_content")
-        .map(|fragment| html_fragment_to_text(&fragment))
+        .map(|fragment| html_fragment_to_markdown(&fragment))
         .filter(|text| !text.trim().is_empty());
 
     match (activity_title, body) {
@@ -419,7 +419,7 @@ fn extract_primary_body(html: &str) -> Option<String> {
 
 fn extract_element_text_by_id(html: &str, element_id: &str) -> Option<String> {
     extract_element_inner_html_by_id(html, element_id)
-        .map(|fragment| html_fragment_to_text(&fragment))
+        .map(|fragment| html_fragment_to_markdown(&fragment))
 }
 
 fn extract_element_inner_html_by_id(html: &str, element_id: &str) -> Option<String> {
@@ -445,7 +445,13 @@ fn extract_element_inner_html_by_id(html: &str, element_id: &str) -> Option<Stri
     html.get(content_start..content_end).map(ToOwned::to_owned)
 }
 
-fn html_fragment_to_text(fragment: &str) -> String {
+fn html_fragment_to_markdown(fragment: &str) -> String {
+    let fragment = replace_anchor_blocks(fragment);
+    let fragment = replace_img_tags(&fragment);
+    normalize_fragment_text(&fragment)
+}
+
+fn normalize_fragment_text(fragment: &str) -> String {
     let mut out = String::new();
     let mut in_tag = false;
     let mut in_entity = false;
@@ -481,6 +487,85 @@ fn html_fragment_to_text(fragment: &str) -> String {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+fn replace_anchor_blocks(fragment: &str) -> String {
+    let mut out = String::new();
+    let mut cursor = 0;
+
+    while let Some(rel_start) = fragment[cursor..].find("<a") {
+        let start = cursor + rel_start;
+        out.push_str(&fragment[cursor..start]);
+
+        let Some(rel_tag_end) = fragment[start..].find('>') else {
+            out.push_str(&fragment[start..]);
+            return out;
+        };
+        let tag_end = start + rel_tag_end;
+        let tag = &fragment[start..=tag_end];
+        let href = extract_attribute_value(tag, "href");
+        let Some(rel_close) = fragment[tag_end + 1..].find("</a>") else {
+            out.push_str(&fragment[start..]);
+            return out;
+        };
+        let close = tag_end + 1 + rel_close;
+        let inner = &fragment[tag_end + 1..close];
+        let text = normalize_fragment_text(inner);
+
+        if let Some(href) = href.filter(|href| !href.trim().is_empty()) {
+            if text.is_empty() {
+                out.push_str(&format!("\n\n{href}\n\n"));
+            } else {
+                out.push_str(&format!("\n\n{text} ({href})\n\n"));
+            }
+        } else {
+            out.push_str(inner);
+        }
+
+        cursor = close + 4;
+    }
+
+    out.push_str(&fragment[cursor..]);
+    out
+}
+
+fn replace_img_tags(fragment: &str) -> String {
+    let mut out = String::new();
+    let mut cursor = 0;
+
+    while let Some(rel_start) = fragment[cursor..].find("<img") {
+        let start = cursor + rel_start;
+        out.push_str(&fragment[cursor..start]);
+
+        let Some(rel_end) = fragment[start..].find('>') else {
+            out.push_str(&fragment[start..]);
+            return out;
+        };
+        let end = start + rel_end;
+        let tag = &fragment[start..=end];
+        let src = extract_attribute_value(tag, "data-src")
+            .or_else(|| extract_attribute_value(tag, "src"))
+            .unwrap_or_default();
+
+        if !src.trim().is_empty() {
+            out.push_str(&format!("\n\n![image]({src})\n\n"));
+        }
+
+        cursor = end + 1;
+    }
+
+    out.push_str(&fragment[cursor..]);
+    out
+}
+
+fn extract_attribute_value(tag: &str, attr: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let pattern = format!("{attr}={quote}");
+        let start = tag.find(&pattern)? + pattern.len();
+        let end = tag[start..].find(quote)? + start;
+        return Some(tag[start..end].to_string());
+    }
+    None
 }
 
 fn decode_html_entity(entity: &str) -> &str {
@@ -747,5 +832,26 @@ mod tests {
         assert!(content.contains("## 公众号标题"));
         assert!(content.contains("正文第一段"));
         assert!(content.contains("source: browser_capture"));
+    }
+
+    #[test]
+    fn primary_body_keeps_links_and_images() {
+        let html = r#"
+<html>
+  <body>
+    <h1 id="activity-name">公众号标题</h1>
+    <div id="js_content">
+      <p>正文第一段</p>
+      <p><a href="https://example.com/link">相关阅读</a></p>
+      <img data-src="https://example.com/image.jpg" />
+    </div>
+  </body>
+</html>
+"#;
+
+        let body = extract_primary_body(html).expect("应提取出正文");
+
+        assert!(body.contains("相关阅读 (https://example.com/link)"));
+        assert!(body.contains("![image](https://example.com/image.jpg)"));
     }
 }

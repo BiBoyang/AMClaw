@@ -1,12 +1,16 @@
 use crate::tool_registry::{ToolAction, ToolRegistry};
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::Utc;
+use chrono_tz::Asia::Shanghai;
 use reqwest::blocking::Client;
 use reqwest::header::CONTENT_TYPE;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::fs;
 use std::path::PathBuf;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 const DEFAULT_MAX_STEPS: usize = 8;
 const DEFAULT_OPENAI_MODEL: &str = "deepseek-chat";
@@ -15,6 +19,7 @@ const LLM_PROVIDER_PRIORITY: [&str; 3] = ["DEEPSEEK", "MOONSHOT", "OPENAI"];
 
 #[derive(Debug)]
 pub struct AgentCore {
+    workspace_root: PathBuf,
     // 负责实际执行工具动作（读写文件等）
     tool_registry: ToolRegistry,
     llm_client: Option<LlmClient>,
@@ -31,7 +36,9 @@ impl AgentCore {
         if max_steps == 0 {
             bail!("max_steps 必须大于 0");
         }
+        let workspace_root = workspace_root.into();
         Ok(Self {
+            workspace_root: workspace_root.clone(),
             tool_registry: ToolRegistry::new(workspace_root)?,
             llm_client: LlmClient::from_env()?,
             max_steps,
@@ -39,19 +46,48 @@ impl AgentCore {
     }
 
     pub fn run(&self, user_input: &str) -> Result<String> {
+        let started = Instant::now();
+        let mut trace = AgentRunTrace::new(&self.workspace_root, user_input);
         let mut tool_result: Option<String> = None;
-        // 最小 Agent Loop: 决策 -> 执行工具 -> 继续决策/结束
-        for step in 0..self.max_steps {
-            let decision = self.decide(user_input, tool_result.as_deref(), step)?;
-            match decision {
-                AgentDecision::CallTool(action) => {
-                    let result = self.tool_registry.execute(action)?;
-                    tool_result = Some(result.output);
+        let result = (|| -> Result<String> {
+            // 最小 Agent Loop: 决策 -> 执行工具 -> 继续决策/结束
+            for step in 0..self.max_steps {
+                trace.step_count = step + 1;
+                let decision = self.decide(user_input, tool_result.as_deref(), step, &mut trace)?;
+                match decision {
+                    AgentDecision::CallTool(action) => {
+                        let tool_trace = trace.start_tool_call(step, &action);
+                        match self.tool_registry.execute(action) {
+                            Ok(result) => {
+                                trace.finish_tool_call_success(
+                                    tool_trace,
+                                    result.tool,
+                                    &result.output,
+                                );
+                                tool_result = Some(result.output);
+                            }
+                            Err(err) => {
+                                trace.finish_tool_call_error(tool_trace, &err.to_string());
+                                return Err(err);
+                            }
+                        }
+                    }
+                    AgentDecision::Final(answer) => return Ok(answer),
                 }
-                AgentDecision::Final(answer) => return Ok(answer),
             }
+            bail!("达到最大步骤，未能收敛")
+        })();
+
+        match &result {
+            Ok(answer) => trace.finish_success(answer, started.elapsed()),
+            Err(err) => trace.finish_error(&err.to_string(), started.elapsed()),
         }
-        bail!("达到最大步骤，未能收敛")
+
+        if let Err(err) = trace.persist() {
+            eprintln!("[AgentTrace] persist_failed error={err}");
+        }
+
+        result
     }
 
     fn decide(
@@ -59,19 +95,22 @@ impl AgentCore {
         user_input: &str,
         tool_result: Option<&str>,
         step: usize,
+        trace: &mut AgentRunTrace,
     ) -> Result<AgentDecision> {
         // 首轮根据用户输入决定是否调用工具
         if step == 0 {
             let mut llm_auth_err: Option<anyhow::Error> = None;
             if let Some(client) = &self.llm_client {
-                match client.plan(user_input) {
+                match client.plan(user_input, trace) {
                     Ok(decision) => {
                         eprintln!("[Agent] planner=llm");
+                        trace.record_decision(step, "llm", &decision);
                         return Ok(decision);
                     }
                     Err(err) => {
                         let err_text = err.to_string();
                         eprintln!("[Agent] planner=fallback reason={}", err_text);
+                        trace.record_llm_fallback(&err_text);
                         if is_llm_auth_error(&err_text) {
                             llm_auth_err = Some(anyhow!(err_text));
                         }
@@ -79,11 +118,16 @@ impl AgentCore {
                 }
             } else {
                 eprintln!("[Agent] planner=rule reason=no_llm_env");
+                trace.record_llm_fallback("no_llm_env");
             }
             eprintln!("[Agent] planner=rule");
             match parse_user_command(user_input) {
-                Ok(decision) => return Ok(decision),
+                Ok(decision) => {
+                    trace.record_decision(step, "rule", &decision);
+                    return Ok(decision);
+                }
                 Err(parse_err) => {
+                    trace.record_rule_parse_error(&parse_err.to_string());
                     if let Some(auth_err) = llm_auth_err {
                         return Err(auth_err);
                     }
@@ -94,10 +138,14 @@ impl AgentCore {
 
         // 有工具结果就直接收敛为最终回答
         if let Some(result) = tool_result {
-            return Ok(AgentDecision::Final(format!("完成: {}", result.trim())));
+            let decision = AgentDecision::Final(format!("完成: {}", result.trim()));
+            trace.record_decision(step, "tool_result", &decision);
+            return Ok(decision);
         }
 
-        Ok(AgentDecision::Final("没有可执行的动作".to_string()))
+        let decision = AgentDecision::Final("没有可执行的动作".to_string());
+        trace.record_decision(step, "default", &decision);
+        Ok(decision)
     }
 }
 
@@ -182,10 +230,10 @@ impl LlmClient {
         Ok(Some(Self { http, configs }))
     }
 
-    fn plan(&self, user_input: &str) -> Result<AgentDecision> {
+    fn plan(&self, user_input: &str, trace: &mut AgentRunTrace) -> Result<AgentDecision> {
         let mut last_auth_err: Option<anyhow::Error> = None;
         for (idx, config) in self.configs.iter().enumerate() {
-            match self.plan_with_config(config, user_input) {
+            match self.plan_with_config(config, user_input, trace) {
                 Ok(decision) => {
                     if idx > 0 {
                         eprintln!(
@@ -218,14 +266,20 @@ impl LlmClient {
         bail!("LLM 配置为空");
     }
 
-    fn plan_with_config(&self, config: &LlmConfig, user_input: &str) -> Result<AgentDecision> {
+    fn plan_with_config(
+        &self,
+        config: &LlmConfig,
+        user_input: &str,
+        trace: &mut AgentRunTrace,
+    ) -> Result<AgentDecision> {
+        let system_prompt = "你是一个文件工具规划器。只输出 JSON，不要解释。格式为 {\"action\":\"read|write|create|final\",\"path\":\"...\",\"content\":\"...\",\"answer\":\"...\"}。read 只需要 path；write/create 需要 path 与 content；final 需要 answer。";
         let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
         let mut body = json!({
             "model": config.model,
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是一个文件工具规划器。只输出 JSON，不要解释。格式为 {\"action\":\"read|write|create|final\",\"path\":\"...\",\"content\":\"...\",\"answer\":\"...\"}。read 只需要 path；write/create 需要 path 与 content；final 需要 answer。"
+                    "content": system_prompt
                 },
                 {
                     "role": "user",
@@ -238,10 +292,13 @@ impl LlmClient {
         } else {
             body["temperature"] = json!(0.0);
         }
+        let llm_call = trace.start_llm_call(config, system_prompt, user_input, &body);
         let mut last_status = 0u16;
         let mut last_text = String::new();
         let mut payload_text: Option<String> = None;
+        let mut attempts = 0usize;
         for attempt in 1..=2 {
+            attempts = attempt;
             let response = self
                 .http
                 .post(&url)
@@ -249,9 +306,25 @@ impl LlmClient {
                 .header("Authorization", format!("Bearer {}", config.api_key))
                 .json(&body)
                 .send()
-                .context("请求 LLM 失败")?;
+                .map_err(|err| {
+                    trace.finish_llm_call_error(
+                        llm_call,
+                        attempts,
+                        None,
+                        &format!("请求 LLM 失败: {err}"),
+                    );
+                    anyhow!("请求 LLM 失败: {err}")
+                })?;
             let status = response.status();
-            let text = response.text().context("读取 LLM 响应失败")?;
+            let text = response.text().map_err(|err| {
+                trace.finish_llm_call_error(
+                    llm_call,
+                    attempts,
+                    Some(status.as_u16()),
+                    &format!("读取 LLM 响应失败: {err}"),
+                );
+                anyhow!("读取 LLM 响应失败: {err}")
+            })?;
             last_status = status.as_u16();
             last_text = text.clone();
             if status.is_success() {
@@ -264,7 +337,7 @@ impl LlmClient {
                 sleep(Duration::from_millis(250));
                 continue;
             }
-            bail!(
+            let error = format!(
                 "LLM 请求失败(source={} model={} base_url={} key_tail={}): HTTP {} {}",
                 config.source,
                 config.model,
@@ -273,9 +346,11 @@ impl LlmClient {
                 status.as_u16(),
                 text
             );
+            trace.finish_llm_call_error(llm_call, attempts, Some(status.as_u16()), &error);
+            bail!(error);
         }
         let text = payload_text.ok_or_else(|| {
-            anyhow!(
+            let error = format!(
                 "LLM 请求失败(source={} model={} base_url={} key_tail={}): HTTP {} {}",
                 config.source,
                 config.model,
@@ -283,17 +358,550 @@ impl LlmClient {
                 key_tail(&config.api_key),
                 last_status,
                 last_text
-            )
+            );
+            trace.finish_llm_call_error(llm_call, attempts, Some(last_status), &error);
+            anyhow!(error)
         })?;
         let payload: OpenAiCompatResponse =
-            serde_json::from_str(&text).context("解析 LLM 响应 JSON 失败")?;
+            serde_json::from_str(&text).map_err(|err| {
+                trace.finish_llm_call_error(
+                    llm_call,
+                    attempts,
+                    Some(last_status),
+                    &format!("解析 LLM 响应 JSON 失败: {err}"),
+                );
+                anyhow!("解析 LLM 响应 JSON 失败: {err}")
+            })?;
         let content = payload
             .choices
             .first()
             .map(|v| v.message.content.trim().to_string())
             .filter(|v| !v.is_empty())
-            .context("LLM 返回内容为空")?;
-        parse_llm_plan(&content)
+            .ok_or_else(|| {
+                trace.finish_llm_call_error(llm_call, attempts, Some(last_status), "LLM 返回内容为空");
+                anyhow!("LLM 返回内容为空")
+            })?;
+        let decision = parse_llm_plan(&content).map_err(|err| {
+            trace.finish_llm_call_error(
+                llm_call,
+                attempts,
+                Some(last_status),
+                &format!("解析 LLM 计划失败: {err}"),
+            );
+            err
+        })?;
+        trace.finish_llm_call_success(llm_call, attempts, &text, &content, last_status, &decision);
+        Ok(decision)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AgentRunTrace {
+    trace_version: &'static str,
+    run_id: String,
+    started_at: String,
+    finished_at: Option<String>,
+    duration_ms: Option<u128>,
+    success: bool,
+    error: Option<String>,
+    final_output: Option<String>,
+    user_input: String,
+    user_input_chars: usize,
+    step_count: usize,
+    workspace_root: String,
+    llm_fallback_reason: Option<String>,
+    rule_parse_error: Option<String>,
+    decisions: Vec<DecisionTrace>,
+    llm_calls: Vec<LlmCallTrace>,
+    tool_calls: Vec<ToolCallTrace>,
+    #[serde(skip_serializing)]
+    trace_dir_root: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct DecisionTrace {
+    step: usize,
+    source: String,
+    decision_type: String,
+    summary: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PromptSnapshot {
+    system_prompt: String,
+    user_prompt: String,
+    request_body: String,
+    system_prompt_chars: usize,
+    user_prompt_chars: usize,
+    request_body_chars: usize,
+    estimated_prompt_chars: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct LlmCallTrace {
+    source: String,
+    model: String,
+    base_url: String,
+    prompt: PromptSnapshot,
+    raw_response: Option<String>,
+    raw_response_chars: Option<usize>,
+    message_content: Option<String>,
+    message_content_chars: Option<usize>,
+    response_status: Option<u16>,
+    attempts: usize,
+    success: bool,
+    error: Option<String>,
+    decision_summary: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolCallTrace {
+    step: usize,
+    tool_name: String,
+    path: Option<String>,
+    content_chars: Option<usize>,
+    output: Option<String>,
+    output_chars: Option<usize>,
+    success: bool,
+    error: Option<String>,
+    duration_ms: Option<u128>,
+    #[serde(skip_serializing)]
+    started_at: Option<Instant>,
+}
+
+impl AgentRunTrace {
+    fn new(workspace_root: &std::path::Path, user_input: &str) -> Self {
+        Self {
+            trace_version: "agent_trace_v1",
+            run_id: Uuid::new_v4().to_string(),
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+            duration_ms: None,
+            success: false,
+            error: None,
+            final_output: None,
+            user_input: user_input.to_string(),
+            user_input_chars: user_input.chars().count(),
+            step_count: 0,
+            workspace_root: workspace_root.display().to_string(),
+            llm_fallback_reason: None,
+            rule_parse_error: None,
+            decisions: Vec::new(),
+            llm_calls: Vec::new(),
+            tool_calls: Vec::new(),
+            trace_dir_root: workspace_root.join("data").join("agent_traces"),
+        }
+    }
+
+    fn record_decision(&mut self, step: usize, source: &str, decision: &AgentDecision) {
+        self.decisions.push(DecisionTrace {
+            step,
+            source: source.to_string(),
+            decision_type: decision.kind().to_string(),
+            summary: decision.summary(),
+        });
+    }
+
+    fn record_llm_fallback(&mut self, reason: &str) {
+        self.llm_fallback_reason = Some(reason.to_string());
+    }
+
+    fn record_rule_parse_error(&mut self, error: &str) {
+        self.rule_parse_error = Some(error.to_string());
+    }
+
+    fn start_llm_call(
+        &mut self,
+        config: &LlmConfig,
+        system_prompt: &str,
+        user_input: &str,
+        body: &serde_json::Value,
+    ) -> usize {
+        let request_body = serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+        self.llm_calls.push(LlmCallTrace {
+            source: config.source.to_string(),
+            model: config.model.clone(),
+            base_url: config.base_url.clone(),
+            prompt: PromptSnapshot {
+                system_prompt: system_prompt.to_string(),
+                user_prompt: user_input.to_string(),
+                system_prompt_chars: system_prompt.chars().count(),
+                user_prompt_chars: user_input.chars().count(),
+                request_body_chars: request_body.chars().count(),
+                estimated_prompt_chars: system_prompt.chars().count()
+                    + user_input.chars().count()
+                    + request_body.chars().count(),
+                request_body,
+            },
+            raw_response: None,
+            raw_response_chars: None,
+            message_content: None,
+            message_content_chars: None,
+            response_status: None,
+            attempts: 0,
+            success: false,
+            error: None,
+            decision_summary: None,
+        });
+        self.llm_calls.len() - 1
+    }
+
+    fn finish_llm_call_success(
+        &mut self,
+        index: usize,
+        attempts: usize,
+        raw_response: &str,
+        message_content: &str,
+        status: u16,
+        decision: &AgentDecision,
+    ) {
+        if let Some(call) = self.llm_calls.get_mut(index) {
+            call.raw_response = Some(raw_response.to_string());
+            call.raw_response_chars = Some(raw_response.chars().count());
+            call.message_content = Some(message_content.to_string());
+            call.message_content_chars = Some(message_content.chars().count());
+            call.response_status = Some(status);
+            call.attempts = attempts;
+            call.success = true;
+            call.decision_summary = Some(decision.summary());
+        }
+    }
+
+    fn finish_llm_call_error(
+        &mut self,
+        index: usize,
+        attempts: usize,
+        status: Option<u16>,
+        error: &str,
+    ) {
+        if let Some(call) = self.llm_calls.get_mut(index) {
+            call.attempts = attempts;
+            call.response_status = status;
+            call.error = Some(error.to_string());
+        }
+    }
+
+    fn start_tool_call(&mut self, step: usize, action: &ToolAction) -> usize {
+        self.tool_calls.push(ToolCallTrace {
+            step,
+            tool_name: action.name().to_string(),
+            path: action.path().map(ToOwned::to_owned),
+            content_chars: action.content().map(|v| v.chars().count()),
+            output: None,
+            output_chars: None,
+            success: false,
+            error: None,
+            duration_ms: None,
+            started_at: Some(Instant::now()),
+        });
+        self.tool_calls.len() - 1
+    }
+
+    fn finish_tool_call_success(&mut self, index: usize, tool_name: &str, output: &str) {
+        if let Some(call) = self.tool_calls.get_mut(index) {
+            call.tool_name = tool_name.to_string();
+            call.output = Some(output.to_string());
+            call.output_chars = Some(output.chars().count());
+            call.success = true;
+            call.duration_ms = call.started_at.map(|v| v.elapsed().as_millis());
+            call.started_at = None;
+        }
+    }
+
+    fn finish_tool_call_error(&mut self, index: usize, error: &str) {
+        if let Some(call) = self.tool_calls.get_mut(index) {
+            call.error = Some(error.to_string());
+            call.duration_ms = call.started_at.map(|v| v.elapsed().as_millis());
+            call.started_at = None;
+        }
+    }
+
+    fn finish_success(&mut self, output: &str, duration: Duration) {
+        self.success = true;
+        self.final_output = Some(output.to_string());
+        self.finished_at = Some(Utc::now().to_rfc3339());
+        self.duration_ms = Some(duration.as_millis());
+    }
+
+    fn finish_error(&mut self, error: &str, duration: Duration) {
+        self.success = false;
+        self.error = Some(error.to_string());
+        self.finished_at = Some(Utc::now().to_rfc3339());
+        self.duration_ms = Some(duration.as_millis());
+        for call in &mut self.llm_calls {
+            if !call.success && call.error.is_none() {
+                call.error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn persist(&self) -> Result<()> {
+        let day = Utc::now().with_timezone(&Shanghai).format("%Y-%m-%d").to_string();
+        let dir = self.trace_dir_root.join(day);
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("创建 agent trace 目录失败: {}", dir.display()))?;
+        let timestamp = Utc::now()
+            .with_timezone(&Shanghai)
+            .format("%Y%m%dT%H%M%S")
+            .to_string();
+        let json_path = dir.join(format!("run_{}_{}.json", timestamp, self.run_id));
+        let json_content =
+            serde_json::to_string_pretty(self).context("序列化 agent trace 失败")?;
+        fs::write(&json_path, format!("{json_content}\n"))
+            .with_context(|| format!("写入 agent trace 失败: {}", json_path.display()))?;
+
+        let markdown_path = dir.join(format!("run_{}_{}.md", timestamp, self.run_id));
+        let markdown_content = self.to_markdown();
+        fs::write(&markdown_path, markdown_content)
+            .with_context(|| format!("写入 agent trace markdown 失败: {}", markdown_path.display()))?;
+        Ok(())
+    }
+
+    fn to_markdown(&self) -> String {
+        let mut lines = vec![
+            format!("# Agent Trace {}", self.run_id),
+            String::new(),
+            "## Summary".to_string(),
+            String::new(),
+            format!("- success: {}", self.success),
+            format!("- started_at: {}", self.started_at),
+            format!(
+                "- finished_at: {}",
+                self.finished_at.as_deref().unwrap_or("(running)")
+            ),
+            format!("- duration_ms: {}", self.duration_ms.unwrap_or(0)),
+            format!("- step_count: {}", self.step_count),
+            format!("- user_input_chars: {}", self.user_input_chars),
+            String::new(),
+            "## User Input".to_string(),
+            String::new(),
+            "```text".to_string(),
+            self.user_input.clone(),
+            "```".to_string(),
+        ];
+
+        if let Some(reason) = &self.llm_fallback_reason {
+            lines.push(String::new());
+            lines.push("## LLM Fallback".to_string());
+            lines.push(String::new());
+            lines.push(format!("- reason: {}", reason));
+        }
+
+        if let Some(error) = &self.rule_parse_error {
+            lines.push(String::new());
+            lines.push("## Rule Parse Error".to_string());
+            lines.push(String::new());
+            lines.push(format!("- error: {}", error));
+        }
+
+        lines.push(String::new());
+        lines.push("## Decisions".to_string());
+        lines.push(String::new());
+        if self.decisions.is_empty() {
+            lines.push("- (none)".to_string());
+        } else {
+            for decision in &self.decisions {
+                lines.push(format!(
+                    "- step={} source={} type={} summary={}",
+                    decision.step, decision.source, decision.decision_type, decision.summary
+                ));
+            }
+        }
+
+        lines.push(String::new());
+        lines.push("## LLM Calls".to_string());
+        lines.push(String::new());
+        if self.llm_calls.is_empty() {
+            lines.push("- (none)".to_string());
+        } else {
+            for (idx, call) in self.llm_calls.iter().enumerate() {
+                lines.push(format!("### LLM Call {}", idx + 1));
+                lines.push(String::new());
+                lines.push(format!("- source: {}", call.source));
+                lines.push(format!("- model: {}", call.model));
+                lines.push(format!("- base_url: {}", call.base_url));
+                lines.push(format!("- success: {}", call.success));
+                lines.push(format!("- attempts: {}", call.attempts));
+                lines.push(format!(
+                    "- response_status: {}",
+                    call.response_status
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "(none)".to_string())
+                ));
+                lines.push(format!(
+                    "- estimated_prompt_chars: {}",
+                    call.prompt.estimated_prompt_chars
+                ));
+                lines.push(format!(
+                    "- system_prompt_chars: {}",
+                    call.prompt.system_prompt_chars
+                ));
+                lines.push(format!("- user_prompt_chars: {}", call.prompt.user_prompt_chars));
+                lines.push(format!(
+                    "- request_body_chars: {}",
+                    call.prompt.request_body_chars
+                ));
+                lines.push(format!(
+                    "- raw_response_chars: {}",
+                    call.raw_response_chars
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "(none)".to_string())
+                ));
+                lines.push(format!(
+                    "- message_content_chars: {}",
+                    call.message_content_chars
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "(none)".to_string())
+                ));
+                if let Some(error) = &call.error {
+                    lines.push(format!("- error: {}", error));
+                }
+                if let Some(summary) = &call.decision_summary {
+                    lines.push(format!("- decision_summary: {}", summary));
+                }
+                lines.push(String::new());
+                lines.push("#### User Prompt".to_string());
+                lines.push(String::new());
+                lines.push("```text".to_string());
+                lines.push(summarize_for_markdown(&call.prompt.user_prompt, 800));
+                lines.push("```".to_string());
+                if let Some(content) = &call.message_content {
+                    lines.push(String::new());
+                    lines.push("#### Message Content Summary".to_string());
+                    lines.push(String::new());
+                    lines.push("```text".to_string());
+                    lines.push(summarize_for_markdown(content, 1000));
+                    lines.push("```".to_string());
+                }
+                lines.push(String::new());
+            }
+        }
+
+        lines.push("## Tool Calls".to_string());
+        lines.push(String::new());
+        if self.tool_calls.is_empty() {
+            lines.push("- (none)".to_string());
+        } else {
+            for (idx, call) in self.tool_calls.iter().enumerate() {
+                lines.push(format!("### Tool Call {}", idx + 1));
+                lines.push(String::new());
+                lines.push(format!("- step: {}", call.step));
+                lines.push(format!("- tool_name: {}", call.tool_name));
+                lines.push(format!(
+                    "- path: {}",
+                    call.path.as_deref().unwrap_or("(none)")
+                ));
+                lines.push(format!(
+                    "- content_chars: {}",
+                    call.content_chars
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "(none)".to_string())
+                ));
+                lines.push(format!(
+                    "- output_chars: {}",
+                    call.output_chars
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "(none)".to_string())
+                ));
+                lines.push(format!("- success: {}", call.success));
+                lines.push(format!(
+                    "- duration_ms: {}",
+                    call.duration_ms
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "(none)".to_string())
+                ));
+                if let Some(error) = &call.error {
+                    lines.push(format!("- error: {}", error));
+                }
+                if let Some(output) = &call.output {
+                    lines.push(String::new());
+                    lines.push("#### Output Summary".to_string());
+                    lines.push(String::new());
+                    lines.push("```text".to_string());
+                    lines.push(summarize_for_markdown(output, 1200));
+                    lines.push("```".to_string());
+                }
+                lines.push(String::new());
+            }
+        }
+
+        lines.push("## Final Output".to_string());
+        lines.push(String::new());
+        lines.push("```text".to_string());
+        lines.push(
+            summarize_for_markdown(
+                self.final_output
+                    .as_deref()
+                    .unwrap_or_else(|| self.error.as_deref().unwrap_or("(none)")),
+                1200,
+            ),
+        );
+        lines.push("```".to_string());
+        lines.push(String::new());
+
+        lines.join("\n")
+    }
+}
+
+fn truncate_for_trace(input: &str, max_chars: usize) -> String {
+    let count = input.chars().count();
+    if count <= max_chars {
+        return input.to_string();
+    }
+    let mut text: String = input.chars().take(max_chars).collect();
+    text.push_str("...");
+    text
+}
+
+fn summarize_for_markdown(input: &str, max_chars: usize) -> String {
+    let count = input.chars().count();
+    if count <= max_chars {
+        return input.to_string();
+    }
+    let head_chars = max_chars.saturating_sub(80).max(40);
+    let mut text: String = input.chars().take(head_chars).collect();
+    text.push_str(&format!("\n\n...[truncated, total_chars={count}]"));
+    text
+}
+
+impl AgentDecision {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::CallTool(_) => "call_tool",
+            Self::Final(_) => "final",
+        }
+    }
+
+    fn summary(&self) -> String {
+        match self {
+            Self::CallTool(action) => format!("tool={} path={}", action.name(), action.path().unwrap_or("")),
+            Self::Final(answer) => truncate_for_trace(answer, 240),
+        }
+    }
+}
+
+impl ToolAction {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Read { .. } => "read",
+            Self::Write { .. } => "write",
+            Self::Create { .. } => "create",
+        }
+    }
+
+    fn path(&self) -> Option<&str> {
+        match self {
+            Self::Read { path } | Self::Write { path, .. } | Self::Create { path, .. } => {
+                Some(path.as_str())
+            }
+        }
+    }
+
+    fn content(&self) -> Option<&str> {
+        match self {
+            Self::Read { .. } => None,
+            Self::Write { content, .. } | Self::Create { content, .. } => Some(content.as_str()),
+        }
     }
 }
 
@@ -521,6 +1129,7 @@ fn split_path_and_content(raw: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::{map_llm_plan, parse_llm_plan, AgentCore, LlmPlan};
+    use serde_json::Value;
     use uuid::Uuid;
 
     fn temp_workspace() -> std::path::PathBuf {
@@ -569,6 +1178,43 @@ mod tests {
             .run("帮我运行：创建文件 demo/prefix.txt :: prefix ok")
             .expect("前缀命令执行失败");
         assert!(result.contains("完成:"));
+    }
+
+    #[test]
+    fn agent_run_writes_trace_file() {
+        let root = temp_workspace();
+        let agent = AgentCore::new(root.clone()).expect("初始化 agent 失败");
+
+        agent.run("读文件 missing.txt").expect_err("应当返回错误");
+
+        let trace_root = root.join("data").join("agent_traces");
+        let day_dir = std::fs::read_dir(&trace_root)
+            .expect("应存在 trace 根目录")
+            .next()
+            .expect("应存在日期目录")
+            .expect("读取日期目录失败")
+            .path();
+        let trace_path = std::fs::read_dir(day_dir)
+            .expect("应存在 trace 文件")
+            .filter_map(|entry| entry.ok().map(|v| v.path()))
+            .find(|path| path.extension().and_then(|v| v.to_str()) == Some("json"))
+            .expect("应存在至少一个 json trace 文件");
+        let payload: Value = serde_json::from_str(
+            &std::fs::read_to_string(&trace_path).expect("读取 trace 文件失败"),
+        )
+        .expect("trace JSON 应合法");
+
+        assert_eq!(payload["trace_version"], "agent_trace_v1");
+        assert_eq!(payload["user_input"], "读文件 missing.txt");
+        assert!(payload["user_input_chars"].as_u64().unwrap_or(0) > 0);
+        assert!(payload["tool_calls"].as_array().is_some());
+        assert!(payload["decisions"].as_array().is_some());
+
+        let markdown_path = trace_path.with_extension("md");
+        let markdown = std::fs::read_to_string(markdown_path).expect("应生成 markdown trace");
+        assert!(markdown.contains("# Agent Trace"));
+        assert!(markdown.contains("## Summary"));
+        assert!(markdown.contains("## Tool Calls"));
     }
 
     #[test]

@@ -469,6 +469,26 @@ struct ToolCallTrace {
     started_at: Option<Instant>,
 }
 
+#[derive(Debug, Serialize)]
+struct AgentTraceIndexEntry {
+    trace_version: &'static str,
+    run_id: String,
+    started_at: String,
+    finished_at: Option<String>,
+    duration_ms: Option<u128>,
+    success: bool,
+    user_input: String,
+    user_input_chars: usize,
+    step_count: usize,
+    llm_call_count: usize,
+    tool_call_count: usize,
+    final_output_chars: Option<usize>,
+    error: Option<String>,
+    llm_fallback_reason: Option<String>,
+    json_file: String,
+    markdown_file: String,
+}
+
 impl AgentRunTrace {
     fn new(workspace_root: &std::path::Path, user_input: &str) -> Self {
         Self {
@@ -654,6 +674,49 @@ impl AgentRunTrace {
         let markdown_content = self.to_markdown();
         fs::write(&markdown_path, markdown_content)
             .with_context(|| format!("写入 agent trace markdown 失败: {}", markdown_path.display()))?;
+
+        let index_entry = AgentTraceIndexEntry {
+            trace_version: self.trace_version,
+            run_id: self.run_id.clone(),
+            started_at: self.started_at.clone(),
+            finished_at: self.finished_at.clone(),
+            duration_ms: self.duration_ms,
+            success: self.success,
+            user_input: summarize_for_markdown(&self.user_input, 240),
+            user_input_chars: self.user_input_chars,
+            step_count: self.step_count,
+            llm_call_count: self.llm_calls.len(),
+            tool_call_count: self.tool_calls.len(),
+            final_output_chars: self.final_output.as_ref().map(|v| v.chars().count()),
+            error: self.error.clone().map(|v| summarize_for_markdown(&v, 240)),
+            llm_fallback_reason: self
+                .llm_fallback_reason
+                .clone()
+                .map(|v| summarize_for_markdown(&v, 240)),
+            json_file: json_path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            markdown_file: markdown_path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .unwrap_or_default()
+                .to_string(),
+        };
+        let index_path = dir.join("index.jsonl");
+        let index_line =
+            serde_json::to_string(&index_entry).context("序列化 agent trace index 失败")?;
+        let mut existing = if index_path.exists() {
+            fs::read_to_string(&index_path)
+                .with_context(|| format!("读取 agent trace index 失败: {}", index_path.display()))?
+        } else {
+            String::new()
+        };
+        existing.push_str(&index_line);
+        existing.push('\n');
+        fs::write(&index_path, existing)
+            .with_context(|| format!("写入 agent trace index 失败: {}", index_path.display()))?;
         Ok(())
     }
 
@@ -1215,6 +1278,19 @@ mod tests {
         assert!(markdown.contains("# Agent Trace"));
         assert!(markdown.contains("## Summary"));
         assert!(markdown.contains("## Tool Calls"));
+
+        let index_path = trace_root.join(
+            std::fs::read_dir(&trace_root)
+                .expect("应存在日期目录")
+                .next()
+                .expect("应存在日期目录")
+                .expect("读取日期目录失败")
+                .file_name(),
+        )
+        .join("index.jsonl");
+        let index_content = std::fs::read_to_string(index_path).expect("应生成 index.jsonl");
+        assert!(index_content.contains("\"trace_version\":\"agent_trace_v1\""));
+        assert!(index_content.contains("\"run_id\""));
     }
 
     #[test]

@@ -451,6 +451,9 @@ impl WeChatBot {
             command_router::RouteIntent::ManualContentSubmission { task_id, content } => {
                 self.handle_manual_content_submission(from_user_id, &task_id, &content);
             }
+            command_router::RouteIntent::ManualTasksQuery => {
+                self.handle_manual_tasks_query(from_user_id);
+            }
             command_router::RouteIntent::TaskRetryRequest { task_id } => {
                 self.handle_task_retry(from_user_id, &task_id);
             }
@@ -593,6 +596,14 @@ impl WeChatBot {
             Ok(Some(status)) => build_task_retry_reply(&status),
             Ok(None) => format!("未找到对应任务: {task_id}"),
             Err(err) => format!("重试任务失败: {err}"),
+        };
+        self.send_reply_text(user_id, &reply);
+    }
+
+    fn handle_manual_tasks_query(&self, user_id: &str) {
+        let reply = match self.task_store.list_manual_tasks(5) {
+            Ok(tasks) => build_manual_tasks_reply(&tasks),
+            Err(err) => format!("查询待补录任务失败: {err}"),
         };
         self.send_reply_text(user_id, &reply);
     }
@@ -872,6 +883,21 @@ fn build_recent_tasks_reply(tasks: &[crate::task_store::RecentTaskRecord]) -> St
     }
 
     let mut lines = vec!["最近任务:".to_string()];
+    for task in tasks {
+        lines.push(format!(
+            "- {} {} task_id={}",
+            task.status, task.normalized_url, task.task_id
+        ));
+    }
+    lines.join("\n")
+}
+
+fn build_manual_tasks_reply(tasks: &[crate::task_store::RecentTaskRecord]) -> String {
+    if tasks.is_empty() {
+        return "当前没有待补录任务".to_string();
+    }
+
+    let mut lines = vec!["待补录任务:".to_string()];
     for task in tasks {
         lines.push(format!(
             "- {} {} task_id={}",
@@ -1424,5 +1450,40 @@ mod tests {
         assert_eq!(details.0, "archived".to_string());
         assert_eq!(details.1, Some("manual_input".to_string()));
         assert!(details.2.is_some());
+    }
+
+    #[test]
+    fn manual_tasks_query_does_not_create_new_tasks() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "https://mp.weixin.qq.com/s/YUvXg9i31QuQN6t-zRTe8g".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-18".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let task_id = first_task_id(&db_path);
+        bot.task_store
+            .mark_task_awaiting_manual_input(
+                &task_id,
+                "微信公众号页面需要验证码验证",
+                "wechat_captcha",
+                None,
+            )
+            .expect("更新 awaiting_manual_input 状态失败");
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "待补录任务".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-19".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        assert_eq!(task_count(&db_path), 1);
+        assert_eq!(message_count(&db_path, "msg-19"), 1);
     }
 }

@@ -279,6 +279,39 @@ impl TaskStore {
         Ok(tasks)
     }
 
+    pub fn list_manual_tasks(&self, limit: usize) -> Result<Vec<RecentTaskRecord>> {
+        let limit = i64::try_from(limit).context("manual task limit 超出范围")?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+                SELECT t.id, t.status, a.normalized_url, t.updated_at
+                FROM tasks t
+                JOIN articles a ON a.id = t.article_id
+                WHERE t.status = 'awaiting_manual_input'
+                ORDER BY t.updated_at DESC, t.created_at DESC
+                LIMIT ?1
+                "#,
+            )
+            .context("准备待补录任务查询失败")?;
+        let rows = stmt
+            .query_map([limit], |row| {
+                Ok(RecentTaskRecord {
+                    task_id: row.get(0)?,
+                    status: row.get(1)?,
+                    normalized_url: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            })
+            .context("查询待补录任务失败")?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks.push(row.context("读取待补录任务记录失败")?);
+        }
+        Ok(tasks)
+    }
+
     pub fn retry_task(&mut self, task_id: &str) -> Result<Option<TaskStatusRecord>> {
         let now = Utc::now().to_rfc3339();
         let tx = self.conn.transaction().context("开启重试事务失败")?;
@@ -982,6 +1015,36 @@ mod tests {
         assert_eq!(
             status.last_error,
             Some("微信公众号页面需要验证码验证".to_string())
+        );
+    }
+
+    #[test]
+    fn manual_tasks_can_be_listed() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        let created = store
+            .record_link_submission("https://mp.weixin.qq.com/s/manual-list")
+            .expect("写入链接失败");
+
+        store
+            .mark_task_awaiting_manual_input(
+                &created.task_id,
+                "微信公众号页面需要验证码验证",
+                "wechat_captcha",
+                None,
+            )
+            .expect("更新 awaiting_manual_input 状态失败");
+
+        let tasks = store.list_manual_tasks(10).expect("查询待补录任务失败");
+
+        assert_eq!(
+            tasks,
+            vec![RecentTaskRecord {
+                task_id: created.task_id,
+                status: "awaiting_manual_input".to_string(),
+                normalized_url: "https://mp.weixin.qq.com/s/manual-list".to_string(),
+                updated_at: tasks[0].updated_at.clone(),
+            }]
         );
     }
 }

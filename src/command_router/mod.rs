@@ -2,6 +2,7 @@
 pub enum RouteIntent {
     ManualContentSubmission { task_id: String, content: String },
     TaskRetryRequest { task_id: String },
+    ManualTasksQuery,
     RecentTasksQuery,
     TaskStatusQuery { task_id: String },
     LinkSubmission { urls: Vec<String> },
@@ -15,6 +16,10 @@ pub fn route_text(input: &str) -> RouteIntent {
     let text = input.trim();
     if text.is_empty() {
         return RouteIntent::Ignore;
+    }
+
+    if is_manual_tasks_query(text) {
+        return RouteIntent::ManualTasksQuery;
     }
 
     if let Some((task_id, content)) = parse_manual_content_submission(text) {
@@ -97,6 +102,13 @@ fn parse_retry_query(input: &str) -> Option<String> {
 
 fn is_recent_tasks_query(input: &str) -> bool {
     matches!(input, "最近任务" | "最新任务" | "recent tasks" | "recent")
+}
+
+fn is_manual_tasks_query(input: &str) -> bool {
+    matches!(
+        input,
+        "待补录任务" | "manual tasks" | "awaiting manual input"
+    )
 }
 
 fn extract_urls(input: &str) -> Vec<String> {
@@ -210,6 +222,11 @@ mod tests {
                 content: "这是人工补录的正文".to_string()
             }
         );
+    }
+
+    #[test]
+    fn manual_tasks_command_is_supported() {
+        assert_eq!(route_text("待补录任务"), RouteIntent::ManualTasksQuery);
     }
 
     #[test]

@@ -13,7 +13,8 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct Pipeline {
@@ -48,6 +49,7 @@ struct BrowserCaptureResponse {
     html_path: PathBuf,
     screenshot_path: PathBuf,
     reason: Option<String>,
+    logs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +71,8 @@ pub enum PipelineFailureKind {
 pub struct PipelineTaskError {
     pub kind: PipelineFailureKind,
     pub message: String,
+    pub snapshot_path: Option<PathBuf>,
+    pub content_source: Option<String>,
 }
 
 impl PipelineTaskError {
@@ -76,6 +80,8 @@ impl PipelineTaskError {
         Self {
             kind: PipelineFailureKind::Failed,
             message: message.into(),
+            snapshot_path: None,
+            content_source: None,
         }
     }
 
@@ -85,6 +91,23 @@ impl PipelineTaskError {
                 page_kind: page_kind.into(),
             },
             message: message.into(),
+            snapshot_path: None,
+            content_source: None,
+        }
+    }
+
+    fn browser_manual_input(
+        page_kind: impl Into<String>,
+        message: impl Into<String>,
+        snapshot_path: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            kind: PipelineFailureKind::AwaitingManualInput {
+                page_kind: page_kind.into(),
+            },
+            message: message.into(),
+            snapshot_path,
+            content_source: Some("browser_capture".to_string()),
         }
     }
 }
@@ -240,46 +263,103 @@ impl Pipeline {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|err| {
-                PipelineTaskError::awaiting_manual_input(
+                PipelineTaskError::browser_manual_input(
                     "browser_worker_unavailable",
                     format!("启动浏览器 worker 失败: {err}"),
+                    existing_file_path(&request.screenshot_path),
                 )
             })?;
 
-        if let Some(stdin) = child.stdin.as_mut() {
+        if let Some(mut stdin) = child.stdin.take() {
             let payload = serde_json::to_vec(&request).map_err(|err| {
                 PipelineTaskError::failed(format!("序列化浏览器抓取请求失败: {err}"))
             })?;
             stdin.write_all(&payload).map_err(|err| {
-                PipelineTaskError::failed(format!("写入浏览器抓取请求失败: {err}"))
+                PipelineTaskError::browser_manual_input(
+                    "browser_worker_io_failed",
+                    format!("写入浏览器抓取请求失败: {err}"),
+                    existing_file_path(&request.screenshot_path),
+                )
             })?;
+            drop(stdin);
+        }
+
+        let worker_deadline = Instant::now() + browser.timeout + Duration::from_secs(15);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if Instant::now() >= worker_deadline {
+                        let _ = child.kill();
+                        let output = child.wait_with_output().map_err(|err| {
+                            PipelineTaskError::browser_manual_input(
+                                "browser_worker_timeout",
+                                format!("终止超时浏览器 worker 失败: {err}"),
+                                existing_file_path(&request.screenshot_path),
+                            )
+                        })?;
+                        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                        return Err(PipelineTaskError::browser_manual_input(
+                            "browser_worker_timeout",
+                            format!(
+                                "浏览器 worker 超时未结束，已终止。stdout={} stderr={}",
+                                summarize_output(&stdout),
+                                summarize_output(&stderr)
+                            ),
+                            existing_file_path(&request.screenshot_path),
+                        ));
+                    }
+                    sleep(Duration::from_millis(200));
+                }
+                Err(err) => {
+                    return Err(PipelineTaskError::browser_manual_input(
+                        "browser_worker_failed",
+                        format!("轮询浏览器 worker 状态失败: {err}"),
+                        existing_file_path(&request.screenshot_path),
+                    ));
+                }
+            }
         }
 
         let output = child.wait_with_output().map_err(|err| {
-            PipelineTaskError::failed(format!("等待浏览器 worker 结束失败: {err}"))
+            PipelineTaskError::browser_manual_input(
+                "browser_worker_failed",
+                format!("等待浏览器 worker 结束失败: {err}"),
+                existing_file_path(&request.screenshot_path),
+            )
         })?;
         let stdout = String::from_utf8(output.stdout).map_err(|err| {
-            PipelineTaskError::failed(format!("浏览器 worker 输出非 UTF-8: {err}"))
+            PipelineTaskError::browser_manual_input(
+                "browser_worker_invalid_output",
+                format!("浏览器 worker 输出非 UTF-8: {err}"),
+                existing_file_path(&request.screenshot_path),
+            )
         })?;
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
         if !output.status.success() && stdout.trim().is_empty() {
-            return Err(PipelineTaskError::awaiting_manual_input(
+            return Err(PipelineTaskError::browser_manual_input(
                 "browser_worker_failed",
                 format!(
                     "浏览器 worker 执行失败: {}",
-                    if stderr.is_empty() {
-                        "unknown"
-                    } else {
-                        &stderr
-                    }
+                    fallback_reason(&stderr, "unknown")
                 ),
+                existing_file_path(&request.screenshot_path),
             ));
         }
 
         let response: BrowserCaptureResponse =
             serde_json::from_str(stdout.trim()).map_err(|err| {
-                PipelineTaskError::failed(format!("解析浏览器 worker 返回失败: {err}"))
+                PipelineTaskError::browser_manual_input(
+                    "browser_worker_invalid_output",
+                    format!(
+                        "解析浏览器 worker 返回失败: {err}; stdout={}; stderr={}",
+                        summarize_output(&stdout),
+                        summarize_output(&stderr)
+                    ),
+                    existing_file_path(&request.screenshot_path),
+                )
             })?;
 
         if response.ok {
@@ -292,11 +372,17 @@ impl Pipeline {
             });
         }
 
-        Err(PipelineTaskError::awaiting_manual_input(
+        Err(PipelineTaskError::browser_manual_input(
             response.page_kind,
-            response
-                .reason
-                .unwrap_or_else(|| "浏览器抓取未成功".to_string()),
+            format_browser_failure_message(
+                response
+                    .reason
+                    .as_deref()
+                    .unwrap_or("浏览器抓取未成功"),
+                &response.logs,
+                &stderr,
+            ),
+            existing_file_path(&response.screenshot_path),
         ))
     }
 
@@ -566,6 +652,43 @@ fn extract_attribute_value(tag: &str, attr: &str) -> Option<String> {
         return Some(tag[start..end].to_string());
     }
     None
+}
+
+fn existing_file_path(path: &PathBuf) -> Option<PathBuf> {
+    path.exists().then(|| path.clone())
+}
+
+fn summarize_output(output: &str) -> String {
+    let cleaned = output.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.is_empty() {
+        "(empty)".to_string()
+    } else {
+        let truncated: String = cleaned.chars().take(240).collect();
+        if cleaned.chars().count() > 240 {
+            format!("{truncated}...")
+        } else {
+            truncated
+        }
+    }
+}
+
+fn fallback_reason<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.trim().is_empty() {
+        fallback
+    } else {
+        value
+    }
+}
+
+fn format_browser_failure_message(reason: &str, logs: &[String], stderr: &str) -> String {
+    let mut parts = vec![reason.trim().to_string()];
+    if !logs.is_empty() {
+        parts.push(format!("logs={}", summarize_output(&logs.join(" | "))));
+    }
+    if !stderr.trim().is_empty() {
+        parts.push(format!("stderr={}", summarize_output(stderr)));
+    }
+    parts.join("; ")
 }
 
 fn decode_html_entity(entity: &str) -> &str {

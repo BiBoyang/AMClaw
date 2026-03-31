@@ -37,6 +37,8 @@ pub struct TaskStatusRecord {
 pub struct RecentTaskRecord {
     pub task_id: String,
     pub status: String,
+    pub content_source: Option<String>,
+    pub page_kind: Option<String>,
     pub normalized_url: String,
     pub updated_at: String,
 }
@@ -253,7 +255,7 @@ impl TaskStore {
             .conn
             .prepare(
                 r#"
-                SELECT t.id, t.status, a.normalized_url, t.updated_at
+                SELECT t.id, t.status, t.content_source, t.page_kind, a.normalized_url, t.updated_at
                 FROM tasks t
                 JOIN articles a ON a.id = t.article_id
                 ORDER BY t.updated_at DESC, t.created_at DESC
@@ -266,8 +268,10 @@ impl TaskStore {
                 Ok(RecentTaskRecord {
                     task_id: row.get(0)?,
                     status: row.get(1)?,
-                    normalized_url: row.get(2)?,
-                    updated_at: row.get(3)?,
+                    content_source: row.get(2)?,
+                    page_kind: row.get(3)?,
+                    normalized_url: row.get(4)?,
+                    updated_at: row.get(5)?,
                 })
             })
             .context("查询最近任务失败")?;
@@ -285,7 +289,7 @@ impl TaskStore {
             .conn
             .prepare(
                 r#"
-                SELECT t.id, t.status, a.normalized_url, t.updated_at
+                SELECT t.id, t.status, t.content_source, t.page_kind, a.normalized_url, t.updated_at
                 FROM tasks t
                 JOIN articles a ON a.id = t.article_id
                 WHERE t.status = 'awaiting_manual_input'
@@ -299,8 +303,10 @@ impl TaskStore {
                 Ok(RecentTaskRecord {
                     task_id: row.get(0)?,
                     status: row.get(1)?,
-                    normalized_url: row.get(2)?,
-                    updated_at: row.get(3)?,
+                    content_source: row.get(2)?,
+                    page_kind: row.get(3)?,
+                    normalized_url: row.get(4)?,
+                    updated_at: row.get(5)?,
                 })
             })
             .context("查询待补录任务失败")?;
@@ -442,13 +448,14 @@ impl TaskStore {
         last_error: &str,
         page_kind: &str,
         snapshot_path: Option<&str>,
+        content_source: Option<&str>,
     ) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
         let updated = self
             .conn
             .execute(
-                "UPDATE tasks SET status = 'awaiting_manual_input', last_error = ?2, page_kind = ?3, snapshot_path = ?4, output_path = NULL, updated_at = ?5 WHERE id = ?1",
-                params![task_id, last_error, page_kind, snapshot_path, now],
+                "UPDATE tasks SET status = 'awaiting_manual_input', last_error = ?2, page_kind = ?3, snapshot_path = ?4, content_source = COALESCE(?5, content_source), output_path = NULL, updated_at = ?6 WHERE id = ?1",
+                params![task_id, last_error, page_kind, snapshot_path, content_source, now],
             )
             .context("更新 awaiting_manual_input 状态失败")?;
         Ok(updated > 0)
@@ -864,12 +871,16 @@ mod tests {
                 RecentTaskRecord {
                     task_id: second.task_id,
                     status: "pending".to_string(),
+                    content_source: None,
+                    page_kind: None,
                     normalized_url: "https://example.com/two".to_string(),
                     updated_at: tasks[0].updated_at.clone(),
                 },
                 RecentTaskRecord {
                     task_id: first.task_id,
                     status: "pending".to_string(),
+                    content_source: None,
+                    page_kind: None,
                     normalized_url: "https://example.com/one".to_string(),
                     updated_at: tasks[1].updated_at.clone(),
                 },
@@ -1001,6 +1012,7 @@ mod tests {
                 "微信公众号页面需要验证码验证",
                 "wechat_captcha",
                 None,
+                Some("browser_capture"),
             )
             .expect("更新 awaiting_manual_input 状态失败"));
 
@@ -1010,7 +1022,7 @@ mod tests {
             .expect("应存在任务");
 
         assert_eq!(status.status, "awaiting_manual_input");
-        assert_eq!(status.content_source, None);
+        assert_eq!(status.content_source, Some("browser_capture".to_string()));
         assert_eq!(status.page_kind, Some("wechat_captcha".to_string()));
         assert_eq!(
             status.last_error,
@@ -1032,6 +1044,7 @@ mod tests {
                 "微信公众号页面需要验证码验证",
                 "wechat_captcha",
                 None,
+                Some("browser_capture"),
             )
             .expect("更新 awaiting_manual_input 状态失败");
 
@@ -1042,6 +1055,8 @@ mod tests {
             vec![RecentTaskRecord {
                 task_id: created.task_id,
                 status: "awaiting_manual_input".to_string(),
+                content_source: Some("browser_capture".to_string()),
+                page_kind: Some("wechat_captcha".to_string()),
                 normalized_url: "https://mp.weixin.qq.com/s/manual-list".to_string(),
                 updated_at: tasks[0].updated_at.clone(),
             }]

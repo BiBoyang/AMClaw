@@ -227,7 +227,7 @@ impl ILinkClient {
         )
     }
 
-    fn login(&mut self, running: &AtomicBool) -> Result<()> {
+    fn fetch_login_qrcode(&self) -> Result<String> {
         println!("[登录] 正在获取二维码...");
         let qr_resp = self.get_qrcode()?;
         assert_ok(&qr_resp, "获取二维码")?;
@@ -248,6 +248,12 @@ impl ILinkClient {
         } else {
             println!("[登录] 二维码URL为空，qrcodeId: {qrcode_id}");
         }
+
+        Ok(qrcode_id)
+    }
+
+    fn login(&mut self, running: &AtomicBool) -> Result<()> {
+        let mut qrcode_id = self.fetch_login_qrcode()?;
 
         println!("[登录] 等待扫码...");
         while running.load(Ordering::Relaxed) {
@@ -272,7 +278,14 @@ impl ILinkClient {
                 return Ok(());
             }
 
-            if ret == 1 || (ret == 0 && status == "wait") {
+            if ret == 1 || (ret == 0 && matches!(status.as_str(), "wait" | "scanned")) {
+                continue;
+            }
+
+            if ret == 0 && status == "expired" {
+                println!("[登录] 二维码已过期，重新获取中...");
+                qrcode_id = self.fetch_login_qrcode()?;
+                println!("[登录] 等待扫码...");
                 continue;
             }
 
@@ -727,11 +740,17 @@ impl WeChatBot {
                 }
                 Err(err) => match err.kind {
                     crate::pipeline::PipelineFailureKind::AwaitingManualInput { page_kind } => {
+                        let snapshot_path = err
+                            .snapshot_path
+                            .as_ref()
+                            .map(|path| path.to_string_lossy().to_string());
+                        let content_source = err.content_source.clone();
                         if let Err(mark_err) = self.task_store.mark_task_awaiting_manual_input(
                             &task.task_id,
                             &err.message,
                             &page_kind,
-                            None,
+                            snapshot_path.as_deref(),
+                            content_source.as_deref(),
                         ) {
                             eprintln!(
                                     "[任务] 更新 awaiting_manual_input 失败 task_id={} error={} mark_error={}",
@@ -885,8 +904,12 @@ fn build_recent_tasks_reply(tasks: &[crate::task_store::RecentTaskRecord]) -> St
     let mut lines = vec!["最近任务:".to_string()];
     for task in tasks {
         lines.push(format!(
-            "- {} {} task_id={}",
-            task.status, task.normalized_url, task.task_id
+            "- {} {} source={} page_kind={} task_id={}",
+            task.status,
+            task.normalized_url,
+            task.content_source.as_deref().unwrap_or("unknown"),
+            task.page_kind.as_deref().unwrap_or("unknown"),
+            task.task_id
         ));
     }
     lines.join("\n")
@@ -900,8 +923,12 @@ fn build_manual_tasks_reply(tasks: &[crate::task_store::RecentTaskRecord]) -> St
     let mut lines = vec!["待补录任务:".to_string()];
     for task in tasks {
         lines.push(format!(
-            "- {} {} task_id={}",
-            task.status, task.normalized_url, task.task_id
+            "- {} {} source={} page_kind={} task_id={}",
+            task.status,
+            task.normalized_url,
+            task.content_source.as_deref().unwrap_or("unknown"),
+            task.page_kind.as_deref().unwrap_or("unknown"),
+            task.task_id
         ));
     }
     lines.join("\n")
@@ -1406,6 +1433,7 @@ mod tests {
                 "微信公众号页面需要验证码验证",
                 "wechat_captcha",
                 None,
+                Some("browser_capture"),
             )
             .expect("更新 awaiting_manual_input 状态失败");
 
@@ -1435,6 +1463,7 @@ mod tests {
                 "微信公众号页面需要验证码验证",
                 "wechat_captcha",
                 None,
+                Some("browser_capture"),
             )
             .expect("更新 awaiting_manual_input 状态失败");
 
@@ -1472,6 +1501,7 @@ mod tests {
                 "微信公众号页面需要验证码验证",
                 "wechat_captcha",
                 None,
+                Some("browser_capture"),
             )
             .expect("更新 awaiting_manual_input 状态失败");
 

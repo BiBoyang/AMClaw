@@ -204,5 +204,6 @@ cargo test
 - `DESIGN-0.1.0.md`：目标架构与版本设计
 - `PLAN.md`：当前实施路线
 - `NEXT-STEPS.md`：当前阶段执行备忘
+- `DEVELOPMENT.md`：后续开发、维护与提交流程说明
 
 如果你准备继续开发这个项目，建议先读这三个文件，再看 `src/chat_adapter`、`src/command_router`、`src/task_store` 和 `src/agent_core` 的当前实现。

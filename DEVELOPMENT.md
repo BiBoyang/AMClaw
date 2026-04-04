@@ -129,6 +129,12 @@ cargo test
 `CLAUDE.md` 是给只识别该文件名的助手使用的镜像规则文件。  
 如果更新了某目录下的 `AGENTS.md`，通常也应同步更新同目录 `CLAUDE.md`。
 
+仓库测试会校验这组镜像是否漂移，因此改完后至少跑一次：
+
+```bash
+cargo test --test doc_mirrors
+```
+
 ## 5. 模块边界提醒
 
 修改前先确认自己是否在正确模块动手：
@@ -161,6 +167,7 @@ cargo test
 
 建议额外确认：
 
+- `cargo test --test doc_mirrors`
 - `cargo fmt --check`
 - `cargo clippy --all-targets --all-features`
 - `cargo test`

@@ -192,10 +192,15 @@ impl Pipeline {
     }
 
     fn fetch_html(&self, url: &str) -> std::result::Result<String, PipelineTaskError> {
+        let redirect_policy = if should_disable_http_redirects(url) {
+            Policy::none()
+        } else {
+            Policy::limited(10)
+        };
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
-            .redirect(Policy::none())
+            .redirect(redirect_policy)
             .build()
             .map_err(|err| {
                 PipelineTaskError::failed(format!("创建 pipeline HTTP 客户端失败: {err}"))
@@ -204,6 +209,7 @@ impl Pipeline {
             .get(url)
             .send()
             .map_err(|err| PipelineTaskError::failed(format!("抓取页面失败: {url} ({err})")))?;
+        let final_url = response.url().to_string();
         let status = response.status();
         if status.is_redirection() {
             if let Some(location) = response
@@ -229,7 +235,7 @@ impl Pipeline {
         let html = response
             .text()
             .map_err(|err| PipelineTaskError::failed(format!("读取页面正文失败: {err}")))?;
-        detect_wechat_error_page(url, &html)?;
+        validate_fetched_html(url, &final_url, &html)?;
         Ok(html)
     }
 
@@ -375,10 +381,7 @@ impl Pipeline {
         Err(PipelineTaskError::browser_manual_input(
             response.page_kind,
             format_browser_failure_message(
-                response
-                    .reason
-                    .as_deref()
-                    .unwrap_or("浏览器抓取未成功"),
+                response.reason.as_deref().unwrap_or("浏览器抓取未成功"),
                 &response.logs,
                 &stderr,
             ),
@@ -703,11 +706,15 @@ fn decode_html_entity(entity: &str) -> &str {
     }
 }
 
-fn should_prefer_browser_capture(url: &str) -> bool {
+fn is_wechat_mp_url(url: &str) -> bool {
     Url::parse(url)
         .ok()
         .and_then(|parsed| parsed.domain().map(|domain| domain == "mp.weixin.qq.com"))
         .unwrap_or(false)
+}
+
+fn should_prefer_browser_capture(url: &str) -> bool {
+    is_wechat_mp_url(url)
 }
 
 fn extract_manual_title(content: &str) -> Option<String> {
@@ -716,6 +723,18 @@ fn extract_manual_title(content: &str) -> Option<String> {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(|line| line.chars().take(80).collect::<String>())
+}
+
+fn should_disable_http_redirects(url: &str) -> bool {
+    is_wechat_mp_url(url)
+}
+
+fn validate_fetched_html(
+    _requested_url: &str,
+    final_url: &str,
+    html: &str,
+) -> std::result::Result<(), PipelineTaskError> {
+    detect_wechat_error_page(final_url, html)
 }
 
 fn detect_wechat_redirect(location: &str) -> std::result::Result<(), PipelineTaskError> {
@@ -783,7 +802,8 @@ fn detect_wechat_error_page(url: &str, html: &str) -> std::result::Result<(), Pi
 mod tests {
     use super::{
         detect_wechat_error_page, detect_wechat_redirect, extract_html_title, extract_primary_body,
-        should_prefer_browser_capture, BrowserCaptureResult, Pipeline, PipelineFailureKind,
+        should_disable_http_redirects, should_prefer_browser_capture, validate_fetched_html,
+        BrowserCaptureResult, Pipeline, PipelineFailureKind,
     };
     use crate::task_store::{PendingTaskRecord, TaskContentRecord};
     use std::fs;
@@ -869,6 +889,21 @@ mod tests {
     }
 
     #[test]
+    fn redirected_wechat_error_page_is_detected_by_final_url() {
+        let err = validate_fetched_html(
+            "https://short.example/abc",
+            "https://mp.weixin.qq.com/s/abc",
+            "<html><head><title>未知错误</title></head><body>你暂无权限查看此页面内容。</body></html>",
+        )
+        .expect_err("应按最终 URL 识别公众号错误页");
+
+        assert!(matches!(
+            err.kind,
+            PipelineFailureKind::AwaitingManualInput { .. }
+        ));
+    }
+
+    #[test]
     fn wechat_captcha_redirect_is_rejected() {
         let err = detect_wechat_redirect(
             "https://mp.weixin.qq.com/mp/wappoc_appmsgcaptcha?poc_token=abc&target_url=https%3A%2F%2Fmp.weixin.qq.com%2Fs%2Fxyz",
@@ -878,6 +913,24 @@ mod tests {
         assert!(matches!(
             err.kind,
             PipelineFailureKind::AwaitingManualInput { .. }
+        ));
+    }
+
+    #[test]
+    fn non_wechat_urls_allow_http_redirects() {
+        assert!(!should_disable_http_redirects(
+            "https://example.com/redirect"
+        ));
+        assert!(!should_disable_http_redirects("https://x.com/t/abc"));
+    }
+
+    #[test]
+    fn wechat_urls_keep_redirect_guard() {
+        assert!(should_disable_http_redirects(
+            "https://mp.weixin.qq.com/s/demo"
+        ));
+        assert!(!should_disable_http_redirects(
+            "https://example.com/article"
         ));
     }
 

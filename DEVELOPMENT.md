@@ -47,6 +47,13 @@
 - `.env.moonshot.local`
 - `.env.moonshot`
 
+建议优先从示例模板复制，再填入真实值：
+
+```bash
+cp .env.deepseek.example .env.deepseek
+cp .env.moonshot.example .env.moonshot
+```
+
 也可以直接通过 shell 设置环境变量，例如：
 
 - `OPENAI_API_KEY`
@@ -197,14 +204,15 @@ cargo test --test doc_mirrors
 
 默认不提交以下本地产物：
 
-- `.env.*.local`
+- `.env`
+- `.env.*`
 - `config.toml`
 - `data/`
 - `target/`
 - 浏览器抓取缓存或临时截图
 - 含真实 token、cookie、Authorization 的任何文件
 
-如果确实需要提交示例配置，请使用脱敏模板，而不是直接提交真实内容。
+如果确实需要提交示例配置，请使用脱敏模板，如 `.env.deepseek.example`、`.env.moonshot.example`，而不是直接提交真实内容。
 
 ## 9. Commit 建议
 

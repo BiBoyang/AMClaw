@@ -1,7 +1,8 @@
 target/
 .DS_Store
-.env.moonshot.local
-.env.deepseek.local
+.env
+.env.*
+!.env*.example
 config.toml
 data/
 tools/browser_worker/node_modules/

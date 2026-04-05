@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use reqwest::Url;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -591,6 +591,9 @@ fn ensure_column_exists(
 
 fn normalize_url(input: &str) -> Result<String> {
     let mut url = Url::parse(input).with_context(|| format!("无效 URL: {input}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("仅支持 http/https URL: {input}");
+    }
     url.set_fragment(None);
     strip_tracking_query_pairs(&mut url);
     let mut normalized = url.to_string();
@@ -827,6 +830,30 @@ mod tests {
         assert_eq!(first.normalized_url, "https://example.com/page?id=42");
         assert_eq!(second.normalized_url, "https://example.com/page?id=42");
         assert!(!second.created_new);
+    }
+
+    #[test]
+    fn non_http_scheme_is_rejected_during_link_submission() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let err = store
+            .record_link_submission("file:///tmp/demo.html")
+            .expect_err("应拒绝非 http/https 协议");
+
+        assert!(err.to_string().contains("仅支持 http/https URL"));
+    }
+
+    #[test]
+    fn javascript_scheme_is_rejected_during_link_submission() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let err = store
+            .record_link_submission("javascript:alert(1)")
+            .expect_err("应拒绝 javascript 协议");
+
+        assert!(err.to_string().contains("仅支持 http/https URL"));
     }
 
     #[test]

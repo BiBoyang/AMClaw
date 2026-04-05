@@ -367,6 +367,7 @@ impl Pipeline {
                     existing_file_path(&request.screenshot_path),
                 )
             })?;
+        validate_browser_capture_paths(&request, &response)?;
 
         if response.ok {
             return Ok(BrowserCaptureResult {
@@ -729,6 +730,27 @@ fn should_disable_http_redirects(url: &str) -> bool {
     is_wechat_mp_url(url)
 }
 
+fn validate_browser_capture_paths(
+    request: &BrowserCaptureRequest,
+    response: &BrowserCaptureResponse,
+) -> std::result::Result<(), PipelineTaskError> {
+    if response.html_path != request.html_path || response.screenshot_path != request.screenshot_path
+    {
+        return Err(PipelineTaskError::browser_manual_input(
+            "browser_worker_invalid_output",
+            format!(
+                "浏览器 worker 返回了非预期产物路径: html_path={} expected_html_path={} screenshot_path={} expected_screenshot_path={}",
+                response.html_path.display(),
+                request.html_path.display(),
+                response.screenshot_path.display(),
+                request.screenshot_path.display()
+            ),
+            existing_file_path(&request.screenshot_path),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_fetched_html(
     _requested_url: &str,
     final_url: &str,
@@ -802,8 +824,9 @@ fn detect_wechat_error_page(url: &str, html: &str) -> std::result::Result<(), Pi
 mod tests {
     use super::{
         detect_wechat_error_page, detect_wechat_redirect, extract_html_title, extract_primary_body,
-        should_disable_http_redirects, should_prefer_browser_capture, validate_fetched_html,
-        BrowserCaptureResult, Pipeline, PipelineFailureKind,
+        should_disable_http_redirects, should_prefer_browser_capture,
+        validate_browser_capture_paths, validate_fetched_html, BrowserCaptureRequest,
+        BrowserCaptureResponse, BrowserCaptureResult, Pipeline, PipelineFailureKind,
     };
     use crate::task_store::{PendingTaskRecord, TaskContentRecord};
     use std::fs;
@@ -1008,6 +1031,37 @@ mod tests {
         assert!(content.contains("## 公众号标题"));
         assert!(content.contains("正文第一段"));
         assert!(content.contains("source: browser_capture"));
+    }
+
+    #[test]
+    fn browser_capture_response_paths_must_match_request() {
+        let request = BrowserCaptureRequest {
+            url: "https://mp.weixin.qq.com/s/demo".to_string(),
+            html_path: std::path::PathBuf::from("/tmp/expected.html"),
+            screenshot_path: std::path::PathBuf::from("/tmp/expected.png"),
+            timeout_ms: 30_000,
+            headless: true,
+            mobile_viewport: true,
+        };
+        let response = BrowserCaptureResponse {
+            ok: true,
+            page_kind: "article".to_string(),
+            final_url: "https://mp.weixin.qq.com/s/demo".to_string(),
+            title: Some("标题".to_string()),
+            html_path: std::path::PathBuf::from("/tmp/other.html"),
+            screenshot_path: std::path::PathBuf::from("/tmp/other.png"),
+            reason: None,
+            logs: Vec::new(),
+        };
+
+        let err = validate_browser_capture_paths(&request, &response)
+            .expect_err("应拒绝非预期的浏览器产物路径");
+
+        assert!(matches!(
+            err.kind,
+            PipelineFailureKind::AwaitingManualInput { .. }
+        ));
+        assert!(err.message.contains("非预期产物路径"));
     }
 
     #[test]

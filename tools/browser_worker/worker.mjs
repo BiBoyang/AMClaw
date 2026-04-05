@@ -210,67 +210,41 @@ async function preparePageForScreenshot(page, logs, timeoutMs) {
 
 async function main() {
   const input = await readStdin();
-  const req = JSON.parse(input);
-  const logs = [];
-
-  let playwright;
   try {
-    playwright = await import("playwright");
-  } catch (error) {
-    writeResponse(
-      req,
-      {
-        ok: false,
-        page_kind: "browser_worker_unavailable",
-        reason: `Playwright 不可用: ${error.message}`,
-      },
-      logs
-    );
-    return;
-  }
-
-  await fs.mkdir(path.dirname(req.html_path), { recursive: true });
-  await fs.mkdir(path.dirname(req.screenshot_path), { recursive: true });
-
-  let browser;
-  try {
-    browser = await playwright.chromium.launch({
-      headless: req.headless,
-    });
-  } catch (error) {
-    logs.push(`launch_failed:${error.message}`);
-    writeResponse(
-      req,
-      {
-        ok: false,
-        page_kind: "browser_launch_failed",
-        reason: `启动 Chromium 失败: ${error.message}`,
-      },
-      logs
-    );
-    return;
-  }
-
-  try {
-    let context;
+    const req = JSON.parse(input);
+    const logs = [];
+    let playwright;
     try {
-      context = await browser.newContext({
-        viewport: req.mobile_viewport
-          ? { width: 430, height: 932 }
-          : { width: 1440, height: 1080 },
-        isMobile: Boolean(req.mobile_viewport),
-        userAgent: req.mobile_viewport
-          ? "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
-          : undefined,
-      });
+      playwright = await import("playwright");
     } catch (error) {
-      logs.push(`context_failed:${error.message}`);
       writeResponse(
         req,
         {
           ok: false,
-          page_kind: "browser_context_failed",
-          reason: `创建浏览器上下文失败: ${error.message}`,
+          page_kind: "browser_worker_unavailable",
+          reason: `Playwright 不可用: ${error.message}`,
+        },
+        logs
+      );
+      return;
+    }
+
+    await fs.mkdir(path.dirname(req.html_path), { recursive: true });
+    await fs.mkdir(path.dirname(req.screenshot_path), { recursive: true });
+
+    let browser;
+    try {
+      browser = await playwright.chromium.launch({
+        headless: req.headless,
+      });
+    } catch (error) {
+      logs.push(`launch_failed:${error.message}`);
+      writeResponse(
+        req,
+        {
+          ok: false,
+          page_kind: "browser_launch_failed",
+          reason: `启动 Chromium 失败: ${error.message}`,
         },
         logs
       );
@@ -278,117 +252,144 @@ async function main() {
     }
 
     try {
-      const page = await context.newPage();
-      logs.push(`goto_start:${req.url}`);
+      let context;
       try {
-        await page.goto(req.url, {
-          timeout: req.timeout_ms,
-          waitUntil: "domcontentloaded",
+        context = await browser.newContext({
+          viewport: req.mobile_viewport
+            ? { width: 430, height: 932 }
+            : { width: 1440, height: 1080 },
+          isMobile: Boolean(req.mobile_viewport),
+          userAgent: req.mobile_viewport
+            ? "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
+            : undefined,
         });
       } catch (error) {
-        const pageKind =
-          error.name === "TimeoutError"
-            ? "browser_navigation_timeout"
-            : "browser_navigation_failed";
-        logs.push(`${pageKind}:${error.message}`);
+        logs.push(`context_failed:${error.message}`);
         writeResponse(
           req,
           {
             ok: false,
-            page_kind: pageKind,
-            reason:
-              error.name === "TimeoutError"
-                ? `页面加载超时: ${error.message}`
-                : `页面加载失败: ${error.message}`,
-            final_url: page.url(),
+            page_kind: "browser_context_failed",
+            reason: `创建浏览器上下文失败: ${error.message}`,
           },
           logs
         );
         return;
       }
 
-      await page.waitForTimeout(1500);
-      await preparePageForScreenshot(page, logs, req.timeout_ms);
-
-      const finalUrl = page.url();
-      logs.push(`goto_ok:${finalUrl}`);
-
-      let title;
-      let html;
       try {
-        title = await page.title();
-        html = await page.content();
-      } catch (error) {
-        logs.push(`content_failed:${error.message}`);
+        const page = await context.newPage();
+        logs.push(`goto_start:${req.url}`);
+        try {
+          await page.goto(req.url, {
+            timeout: req.timeout_ms,
+            waitUntil: "domcontentloaded",
+          });
+        } catch (error) {
+          const pageKind =
+            error.name === "TimeoutError"
+              ? "browser_navigation_timeout"
+              : "browser_navigation_failed";
+          logs.push(`${pageKind}:${error.message}`);
+          writeResponse(
+            req,
+            {
+              ok: false,
+              page_kind: pageKind,
+              reason:
+                error.name === "TimeoutError"
+                  ? `页面加载超时: ${error.message}`
+                  : `页面加载失败: ${error.message}`,
+              final_url: page.url(),
+            },
+            logs
+          );
+          return;
+        }
+
+        await page.waitForTimeout(1500);
+        await preparePageForScreenshot(page, logs, req.timeout_ms);
+
+        const finalUrl = page.url();
+        logs.push(`goto_ok:${finalUrl}`);
+
+        let title;
+        let html;
+        try {
+          title = await page.title();
+          html = await page.content();
+        } catch (error) {
+          logs.push(`content_failed:${error.message}`);
+          writeResponse(
+            req,
+            {
+              ok: false,
+              page_kind: "browser_content_failed",
+              reason: `读取页面内容失败: ${error.message}`,
+              final_url: finalUrl,
+            },
+            logs
+          );
+          return;
+        }
+
+        await fs.writeFile(req.html_path, html, "utf8");
+        logs.push(`html_saved:${req.html_path}`);
+
+        try {
+          await page.screenshot({
+            path: req.screenshot_path,
+            fullPage: true,
+          });
+          logs.push(`screenshot_saved:${req.screenshot_path}`);
+        } catch (error) {
+          logs.push(`screenshot_failed:${error.message}`);
+          writeResponse(
+            req,
+            {
+              ok: false,
+              page_kind: "browser_screenshot_failed",
+              reason: `截图失败: ${error.message}`,
+              final_url: finalUrl,
+              title: title || null,
+            },
+            logs
+          );
+          return;
+        }
+
+        const result = classifyWechatPage(finalUrl, title, html);
         writeResponse(
           req,
           {
-            ok: false,
-            page_kind: "browser_content_failed",
-            reason: `读取页面内容失败: ${error.message}`,
-            final_url: finalUrl,
-          },
-          logs
-        );
-        return;
-      }
-
-      await fs.writeFile(req.html_path, html, "utf8");
-      logs.push(`html_saved:${req.html_path}`);
-
-      try {
-        await page.screenshot({
-          path: req.screenshot_path,
-          fullPage: true,
-        });
-        logs.push(`screenshot_saved:${req.screenshot_path}`);
-      } catch (error) {
-        logs.push(`screenshot_failed:${error.message}`);
-        writeResponse(
-          req,
-          {
-            ok: false,
-            page_kind: "browser_screenshot_failed",
-            reason: `截图失败: ${error.message}`,
+            ok: result.ok,
+            page_kind: result.page_kind,
             final_url: finalUrl,
             title: title || null,
+            reason: result.reason,
           },
           logs
         );
-        return;
+      } finally {
+        await context.close();
       }
-
-      const result = classifyWechatPage(finalUrl, title, html);
-      writeResponse(
-        req,
-        {
-          ok: result.ok,
-          page_kind: result.page_kind,
-          final_url: finalUrl,
-          title: title || null,
-          reason: result.reason,
-        },
-        logs
-      );
     } finally {
-      await context.close();
+      await browser.close();
     }
-  } finally {
-    await browser.close();
+  } catch (error) {
+    process.stdout.write(
+      JSON.stringify({
+        ok: false,
+        page_kind: "browser_worker_failed",
+        final_url: "",
+        title: null,
+        html_path: "",
+        screenshot_path: "",
+        reason: `浏览器 worker 失败: ${error.message}`,
+        logs: [`uncaught:${error.message}`],
+      })
+    );
   }
 }
 
-main().catch((error) => {
-  process.stdout.write(
-    JSON.stringify({
-      ok: false,
-      page_kind: "browser_worker_failed",
-      final_url: "",
-      title: null,
-      html_path: "",
-      screenshot_path: "",
-      reason: `浏览器 worker 失败: ${error.message}`,
-      logs: [`uncaught:${error.message}`],
-    })
-  );
-});
+main();

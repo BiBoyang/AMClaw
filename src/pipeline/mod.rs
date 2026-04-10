@@ -7,6 +7,7 @@ use reqwest::header::LOCATION;
 use reqwest::redirect::Policy;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -132,18 +133,63 @@ impl Pipeline {
         &self,
         task: &PendingTaskRecord,
     ) -> std::result::Result<PipelineResult, PipelineTaskError> {
+        log_pipeline_info(
+            "task_processing_started",
+            vec![
+                ("task_id", json!(task.task_id)),
+                ("article_id", json!(task.article_id)),
+                ("url", json!(task.normalized_url)),
+            ],
+        );
         if should_prefer_browser_capture(&task.normalized_url) {
             if let Some(browser) = &self.browser {
+                log_pipeline_info(
+                    "task_fetch_branch_selected",
+                    vec![
+                        ("task_id", json!(task.task_id)),
+                        ("source", json!("browser_capture")),
+                        ("status", json!("selected")),
+                    ],
+                );
                 let capture = self.run_browser_capture(browser, task)?;
                 return self.archive_browser_capture(task, &capture).map_err(|err| {
+                    log_pipeline_error(
+                        "task_failed",
+                        vec![
+                            ("task_id", json!(task.task_id)),
+                            ("source", json!("browser_capture")),
+                            ("status", json!("failed")),
+                            ("error_kind", json!("browser_archive_failed")),
+                            ("detail", json!(err.to_string())),
+                        ],
+                    );
                     PipelineTaskError::failed(format!("归档浏览器抓取结果失败: {err}"))
                 });
             }
         }
 
+        log_pipeline_info(
+            "task_fetch_branch_selected",
+            vec![
+                ("task_id", json!(task.task_id)),
+                ("source", json!("http")),
+                ("status", json!("selected")),
+            ],
+        );
         let html = self.fetch_html(&task.normalized_url)?;
-        self.archive_html(task, &html)
-            .map_err(|err| PipelineTaskError::failed(format!("归档页面失败: {err}")))
+        self.archive_html(task, &html).map_err(|err| {
+            log_pipeline_error(
+                "task_failed",
+                vec![
+                    ("task_id", json!(task.task_id)),
+                    ("source", json!("http")),
+                    ("status", json!("failed")),
+                    ("error_kind", json!("html_archive_failed")),
+                    ("detail", json!(err.to_string())),
+                ],
+            );
+            PipelineTaskError::failed(format!("归档页面失败: {err}"))
+        })
     }
 
     pub fn archive_manual_content(
@@ -183,15 +229,32 @@ impl Pipeline {
         fs::write(&output_path, content)
             .with_context(|| format!("写入人工归档文件失败: {}", output_path.display()))?;
 
-        Ok(PipelineResult {
+        let result = PipelineResult {
             output_path,
             raw_path,
             snapshot_path: None,
             title,
-        })
+        };
+        log_pipeline_info(
+            "task_archived",
+            vec![
+                ("task_id", json!(task.task_id)),
+                ("source", json!("manual_input")),
+                ("status", json!("archived")),
+                (
+                    "output_path",
+                    json!(result.output_path.display().to_string()),
+                ),
+            ],
+        );
+        Ok(result)
     }
 
     fn fetch_html(&self, url: &str) -> std::result::Result<String, PipelineTaskError> {
+        log_pipeline_info(
+            "http_fetch_started",
+            vec![("source", json!("http")), ("url", json!(url))],
+        );
         let redirect_policy = if should_disable_http_redirects(url) {
             Policy::none()
         } else {
@@ -203,12 +266,29 @@ impl Pipeline {
             .redirect(redirect_policy)
             .build()
             .map_err(|err| {
+                log_pipeline_error(
+                    "http_fetch_failed",
+                    vec![
+                        ("source", json!("http")),
+                        ("url", json!(url)),
+                        ("error_kind", json!("http_client_build_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
                 PipelineTaskError::failed(format!("创建 pipeline HTTP 客户端失败: {err}"))
             })?;
-        let response = client
-            .get(url)
-            .send()
-            .map_err(|err| PipelineTaskError::failed(format!("抓取页面失败: {url} ({err})")))?;
+        let response = client.get(url).send().map_err(|err| {
+            log_pipeline_error(
+                "http_fetch_failed",
+                vec![
+                    ("source", json!("http")),
+                    ("url", json!(url)),
+                    ("error_kind", json!("http_request_failed")),
+                    ("detail", json!(err.to_string())),
+                ],
+            );
+            PipelineTaskError::failed(format!("抓取页面失败: {url} ({err})"))
+        })?;
         let final_url = response.url().to_string();
         let status = response.status();
         if status.is_redirection() {
@@ -219,6 +299,15 @@ impl Pipeline {
             {
                 detect_wechat_redirect(location)?;
             }
+            log_pipeline_error(
+                "http_fetch_failed",
+                vec![
+                    ("source", json!("http")),
+                    ("url", json!(url)),
+                    ("status", json!(status.as_u16())),
+                    ("error_kind", json!("http_redirect_rejected")),
+                ],
+            );
             return Err(PipelineTaskError::failed(format!(
                 "抓取页面失败: HTTP {} {}",
                 status.as_u16(),
@@ -226,16 +315,44 @@ impl Pipeline {
             )));
         }
         if !status.is_success() {
+            log_pipeline_error(
+                "http_fetch_failed",
+                vec![
+                    ("source", json!("http")),
+                    ("url", json!(url)),
+                    ("status", json!(status.as_u16())),
+                    ("error_kind", json!("http_status_failed")),
+                ],
+            );
             return Err(PipelineTaskError::failed(format!(
                 "抓取页面失败: HTTP {} {}",
                 status.as_u16(),
                 url
             )));
         }
-        let html = response
-            .text()
-            .map_err(|err| PipelineTaskError::failed(format!("读取页面正文失败: {err}")))?;
+        let html = response.text().map_err(|err| {
+            log_pipeline_error(
+                "http_fetch_failed",
+                vec![
+                    ("source", json!("http")),
+                    ("url", json!(url)),
+                    ("error_kind", json!("http_read_body_failed")),
+                    ("detail", json!(err.to_string())),
+                ],
+            );
+            PipelineTaskError::failed(format!("读取页面正文失败: {err}"))
+        })?;
         validate_fetched_html(url, &final_url, &html)?;
+        log_pipeline_info(
+            "http_fetch_finished",
+            vec![
+                ("source", json!("http")),
+                ("url", json!(url)),
+                ("final_url", json!(final_url)),
+                ("status", json!("ok")),
+                ("html_chars", json!(html.chars().count())),
+            ],
+        );
         Ok(html)
     }
 
@@ -261,6 +378,15 @@ impl Pipeline {
             headless: browser.headless,
             mobile_viewport: browser.mobile_viewport,
         };
+        log_pipeline_info(
+            "browser_worker_started",
+            vec![
+                ("task_id", json!(task.task_id)),
+                ("source", json!("browser_capture")),
+                ("url", json!(task.normalized_url)),
+                ("timeout_ms", json!(request.timeout_ms)),
+            ],
+        );
 
         let mut child = Command::new(&browser.command)
             .arg(&browser.worker_script)
@@ -269,6 +395,15 @@ impl Pipeline {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|err| {
+                log_pipeline_error(
+                    "browser_worker_failed",
+                    vec![
+                        ("task_id", json!(task.task_id)),
+                        ("source", json!("browser_capture")),
+                        ("error_kind", json!("browser_worker_unavailable")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
                 PipelineTaskError::browser_manual_input(
                     "browser_worker_unavailable",
                     format!("启动浏览器 worker 失败: {err}"),
@@ -278,9 +413,27 @@ impl Pipeline {
 
         if let Some(mut stdin) = child.stdin.take() {
             let payload = serde_json::to_vec(&request).map_err(|err| {
+                log_pipeline_error(
+                    "browser_worker_failed",
+                    vec![
+                        ("task_id", json!(task.task_id)),
+                        ("source", json!("browser_capture")),
+                        ("error_kind", json!("browser_request_serialize_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
                 PipelineTaskError::failed(format!("序列化浏览器抓取请求失败: {err}"))
             })?;
             stdin.write_all(&payload).map_err(|err| {
+                log_pipeline_error(
+                    "browser_worker_failed",
+                    vec![
+                        ("task_id", json!(task.task_id)),
+                        ("source", json!("browser_capture")),
+                        ("error_kind", json!("browser_worker_io_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
                 PipelineTaskError::browser_manual_input(
                     "browser_worker_io_failed",
                     format!("写入浏览器抓取请求失败: {err}"),
@@ -298,6 +451,15 @@ impl Pipeline {
                     if Instant::now() >= worker_deadline {
                         let _ = child.kill();
                         let output = child.wait_with_output().map_err(|err| {
+                            log_pipeline_error(
+                                "browser_worker_failed",
+                                vec![
+                                    ("task_id", json!(task.task_id)),
+                                    ("source", json!("browser_capture")),
+                                    ("error_kind", json!("browser_worker_timeout_kill_failed")),
+                                    ("detail", json!(err.to_string())),
+                                ],
+                            );
                             PipelineTaskError::browser_manual_input(
                                 "browser_worker_timeout",
                                 format!("终止超时浏览器 worker 失败: {err}"),
@@ -306,6 +468,22 @@ impl Pipeline {
                         })?;
                         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                        log_pipeline_error(
+                            "browser_worker_failed",
+                            vec![
+                                ("task_id", json!(task.task_id)),
+                                ("source", json!("browser_capture")),
+                                ("error_kind", json!("browser_worker_timeout")),
+                                (
+                                    "detail",
+                                    json!(format!(
+                                        "stdout={} stderr={}",
+                                        summarize_output(&stdout),
+                                        summarize_output(&stderr)
+                                    )),
+                                ),
+                            ],
+                        );
                         return Err(PipelineTaskError::browser_manual_input(
                             "browser_worker_timeout",
                             format!(
@@ -319,6 +497,15 @@ impl Pipeline {
                     sleep(Duration::from_millis(200));
                 }
                 Err(err) => {
+                    log_pipeline_error(
+                        "browser_worker_failed",
+                        vec![
+                            ("task_id", json!(task.task_id)),
+                            ("source", json!("browser_capture")),
+                            ("error_kind", json!("browser_worker_status_poll_failed")),
+                            ("detail", json!(err.to_string())),
+                        ],
+                    );
                     return Err(PipelineTaskError::browser_manual_input(
                         "browser_worker_failed",
                         format!("轮询浏览器 worker 状态失败: {err}"),
@@ -329,6 +516,15 @@ impl Pipeline {
         }
 
         let output = child.wait_with_output().map_err(|err| {
+            log_pipeline_error(
+                "browser_worker_failed",
+                vec![
+                    ("task_id", json!(task.task_id)),
+                    ("source", json!("browser_capture")),
+                    ("error_kind", json!("browser_worker_wait_failed")),
+                    ("detail", json!(err.to_string())),
+                ],
+            );
             PipelineTaskError::browser_manual_input(
                 "browser_worker_failed",
                 format!("等待浏览器 worker 结束失败: {err}"),
@@ -336,6 +532,15 @@ impl Pipeline {
             )
         })?;
         let stdout = String::from_utf8(output.stdout).map_err(|err| {
+            log_pipeline_error(
+                "browser_worker_failed",
+                vec![
+                    ("task_id", json!(task.task_id)),
+                    ("source", json!("browser_capture")),
+                    ("error_kind", json!("browser_worker_output_invalid_utf8")),
+                    ("detail", json!(err.to_string())),
+                ],
+            );
             PipelineTaskError::browser_manual_input(
                 "browser_worker_invalid_output",
                 format!("浏览器 worker 输出非 UTF-8: {err}"),
@@ -345,6 +550,18 @@ impl Pipeline {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
         if !output.status.success() && stdout.trim().is_empty() {
+            log_pipeline_error(
+                "browser_worker_failed",
+                vec![
+                    ("task_id", json!(task.task_id)),
+                    ("source", json!("browser_capture")),
+                    ("error_kind", json!("browser_worker_failed")),
+                    (
+                        "detail",
+                        json!(fallback_reason(&stderr, "unknown").to_string()),
+                    ),
+                ],
+            );
             return Err(PipelineTaskError::browser_manual_input(
                 "browser_worker_failed",
                 format!(
@@ -357,6 +574,22 @@ impl Pipeline {
 
         let response: BrowserCaptureResponse =
             serde_json::from_str(stdout.trim()).map_err(|err| {
+                log_pipeline_error(
+                    "browser_worker_failed",
+                    vec![
+                        ("task_id", json!(task.task_id)),
+                        ("source", json!("browser_capture")),
+                        ("error_kind", json!("browser_worker_invalid_output")),
+                        (
+                            "detail",
+                            json!(format!(
+                                "parse_error={err}; stdout={}; stderr={}",
+                                summarize_output(&stdout),
+                                summarize_output(&stderr)
+                            )),
+                        ),
+                    ],
+                );
                 PipelineTaskError::browser_manual_input(
                     "browser_worker_invalid_output",
                     format!(
@@ -370,6 +603,16 @@ impl Pipeline {
         validate_browser_capture_paths(&request, &response)?;
 
         if response.ok {
+            log_pipeline_info(
+                "browser_worker_finished",
+                vec![
+                    ("task_id", json!(task.task_id)),
+                    ("source", json!("browser_capture")),
+                    ("status", json!("ok")),
+                    ("page_kind", json!(response.page_kind)),
+                    ("final_url", json!(response.final_url)),
+                ],
+            );
             return Ok(BrowserCaptureResult {
                 page_kind: response.page_kind,
                 final_url: response.final_url,
@@ -379,6 +622,23 @@ impl Pipeline {
             });
         }
 
+        log_pipeline_warn(
+            "task_awaiting_manual_input",
+            vec![
+                ("task_id", json!(task.task_id)),
+                ("source", json!("browser_capture")),
+                ("status", json!("awaiting_manual_input")),
+                ("page_kind", json!(response.page_kind)),
+                (
+                    "detail",
+                    json!(format_browser_failure_message(
+                        response.reason.as_deref().unwrap_or("浏览器抓取未成功"),
+                        &response.logs,
+                        &stderr,
+                    )),
+                ),
+            ],
+        );
         Err(PipelineTaskError::browser_manual_input(
             response.page_kind,
             format_browser_failure_message(
@@ -420,12 +680,30 @@ impl Pipeline {
         fs::write(&output_path, content)
             .with_context(|| format!("写入浏览器归档文件失败: {}", output_path.display()))?;
 
-        Ok(PipelineResult {
+        let result = PipelineResult {
             output_path,
             raw_path: capture.html_path.clone(),
             snapshot_path: Some(capture.screenshot_path.clone()),
             title: capture.title.clone(),
-        })
+        };
+        log_pipeline_info(
+            "task_archived",
+            vec![
+                ("task_id", json!(task.task_id)),
+                ("source", json!("browser_capture")),
+                ("status", json!("archived")),
+                ("page_kind", json!(capture.page_kind)),
+                (
+                    "output_path",
+                    json!(result.output_path.display().to_string()),
+                ),
+                (
+                    "snapshot_path",
+                    json!(capture.screenshot_path.display().to_string()),
+                ),
+            ],
+        );
+        Ok(result)
     }
 
     fn archive_html(&self, task: &PendingTaskRecord, html: &str) -> Result<PipelineResult> {
@@ -456,13 +734,47 @@ impl Pipeline {
         fs::write(&output_path, content)
             .with_context(|| format!("写入归档文件失败: {}", output_path.display()))?;
 
-        Ok(PipelineResult {
+        let result = PipelineResult {
             output_path,
             raw_path,
             snapshot_path: None,
             title,
-        })
+        };
+        log_pipeline_info(
+            "task_archived",
+            vec![
+                ("task_id", json!(task.task_id)),
+                ("source", json!("http")),
+                ("status", json!("archived")),
+                (
+                    "output_path",
+                    json!(result.output_path.display().to_string()),
+                ),
+            ],
+        );
+        Ok(result)
     }
+}
+
+fn log_pipeline_info(event: &str, fields: Vec<(&str, Value)>) {
+    log_pipeline_event("info", event, fields);
+}
+
+fn log_pipeline_warn(event: &str, fields: Vec<(&str, Value)>) {
+    log_pipeline_event("warn", event, fields);
+}
+
+fn log_pipeline_error(event: &str, fields: Vec<(&str, Value)>) {
+    log_pipeline_event("error", event, fields);
+}
+
+fn log_pipeline_event(level: &str, event: &str, fields: Vec<(&str, Value)>) {
+    crate::logging::emit_structured_log(level, event, fields);
+}
+
+#[cfg(test)]
+fn build_pipeline_log_payload(level: &str, event: &str, fields: Vec<(&str, Value)>) -> Value {
+    crate::logging::build_structured_log_payload(level, event, fields)
 }
 
 fn extract_html_title(html: &str) -> Option<String> {
@@ -734,7 +1046,8 @@ fn validate_browser_capture_paths(
     request: &BrowserCaptureRequest,
     response: &BrowserCaptureResponse,
 ) -> std::result::Result<(), PipelineTaskError> {
-    if response.html_path != request.html_path || response.screenshot_path != request.screenshot_path
+    if response.html_path != request.html_path
+        || response.screenshot_path != request.screenshot_path
     {
         return Err(PipelineTaskError::browser_manual_input(
             "browser_worker_invalid_output",
@@ -823,12 +1136,14 @@ fn detect_wechat_error_page(url: &str, html: &str) -> std::result::Result<(), Pi
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_wechat_error_page, detect_wechat_redirect, extract_html_title, extract_primary_body,
-        should_disable_http_redirects, should_prefer_browser_capture,
-        validate_browser_capture_paths, validate_fetched_html, BrowserCaptureRequest,
-        BrowserCaptureResponse, BrowserCaptureResult, Pipeline, PipelineFailureKind,
+        build_pipeline_log_payload, detect_wechat_error_page, detect_wechat_redirect,
+        extract_html_title, extract_primary_body, should_disable_http_redirects,
+        should_prefer_browser_capture, validate_browser_capture_paths, validate_fetched_html,
+        BrowserCaptureRequest, BrowserCaptureResponse, BrowserCaptureResult, Pipeline,
+        PipelineFailureKind,
     };
     use crate::task_store::{PendingTaskRecord, TaskContentRecord};
+    use serde_json::{json, Value};
     use std::fs;
     use uuid::Uuid;
 
@@ -965,6 +1280,26 @@ mod tests {
         assert!(!should_prefer_browser_capture(
             "https://example.com/article"
         ));
+    }
+
+    #[test]
+    fn pipeline_log_payload_keeps_contract_fields() {
+        let payload = build_pipeline_log_payload(
+            "warn",
+            "task_awaiting_manual_input",
+            vec![
+                ("task_id", json!("task-1")),
+                ("source", json!("browser_capture")),
+                ("detail", Value::Null),
+            ],
+        );
+
+        assert_eq!(payload["level"], "warn");
+        assert_eq!(payload["event"], "task_awaiting_manual_input");
+        assert_eq!(payload["task_id"], "task-1");
+        assert_eq!(payload["source"], "browser_capture");
+        assert!(payload.get("ts").is_some());
+        assert!(payload.get("detail").is_none());
     }
 
     #[test]

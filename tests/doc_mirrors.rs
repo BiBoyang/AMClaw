@@ -72,7 +72,8 @@ fn claude_files_match_agents_files_except_title() {
         let claude_body = normalized_mirror_body(&claude);
 
         assert_eq!(
-            claude_body, agents_body,
+            claude_body,
+            agents_body,
             "文档镜像漂移: {} <-> {}",
             agents.display(),
             claude.display()

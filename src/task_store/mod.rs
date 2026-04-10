@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use reqwest::Url;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -44,6 +45,18 @@ pub struct RecentTaskRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivedTaskRecord {
+    pub task_id: String,
+    pub article_id: String,
+    pub normalized_url: String,
+    pub title: Option<String>,
+    pub content_source: Option<String>,
+    pub page_kind: Option<String>,
+    pub output_path: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingTaskRecord {
     pub task_id: String,
     pub article_id: String,
@@ -58,6 +71,23 @@ pub struct TaskContentRecord {
     pub normalized_url: String,
     pub original_url: String,
     pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSessionRecord {
+    pub user_id: String,
+    pub merged_text: String,
+    pub message_ids: Vec<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserMemoryRecord {
+    pub id: String,
+    pub user_id: String,
+    pub content: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug)]
@@ -98,6 +128,14 @@ impl TaskStore {
         )?;
         if inserted == 0 {
             tx.rollback().context("回滚重复消息事务失败")?;
+            log_task_store_info(
+                "inbound_message_deduplicated",
+                vec![
+                    ("message_id", json!(message_id)),
+                    ("user_id", json!(from_user_id)),
+                    ("status", json!("deduplicated")),
+                ],
+            );
             return Ok(false);
         }
 
@@ -110,7 +148,187 @@ impl TaskStore {
         )
         .context("写入入站消息失败")?;
         tx.commit().context("提交消息写入事务失败")?;
+        log_task_store_info(
+            "inbound_message_recorded",
+            vec![
+                ("message_id", json!(message_id)),
+                ("user_id", json!(from_user_id)),
+                ("status", json!("recorded")),
+                ("text_chars", json!(text.chars().count())),
+            ],
+        );
         Ok(true)
+    }
+
+    pub fn upsert_context_token(&mut self, user_id: &str, context_token: &str) -> Result<()> {
+        let user_id = user_id.trim();
+        let context_token = context_token.trim();
+        if user_id.is_empty() || context_token.is_empty() {
+            bail!("user_id/context_token 不能为空");
+        }
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO user_context_tokens (user_id, context_token, updated_at)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    context_token = excluded.context_token,
+                    updated_at = excluded.updated_at
+                "#,
+                params![user_id, context_token, now],
+            )
+            .context("写入 context_token 失败")?;
+        Ok(())
+    }
+
+    pub fn get_context_token(&self, user_id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT context_token FROM user_context_tokens WHERE user_id = ?1",
+                [user_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("查询 context_token 失败")
+    }
+
+    pub fn upsert_session_state(
+        &mut self,
+        user_id: &str,
+        merged_text: &str,
+        message_ids: &[String],
+    ) -> Result<()> {
+        let user_id = user_id.trim();
+        let merged_text = merged_text.trim();
+        if user_id.is_empty() || merged_text.is_empty() {
+            bail!("user_id/merged_text 不能为空");
+        }
+        let updated_at = Utc::now().to_rfc3339();
+        let message_ids_json =
+            serde_json::to_string(message_ids).context("序列化 session message_ids 失败")?;
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO user_sessions (user_id, merged_text, message_ids_json, updated_at)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    merged_text = excluded.merged_text,
+                    message_ids_json = excluded.message_ids_json,
+                    updated_at = excluded.updated_at
+                "#,
+                params![user_id, merged_text, message_ids_json, updated_at],
+            )
+            .context("写入 session_state 失败")?;
+        Ok(())
+    }
+
+    pub fn delete_session_state(&mut self, user_id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM user_sessions WHERE user_id = ?1", [user_id])
+            .context("删除 session_state 失败")?;
+        Ok(())
+    }
+
+    pub fn list_session_states(&self) -> Result<Vec<StoredSessionRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+                SELECT user_id, merged_text, message_ids_json, updated_at
+                FROM user_sessions
+                ORDER BY updated_at DESC
+                "#,
+            )
+            .context("准备 session_state 查询失败")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let message_ids_json: String = row.get(2)?;
+                let message_ids = serde_json::from_str::<Vec<String>>(&message_ids_json)
+                    .unwrap_or_default();
+                Ok(StoredSessionRecord {
+                    user_id: row.get(0)?,
+                    merged_text: row.get(1)?,
+                    message_ids,
+                    updated_at: row.get(3)?,
+                })
+            })
+            .context("查询 session_state 失败")?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row.context("读取 session_state 失败")?);
+        }
+        Ok(sessions)
+    }
+
+    pub fn add_user_memory(&mut self, user_id: &str, content: &str) -> Result<UserMemoryRecord> {
+        let user_id = user_id.trim();
+        let content = content.trim();
+        if user_id.is_empty() || content.is_empty() {
+            bail!("user_id/content 不能为空");
+        }
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO user_memories (id, user_id, content, created_at, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+                params![id, user_id, content, now.clone(), now.clone()],
+            )
+            .context("写入 user_memory 失败")?;
+        Ok(UserMemoryRecord {
+            id,
+            user_id: user_id.to_string(),
+            content: content.to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+        })
+    }
+
+    pub fn list_user_memories(&self, user_id: &str, limit: usize) -> Result<Vec<UserMemoryRecord>> {
+        let limit = i64::try_from(limit).context("memory limit 超出范围")?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+                SELECT id, user_id, content, created_at, updated_at
+                FROM user_memories
+                WHERE user_id = ?1
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT ?2
+                "#,
+            )
+            .context("准备 user_memory 查询失败")?;
+        let rows = stmt
+            .query_map(params![user_id, limit], |row| {
+                Ok(UserMemoryRecord {
+                    id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    content: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            })
+            .context("查询 user_memory 失败")?;
+        let mut memories = Vec::new();
+        for row in rows {
+            memories.push(row.context("读取 user_memory 失败")?);
+        }
+        Ok(memories)
+    }
+
+    pub fn has_user_memory(&self, user_id: &str, content: &str) -> Result<bool> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM user_memories WHERE user_id = ?1 AND content = ?2",
+                params![user_id, content],
+                |row| row.get(0),
+            )
+            .context("查询 user_memory 去重失败")?;
+        Ok(count > 0)
     }
 
     pub fn record_link_submission(&mut self, original_url: &str) -> Result<LinkTaskRecord> {
@@ -180,13 +398,31 @@ impl TaskStore {
         };
 
         tx.commit().context("提交链接写入事务失败")?;
-        Ok(LinkTaskRecord {
+        let record = LinkTaskRecord {
             article_id,
             task_id,
             normalized_url,
             original_url: original_url.to_string(),
             created_new,
-        })
+        };
+        log_task_store_info(
+            "task_created",
+            vec![
+                ("task_id", json!(record.task_id)),
+                ("article_id", json!(record.article_id)),
+                ("url", json!(record.normalized_url)),
+                (
+                    "status",
+                    json!(if record.created_new {
+                        "created"
+                    } else {
+                        "existing"
+                    }),
+                ),
+                ("created_new", json!(record.created_new)),
+            ],
+        );
+        Ok(record)
     }
 
     pub fn get_task_status(&self, task_id: &str) -> Result<Option<TaskStatusRecord>> {
@@ -318,6 +554,43 @@ impl TaskStore {
         Ok(tasks)
     }
 
+    pub fn list_archived_tasks(&self, limit: usize) -> Result<Vec<ArchivedTaskRecord>> {
+        let limit = i64::try_from(limit).context("archived task limit 超出范围")?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+                SELECT t.id, t.article_id, a.normalized_url, a.title, t.content_source, t.page_kind, t.output_path, t.updated_at
+                FROM tasks t
+                JOIN articles a ON a.id = t.article_id
+                WHERE t.status = 'archived'
+                ORDER BY t.updated_at DESC, t.created_at DESC
+                LIMIT ?1
+                "#,
+            )
+            .context("准备 archived 任务查询失败")?;
+        let rows = stmt
+            .query_map([limit], |row| {
+                Ok(ArchivedTaskRecord {
+                    task_id: row.get(0)?,
+                    article_id: row.get(1)?,
+                    normalized_url: row.get(2)?,
+                    title: row.get(3)?,
+                    content_source: row.get(4)?,
+                    page_kind: row.get(5)?,
+                    output_path: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            })
+            .context("查询 archived 任务失败")?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks.push(row.context("读取 archived 任务记录失败")?);
+        }
+        Ok(tasks)
+    }
+
     pub fn retry_task(&mut self, task_id: &str) -> Result<Option<TaskStatusRecord>> {
         let now = Utc::now().to_rfc3339();
         let tx = self.conn.transaction().context("开启重试事务失败")?;
@@ -339,6 +612,10 @@ impl TaskStore {
             .context("更新任务重试状态失败")?;
         if updated == 0 {
             tx.rollback().context("回滚不存在任务事务失败")?;
+            log_task_store_warn(
+                "task_retry_requested",
+                vec![("task_id", json!(task_id)), ("status", json!("missing"))],
+            );
             return Ok(None);
         }
         let task = tx
@@ -370,6 +647,15 @@ impl TaskStore {
             )
             .context("读取重试后的任务状态失败")?;
         tx.commit().context("提交重试事务失败")?;
+        log_task_store_info(
+            "task_retry_requested",
+            vec![
+                ("task_id", json!(task.task_id)),
+                ("article_id", json!(task.article_id)),
+                ("status", json!(task.status)),
+                ("retry_count", json!(task.retry_count)),
+            ],
+        );
         Ok(Some(task))
     }
 
@@ -448,6 +734,14 @@ impl TaskStore {
             .context("更新 archived 状态失败")?;
         if updated == 0 {
             tx.rollback().context("回滚不存在任务 archived 事务失败")?;
+            log_task_store_warn(
+                "task_status_changed",
+                vec![
+                    ("task_id", json!(task_id)),
+                    ("status", json!("missing")),
+                    ("target_status", json!("archived")),
+                ],
+            );
             return Ok(false);
         }
         if let Some(title) = title.filter(|v| !v.trim().is_empty()) {
@@ -462,6 +756,17 @@ impl TaskStore {
             .context("更新文章标题失败")?;
         }
         tx.commit().context("提交 archived 事务失败")?;
+        log_task_store_info(
+            "task_status_changed",
+            vec![
+                ("task_id", json!(task_id)),
+                ("status", json!("archived")),
+                ("page_kind", json!(page_kind)),
+                ("content_source", json!(content_source)),
+                ("output_path", json!(output_path)),
+                ("snapshot_path", json!(snapshot_path)),
+            ],
+        );
         Ok(updated > 0)
     }
 
@@ -481,6 +786,29 @@ impl TaskStore {
                 params![task_id, last_error, page_kind, snapshot_path, content_source, now],
             )
             .context("更新 awaiting_manual_input 状态失败")?;
+        if updated > 0 {
+            log_task_store_warn(
+                "task_status_changed",
+                vec![
+                    ("task_id", json!(task_id)),
+                    ("status", json!("awaiting_manual_input")),
+                    ("page_kind", json!(page_kind)),
+                    ("content_source", json!(content_source)),
+                    ("snapshot_path", json!(snapshot_path)),
+                    ("error_kind", json!("awaiting_manual_input")),
+                    ("detail", json!(summarize_text_for_log(last_error, 160))),
+                ],
+            );
+        } else {
+            log_task_store_warn(
+                "task_status_changed",
+                vec![
+                    ("task_id", json!(task_id)),
+                    ("status", json!("missing")),
+                    ("target_status", json!("awaiting_manual_input")),
+                ],
+            );
+        }
         Ok(updated > 0)
     }
 
@@ -493,6 +821,26 @@ impl TaskStore {
                 params![task_id, last_error, now],
             )
             .context("更新 failed 状态失败")?;
+        if updated > 0 {
+            log_task_store_error(
+                "task_status_changed",
+                vec![
+                    ("task_id", json!(task_id)),
+                    ("status", json!("failed")),
+                    ("error_kind", json!("task_failed")),
+                    ("detail", json!(summarize_text_for_log(last_error, 160))),
+                ],
+            );
+        } else {
+            log_task_store_warn(
+                "task_status_changed",
+                vec![
+                    ("task_id", json!(task_id)),
+                    ("status", json!("missing")),
+                    ("target_status", json!("failed")),
+                ],
+            );
+        }
         Ok(updated > 0)
     }
 
@@ -547,6 +895,27 @@ impl TaskStore {
                 created_at  DATETIME NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS user_context_tokens (
+                user_id       TEXT PRIMARY KEY,
+                context_token TEXT NOT NULL,
+                updated_at    DATETIME NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                user_id          TEXT PRIMARY KEY,
+                merged_text      TEXT NOT NULL,
+                message_ids_json TEXT NOT NULL,
+                updated_at       DATETIME NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS user_memories (
+                id         TEXT PRIMARY KEY,
+                user_id    TEXT NOT NULL,
+                content    TEXT NOT NULL,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_articles_normalized_url ON articles(normalized_url);
             CREATE INDEX IF NOT EXISTS idx_tasks_article_id ON tasks(article_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -587,6 +956,36 @@ fn ensure_column_exists(
     conn.execute(&sql, [])
         .with_context(|| format!("补充列失败: {table}.{column}"))?;
     Ok(())
+}
+
+fn log_task_store_info(event: &str, fields: Vec<(&str, Value)>) {
+    log_task_store_event("info", event, fields);
+}
+
+fn log_task_store_warn(event: &str, fields: Vec<(&str, Value)>) {
+    log_task_store_event("warn", event, fields);
+}
+
+fn log_task_store_error(event: &str, fields: Vec<(&str, Value)>) {
+    log_task_store_event("error", event, fields);
+}
+
+fn log_task_store_event(level: &str, event: &str, fields: Vec<(&str, Value)>) {
+    crate::logging::emit_structured_log(level, event, fields);
+}
+
+#[cfg(test)]
+fn build_task_store_log_payload(level: &str, event: &str, fields: Vec<(&str, Value)>) -> Value {
+    crate::logging::build_structured_log_payload(level, event, fields)
+}
+
+fn summarize_text_for_log(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    let mut output: String = input.chars().take(max_chars).collect();
+    output.push_str("...");
+    output
 }
 
 fn normalize_url(input: &str) -> Result<String> {
@@ -638,8 +1037,12 @@ fn source_domain(normalized_url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LinkTaskRecord, PendingTaskRecord, RecentTaskRecord, TaskStatusRecord, TaskStore};
+    use super::{
+        build_task_store_log_payload, ArchivedTaskRecord, LinkTaskRecord, PendingTaskRecord,
+        RecentTaskRecord, StoredSessionRecord, TaskStatusRecord, TaskStore, UserMemoryRecord,
+    };
     use rusqlite::Connection;
+    use serde_json::{json, Value};
     use std::fs;
     use uuid::Uuid;
 
@@ -1111,5 +1514,161 @@ mod tests {
                 updated_at: tasks[0].updated_at.clone(),
             }]
         );
+    }
+
+    #[test]
+    fn archived_tasks_can_be_listed() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        let created = store
+            .record_link_submission("https://example.com/archived-list")
+            .expect("写入链接失败");
+
+        assert!(store
+            .mark_task_archived(
+                &created.task_id,
+                "/tmp/archived-list.md",
+                Some("Archived List Title"),
+                Some("article"),
+                None,
+                Some("http"),
+            )
+            .expect("更新 archived 状态失败"));
+
+        let tasks = store.list_archived_tasks(10).expect("查询 archived 失败");
+        assert_eq!(
+            tasks,
+            vec![ArchivedTaskRecord {
+                task_id: created.task_id,
+                article_id: created.article_id,
+                normalized_url: "https://example.com/archived-list".to_string(),
+                title: Some("Archived List Title".to_string()),
+                content_source: Some("http".to_string()),
+                page_kind: Some("article".to_string()),
+                output_path: Some("/tmp/archived-list.md".to_string()),
+                updated_at: tasks[0].updated_at.clone(),
+            }]
+        );
+    }
+
+    #[test]
+    fn context_token_can_be_persisted_and_loaded() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        store
+            .upsert_context_token("user-a", "ctx-1")
+            .expect("写入 token 失败");
+        assert_eq!(
+            store.get_context_token("user-a").expect("读取 token 失败"),
+            Some("ctx-1".to_string())
+        );
+
+        store
+            .upsert_context_token("user-a", "ctx-2")
+            .expect("更新 token 失败");
+        assert_eq!(
+            store.get_context_token("user-a").expect("读取 token 失败"),
+            Some("ctx-2".to_string())
+        );
+    }
+
+    #[test]
+    fn session_state_can_be_persisted_listed_and_deleted() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        store
+            .upsert_session_state(
+                "user-a",
+                "hello\nworld",
+                &["msg-1".to_string(), "msg-2".to_string()],
+            )
+            .expect("写入 session_state 失败");
+
+        let sessions = store.list_session_states().expect("查询 session_state 失败");
+        assert_eq!(
+            sessions.len(),
+            1,
+            "应只有一条 session_state，实际: {:?}",
+            sessions
+        );
+        assert_eq!(
+            sessions[0],
+            StoredSessionRecord {
+                user_id: "user-a".to_string(),
+                merged_text: "hello\nworld".to_string(),
+                message_ids: vec!["msg-1".to_string(), "msg-2".to_string()],
+                updated_at: sessions[0].updated_at.clone(),
+            }
+        );
+
+        store
+            .delete_session_state("user-a")
+            .expect("删除 session_state 失败");
+        assert!(store
+            .list_session_states()
+            .expect("查询 session_state 失败")
+            .is_empty());
+    }
+
+    #[test]
+    fn user_memory_can_be_added_and_listed() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let created = store
+            .add_user_memory("user-a", "我更喜欢短摘要")
+            .expect("写入 user_memory 失败");
+        let memories = store
+            .list_user_memories("user-a", 10)
+            .expect("查询 user_memory 失败");
+
+        assert_eq!(
+            memories,
+            vec![UserMemoryRecord {
+                id: created.id,
+                user_id: "user-a".to_string(),
+                content: "我更喜欢短摘要".to_string(),
+                created_at: created.created_at,
+                updated_at: created.updated_at,
+            }]
+        );
+    }
+
+    #[test]
+    fn user_memory_dedup_check_works() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        store
+            .add_user_memory("user-a", "偏好: 短摘要")
+            .expect("写入 user_memory 失败");
+
+        assert!(store
+            .has_user_memory("user-a", "偏好: 短摘要")
+            .expect("查询 user_memory 去重失败"));
+        assert!(!store
+            .has_user_memory("user-a", "主题: Rust")
+            .expect("查询 user_memory 去重失败"));
+    }
+
+    #[test]
+    fn task_store_log_payload_keeps_contract_fields() {
+        let payload = build_task_store_log_payload(
+            "error",
+            "task_status_changed",
+            vec![
+                ("task_id", json!("task-1")),
+                ("status", json!("failed")),
+                ("detail", Value::Null),
+            ],
+        );
+
+        assert_eq!(payload["level"], "error");
+        assert_eq!(payload["event"], "task_status_changed");
+        assert_eq!(payload["task_id"], "task-1");
+        assert_eq!(payload["status"], "failed");
+        assert!(payload.get("ts").is_some());
+        assert!(payload.get("detail").is_none());
     }
 }

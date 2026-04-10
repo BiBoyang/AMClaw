@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use config::AppConfig;
+use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,7 +9,10 @@ mod agent_core;
 mod chat_adapter;
 mod command_router;
 mod config;
+mod logging;
 mod pipeline;
+mod reporter;
+mod scheduler;
 mod session_router;
 mod task_store;
 mod tool_registry;
@@ -19,10 +23,34 @@ fn main() -> Result<()> {
     let app_config = AppConfig::load_or_create(workspace_root.join("config.toml"))?;
     let browser = app_config.resolved_browser();
 
+    if let Ok(day) = std::env::var("AMCLAW_GENERATE_DAILY_REPORT_FOR") {
+        let output = scheduler::generate_daily_report_once(&app_config, &day)?;
+        log_startup_info(
+            "daily_report_generated_once",
+            vec![
+                ("day", json!(output.day)),
+                ("item_count", json!(output.item_count)),
+                (
+                    "markdown_path",
+                    json!(output.markdown_path.display().to_string()),
+                ),
+            ],
+        );
+        println!("{}", output.summary);
+        return Ok(());
+    }
+
     if let Ok(command) = std::env::var("AMCLAW_AGENT_DEMO_COMMAND") {
-        let agent = agent_core::AgentCore::new(workspace_root)?;
+        let agent =
+            agent_core::AgentCore::with_task_store_db_path(workspace_root, app_config.db_path())?;
         let output = agent.run(&command)?;
-        println!("[AgentDemo] {output}");
+        log_startup_info(
+            "agent_demo_finished",
+            vec![
+                ("command", json!(command)),
+                ("output_chars", json!(output.chars().count())),
+            ],
+        );
         return Ok(());
     }
 
@@ -30,15 +58,28 @@ fn main() -> Result<()> {
     {
         let running = Arc::clone(&running);
         ctrlc::set_handler(move || {
-            println!("\n[退出] 收到 SIGINT，正在退出...");
+            log_startup_info("signal_received", vec![("signal", json!("SIGINT"))]);
             running.store(false, Ordering::Relaxed);
         })
         .context("注册 Ctrl-C 处理器失败")?;
     }
 
-    if let Err(err) = chat_adapter::run(app_config, browser, running) {
-        eprintln!("[启动失败] {err:#}");
+    let scheduler_handle =
+        scheduler::spawn_daily_scheduler(app_config.clone(), Arc::clone(&running))?;
+
+    if let Err(err) = chat_adapter::run(app_config, browser, Arc::clone(&running)) {
+        log_startup_error(
+            "startup_failed",
+            vec![
+                ("error_kind", json!("chat_adapter_run_failed")),
+                ("detail", json!(format!("{err:#}"))),
+            ],
+        );
         std::process::exit(1);
+    }
+    running.store(false, Ordering::Relaxed);
+    if let Some(handle) = scheduler_handle {
+        let _ = handle.join();
     }
     Ok(())
 }
@@ -72,7 +113,10 @@ fn load_env_file_if_exists(path: &str) -> Result<()> {
         }
         std::env::set_var(key, clean_env_value(value));
     }
-    eprintln!("[启动] 已加载配置文件: {}", file_path.display());
+    log_startup_info(
+        "startup_env_loaded",
+        vec![("path", json!(file_path.display().to_string()))],
+    );
     Ok(())
 }
 
@@ -84,4 +128,16 @@ fn clean_env_value(value: &str) -> String {
         .trim_matches('`')
         .trim()
         .to_string()
+}
+
+fn log_startup_info(event: &str, fields: Vec<(&str, Value)>) {
+    log_startup_event("info", event, fields);
+}
+
+fn log_startup_error(event: &str, fields: Vec<(&str, Value)>) {
+    log_startup_event("error", event, fields);
+}
+
+fn log_startup_event(level: &str, event: &str, fields: Vec<(&str, Value)>) {
+    crate::logging::emit_structured_log(level, event, fields);
 }

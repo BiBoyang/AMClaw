@@ -1,8 +1,10 @@
 # AMClaw 当前状态
 
-更新于 2026-03-31。
+更新于 2026-04-06。
 
 这份文件不再记录理想化路线图，而是记录仓库当前真实状态，方便后续判断“做到哪了、下一步该做什么”。
+
+关于新的 `core/runtime` 与 `skill` 分层路线，不放在本文件展开，统一记录在 `CORE-SKILL-ROADMAP.md`。
 
 ## 项目定位
 
@@ -17,12 +19,15 @@ AMClaw 是个人 IMAgent 项目，以微信 Bot 为入口，围绕“收消息 -
 - [x] 消息去重与入站消息落库
 - [x] 基础聊天流与简单命令处理
 - [x] 二维码过期自动刷新，避免登录阶段卡死
+- [x] 待提交聊天会话最小持久化与恢复
 
 ### Agent / LLM
 
 - [x] 多 Provider 支持（DeepSeek / Moonshot / OpenAI）
 - [x] 基础 Agent 能力可用
 - [x] 普通聊天消息可以进入 LLM 回复链路
+- [x] Memory v1：显式用户记忆写入与上下文读取
+- [x] Memory v2：最小主题 / 偏好自动提炼
 
 ### 任务系统
 
@@ -91,9 +96,15 @@ AMClaw 是个人 IMAgent 项目，以微信 Bot 为入口，围绕“收消息 -
   - 模块级文档后续还可以继续细化
 
 - [ ] 日志体系升级
-  - 目前大量输出仍然是 `println!` / `eprintln!`
+  - `chat_adapter` / `pipeline` / `task_store` 已补第一版结构化日志
+  - `chat_adapter` 的登录、轮询、消息、任务消费日志已基本收口
+  - `main` / `config` / `agent_core` 的启动与内部旧输出已补第一版结构化事件
+  - 已有最小日志契约测试，防止 payload 字段漂移
+  - 目前仍有仓库其他模块的旧 `println!` / `eprintln!` 未完全收口
   - 已有 Agent Trace、Markdown Trace 与每日 `index.jsonl`
-  - 下一步是把 trace 接到真实聊天链路，并补系统级结构化日志
+  - Agent Trace 已接到真实聊天链路，并补充 `source_type`、`trigger_type`、`user_id`、`message_ids`
+  - 每天可读的 `index.md` 已补齐
+  - 下一步是继续收口剩余旧输出，并统一日志约定
 
 - [ ] 内容处理深度
   - 目前公众号正文提取可用
@@ -122,8 +133,8 @@ AMClaw 是个人 IMAgent 项目，以微信 Bot 为入口，围绕“收消息 -
 
 ### 汇总与调度
 
-- [ ] 每日定时任务
-- [ ] 日报 Markdown 输出
+- [x] 每日定时任务（本地 Markdown 日报）
+- [x] 日报 Markdown 输出
 - [ ] 微信摘要回传
 - [ ] 汇总失败补偿策略
 
@@ -156,6 +167,11 @@ AMClaw 是个人 IMAgent 项目，以微信 Bot 为入口，围绕“收消息 -
 - Agent Trace 全量 JSON 落盘
 - Agent Trace Markdown 摘要化
 - Agent Trace 每日 `index.jsonl`
+- Agent Trace 每日 `index.md`
+- 真实聊天链路 Trace 上下文透传（`source_type` / `trigger_type` / `user_id` / `message_ids`）
+- `chat_adapter` / `pipeline` / `task_store` 第一版结构化日志
+- `main` / `config` / `agent_core` 第一版结构化事件
+- 最小日志契约测试（chat / pipeline / task_store）
 
 ## 当前仓库外的说明
 

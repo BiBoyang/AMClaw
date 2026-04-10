@@ -19,11 +19,13 @@
    - 看“当前实现”、运行方式、已有命令和测试范围
 2. `AGENTS.md`
    - 看仓库级目标、约束和模块边界
-3. `PLAN.md`
+3. `LOGGING.md`
+   - 看当前已经落地的结构化日志字段、事件名和扩展规则
+4. `PLAN.md`
    - 看当前中期路线
-4. `NEXT-STEPS.md`
+5. `NEXT-STEPS.md`
    - 看最近阶段的执行备忘
-5. 对应模块下的 `AGENTS.md` / `CLAUDE.md`
+6. 对应模块下的 `AGENTS.md` / `CLAUDE.md`
    - 看该模块的职责边界与不做事项
 
 如果文档描述与代码行为冲突，处理优先级如下：
@@ -127,6 +129,7 @@ cargo test
 最少要检查这些文件是否需要更新：
 
 - `README.md`
+- `LOGGING.md`
 - 根目录 `AGENTS.md`
 - 对应目录下的 `AGENTS.md`
 - 同目录 `CLAUDE.md`

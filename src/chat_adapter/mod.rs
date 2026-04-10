@@ -1,8 +1,10 @@
-use crate::agent_core::AgentCore;
+use crate::agent_core::{AgentCore, AgentRunContext};
 use crate::command_router;
 use crate::config::{AppConfig, ResolvedBrowserConfig};
 use crate::pipeline::Pipeline;
-use crate::session_router::{SessionEvent, SessionRouter};
+use crate::reporter::DailyReporter;
+use crate::session_router::{FlushReason, SessionEvent, SessionRouter};
+use crate::scheduler::DailyReportSchedule;
 use crate::task_store::TaskStore;
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -228,7 +230,7 @@ impl ILinkClient {
     }
 
     fn fetch_login_qrcode(&self) -> Result<String> {
-        println!("[登录] 正在获取二维码...");
+        log_chat_info("login_qrcode_requested", vec![]);
         let qr_resp = self.get_qrcode()?;
         assert_ok(&qr_resp, "获取二维码")?;
 
@@ -243,10 +245,15 @@ impl ILinkClient {
         ]);
 
         if let Some(url) = qrcode_url {
-            println!("\n请用微信扫描以下二维码登录:");
-            println!("  {url}\n");
+            log_chat_info(
+                "login_qrcode_ready",
+                vec![("qrcode_id", json!(qrcode_id)), ("qrcode_url", json!(url))],
+            );
         } else {
-            println!("[登录] 二维码URL为空，qrcodeId: {qrcode_id}");
+            log_chat_warn(
+                "login_qrcode_missing_url",
+                vec![("qrcode_id", json!(qrcode_id))],
+            );
         }
 
         Ok(qrcode_id)
@@ -255,7 +262,10 @@ impl ILinkClient {
     fn login(&mut self, running: &AtomicBool) -> Result<()> {
         let mut qrcode_id = self.fetch_login_qrcode()?;
 
-        println!("[登录] 等待扫码...");
+        log_chat_info(
+            "login_waiting_for_scan",
+            vec![("qrcode_id", json!(qrcode_id))],
+        );
         while running.load(Ordering::Relaxed) {
             sleep(Duration::from_secs(2));
             let status_resp = self.get_qrcode_status(&qrcode_id)?;
@@ -272,9 +282,15 @@ impl ILinkClient {
                     }
                 }
 
-                println!("[登录] 登录成功!");
-                println!("  bot_id: {}", self.ilink_bot_id);
-                println!("  user_id: {}", self.ilink_user_id);
+                log_chat_info(
+                    "login_confirmed",
+                    vec![
+                        ("qrcode_id", json!(qrcode_id)),
+                        ("status", json!(status)),
+                        ("bot_id", json!(self.ilink_bot_id)),
+                        ("user_id", json!(self.ilink_user_id)),
+                    ],
+                );
                 return Ok(());
             }
 
@@ -283,15 +299,33 @@ impl ILinkClient {
             }
 
             if ret == 0 && status == "expired" {
-                println!("[登录] 二维码已过期，重新获取中...");
+                log_chat_warn(
+                    "login_qrcode_expired",
+                    vec![("qrcode_id", json!(qrcode_id)), ("status", json!(status))],
+                );
                 qrcode_id = self.fetch_login_qrcode()?;
-                println!("[登录] 等待扫码...");
+                log_chat_info(
+                    "login_waiting_for_scan",
+                    vec![("qrcode_id", json!(qrcode_id))],
+                );
                 continue;
             }
 
-            println!("[登录] 未知状态: {}", compact_json(&status_resp));
+            log_chat_warn(
+                "login_status_unknown",
+                vec![
+                    ("qrcode_id", json!(qrcode_id)),
+                    ("status", json!(status)),
+                    ("ret", json!(ret)),
+                    (
+                        "detail",
+                        json!(truncate_for_log(&compact_json(&status_resp), 240)),
+                    ),
+                ],
+            );
         }
 
+        log_chat_warn("login_aborted", vec![("qrcode_id", json!(qrcode_id))]);
         bail!("登录被中止")
     }
 
@@ -310,9 +344,9 @@ impl ILinkClient {
         )?;
         assert_ok(&resp, "getupdates")?;
 
-        println!(
-            "[调试] getupdates 返回: {}",
-            truncate_for_log(&compact_json(&resp), 500)
+        log_chat_info(
+            "poll_updates_received",
+            vec![("detail", json!(truncate_for_log(&compact_json(&resp), 500)))],
         );
 
         let new_cursor = first_non_empty([
@@ -360,8 +394,11 @@ struct WeChatBot {
     agent_core: AgentCore,
     client: ILinkClient,
     pipeline: Pipeline,
+    reporter: DailyReporter,
     task_store: TaskStore,
     context_token_map: HashMap<String, String>,
+    daily_report_schedule: Option<DailyReportSchedule>,
+    last_daily_report_push_day: Option<String>,
     cursor: String,
     seen_ids: HashSet<String>,
     seen_order: VecDeque<String>,
@@ -378,24 +415,29 @@ impl WeChatBot {
         let workspace_root = std::env::current_dir().context("获取工作目录失败")?;
         let db_path = config.db_path();
         let root_dir = config.resolved_root_dir();
-        Ok(Self {
-            agent_core: AgentCore::new(workspace_root)?,
+        let mut bot = Self {
+            agent_core: AgentCore::with_task_store_db_path(workspace_root, db_path.clone())?,
             client: ILinkClient::new(config.wechat.channel_version.clone())?,
             pipeline: Pipeline::new(root_dir, browser),
+            reporter: DailyReporter::from_config(&config)?,
             task_store: TaskStore::open(&db_path)?,
             context_token_map: HashMap::new(),
+            daily_report_schedule: DailyReportSchedule::from_config(&config)?,
+            last_daily_report_push_day: None,
             cursor: String::new(),
             seen_ids: HashSet::new(),
             seen_order: VecDeque::new(),
             session_router: SessionRouter::new(config.session_merge_timeout()),
             running,
-        })
+        };
+        bot.restore_persisted_sessions()?;
+        Ok(bot)
     }
 
     fn start(&mut self) -> Result<()> {
-        println!("=== 微信 iLink Bot Demo (Rust) ===\n");
+        log_chat_info("bot_starting", vec![]);
         self.client.login(&self.running)?;
-        println!("\n[Bot] 开始接收消息，长轮询中...\n");
+        log_chat_info("bot_polling_started", vec![]);
         self.poll_loop();
         Ok(())
     }
@@ -404,6 +446,7 @@ impl WeChatBot {
         while self.running.load(Ordering::Relaxed) {
             self.flush_expired_sessions();
             self.process_pending_tasks();
+            self.process_scheduled_daily_report_push();
 
             let poll_timeout = self.next_poll_timeout();
             match self.client.get_updates(&self.cursor, poll_timeout) {
@@ -420,8 +463,14 @@ impl WeChatBot {
                     if is_poll_timeout_error(&err) {
                         continue;
                     }
-                    eprintln!("[轮询] 错误: {err}");
-                    println!("[轮询] 5秒后重试...");
+                    log_chat_error(
+                        "poll_failed",
+                        vec![
+                            ("error_kind", json!("get_updates_failed")),
+                            ("detail", json!(err.to_string())),
+                        ],
+                    );
+                    log_chat_info("poll_retry_scheduled", vec![("retry_after_secs", json!(5))]);
                     sleep(Duration::from_secs(5));
                 }
             }
@@ -446,6 +495,19 @@ impl WeChatBot {
         if !context_token.is_empty() {
             self.context_token_map
                 .insert(from_user_id.to_string(), context_token.to_string());
+            if let Err(err) = self
+                .task_store
+                .upsert_context_token(from_user_id, context_token)
+            {
+                log_chat_warn(
+                    "context_token_persist_failed",
+                    vec![
+                        ("user_id", json!(from_user_id)),
+                        ("error_kind", json!("context_token_persist_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
+            }
         }
 
         let text = collect_text(wire);
@@ -454,11 +516,32 @@ impl WeChatBot {
         }
 
         let msg_id = self.extract_message_id(wire);
+        log_chat_info(
+            "message_received",
+            vec![
+                ("user_id", json!(from_user_id)),
+                ("message_id", json!(msg_id)),
+                ("text_chars", json!(text.chars().count())),
+                ("text_preview", json!(summarize_text_for_log(&text, 120))),
+            ],
+        );
         if !self.mark_seen(&msg_id, from_user_id, &text) {
             return;
         }
 
-        println!("[收到消息] {from_user_id}: {text}");
+        log_chat_info(
+            "message_accepted",
+            vec![
+                ("user_id", json!(from_user_id)),
+                ("message_id", json!(msg_id)),
+                ("status", json!("accepted")),
+            ],
+        );
+        let session_message_id = if msg_id.trim().is_empty() {
+            None
+        } else {
+            Some(msg_id)
+        };
         let intent = command_router::route_text(&text);
         match intent {
             command_router::RouteIntent::ManualContentSubmission { task_id, content } => {
@@ -473,6 +556,15 @@ impl WeChatBot {
             command_router::RouteIntent::RecentTasksQuery => {
                 self.handle_recent_tasks_query(from_user_id);
             }
+            command_router::RouteIntent::UserMemoriesQuery => {
+                self.handle_user_memories_query(from_user_id);
+            }
+            command_router::RouteIntent::UserMemoryWrite { content } => {
+                self.handle_user_memory_write(from_user_id, &content);
+            }
+            command_router::RouteIntent::DailyReportQuery { day } => {
+                self.handle_daily_report_query(from_user_id, day.as_deref());
+            }
             command_router::RouteIntent::TaskStatusQuery { task_id } => {
                 self.handle_task_status_query(from_user_id, &task_id);
             }
@@ -480,9 +572,21 @@ impl WeChatBot {
                 self.handle_link_submission(from_user_id, urls);
             }
             other => {
-                let event = self
-                    .session_router
-                    .on_intent(from_user_id, other, Instant::now());
+                self.maybe_persist_auto_memory(from_user_id, &other);
+                let should_persist_session = matches!(
+                    other,
+                    command_router::RouteIntent::ChatContinue { .. }
+                        | command_router::RouteIntent::ChatPending { .. }
+                );
+                let event = self.session_router.on_intent_with_message(
+                    from_user_id,
+                    other,
+                    session_message_id,
+                    Instant::now(),
+                );
+                if should_persist_session {
+                    self.persist_session_snapshot(from_user_id);
+                }
                 self.handle_session_event(event);
             }
         }
@@ -514,16 +618,40 @@ impl WeChatBot {
         {
             Ok(inserted) => inserted,
             Err(err) => {
-                eprintln!("[去重] 数据库写入失败: {err}");
+                log_chat_error(
+                    "message_dedup_store_failed",
+                    vec![
+                        ("user_id", json!(from_user_id)),
+                        ("message_id", json!(id)),
+                        ("error_kind", json!("inbound_message_store_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
                 true
             }
         };
         if !is_new {
+            log_chat_info(
+                "message_deduplicated",
+                vec![
+                    ("user_id", json!(from_user_id)),
+                    ("message_id", json!(id)),
+                    ("reason", json!("db_existing")),
+                ],
+            );
             return false;
         }
 
         let id = id.to_string();
         if self.seen_ids.contains(&id) {
+            log_chat_info(
+                "message_deduplicated",
+                vec![
+                    ("user_id", json!(from_user_id)),
+                    ("message_id", json!(id)),
+                    ("reason", json!("memory_cache")),
+                ],
+            );
             return false;
         }
 
@@ -543,19 +671,58 @@ impl WeChatBot {
         true
     }
 
-    fn generate_reply(&self, user_text: &str) -> String {
-        match self.agent_core.run(user_text) {
+    fn generate_reply(
+        &self,
+        user_id: &str,
+        user_text: &str,
+        message_ids: &[String],
+        reason: FlushReason,
+        trace_context: AgentRunContext,
+    ) -> String {
+        match self.agent_core.run_with_context(user_text, trace_context) {
             Ok(result) => return result,
             Err(err) => {
                 let err_text = err.to_string();
                 if is_agent_command(user_text) {
+                    log_chat_error(
+                        "agent_reply_failed",
+                        vec![
+                            ("user_id", json!(user_id)),
+                            ("trigger", json!(reason.as_str())),
+                            ("message_ids", json!(message_ids)),
+                            ("message_count", json!(message_ids.len())),
+                            ("error_kind", json!("agent_command_failed")),
+                            ("detail", json!(err_text.clone())),
+                        ],
+                    );
                     return format!("执行失败: {err_text}");
                 }
                 if is_llm_auth_error(&err_text) {
+                    log_chat_warn(
+                        "agent_reply_fallback",
+                        vec![
+                            ("user_id", json!(user_id)),
+                            ("trigger", json!(reason.as_str())),
+                            ("message_ids", json!(message_ids)),
+                            ("message_count", json!(message_ids.len())),
+                            ("error_kind", json!("llm_auth_failed")),
+                            ("detail", json!(err_text.clone())),
+                        ],
+                    );
                     return "LLM 鉴权失败（401），请检查 MOONSHOT_* / DEEPSEEK_* / OPENAI_* 配置"
                         .to_string();
                 }
-                eprintln!("[Bot] agent_fallback reason={}", err_text);
+                log_chat_warn(
+                    "agent_reply_fallback",
+                    vec![
+                        ("user_id", json!(user_id)),
+                        ("trigger", json!(reason.as_str())),
+                        ("message_ids", json!(message_ids)),
+                        ("message_count", json!(message_ids.len())),
+                        ("error_kind", json!("agent_run_failed")),
+                        ("detail", json!(err_text)),
+                    ],
+                );
             }
         }
         if user_text == "hello" || user_text == "你好" {
@@ -566,7 +733,7 @@ impl WeChatBot {
             return format!("现在是 {}", now.format("%Y-%m-%d %H:%M:%S"));
         }
         if user_text == "帮助" || user_text == "help" {
-            return "可用命令:\n- hello / 你好\n- 时间\n- 帮助 / help\n- 发送链接或 收藏 <url>\n- 状态 <task_id>\n- 最近任务\n- 重试 <task_id>\n- 其他文字我会 echo 回复"
+            return "可用命令:\n- hello / 你好\n- 时间\n- 帮助 / help\n- 发送链接或 收藏 <url>\n- 状态 <task_id>\n- 最近任务\n- 日报 [YYYY-MM-DD] / 今日整理\n- 记住 <content>\n- 我的记忆\n- 重试 <task_id>\n- 其他文字我会 echo 回复"
                 .to_string();
         }
         format!("Echo: {user_text}")
@@ -602,6 +769,92 @@ impl WeChatBot {
             Err(err) => format!("查询最近任务失败: {err}"),
         };
         self.send_reply_text(user_id, &reply);
+    }
+
+    fn handle_daily_report_query(&self, user_id: &str, day: Option<&str>) {
+        let reply = self.build_daily_report_query_reply(day);
+        self.send_reply_text(user_id, &reply);
+    }
+
+    fn handle_user_memory_write(&mut self, user_id: &str, content: &str) {
+        let reply = match self.task_store.add_user_memory(user_id, content) {
+            Ok(_) => format!("已记住\n- {}", content.trim()),
+            Err(err) => format!("写入记忆失败: {err}"),
+        };
+        self.send_reply_text(user_id, &reply);
+    }
+
+    fn handle_user_memories_query(&self, user_id: &str) {
+        let reply = match self.task_store.list_user_memories(user_id, 10) {
+            Ok(memories) => build_user_memories_reply(&memories),
+            Err(err) => format!("查询记忆失败: {err}"),
+        };
+        self.send_reply_text(user_id, &reply);
+    }
+
+    fn build_daily_report_query_reply(&self, day: Option<&str>) -> String {
+        let day = day
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| self.reporter.current_day());
+        match self.reporter.generate_for_day(&day) {
+            Ok(report) => format!(
+                "{}\nmarkdown_path: {}",
+                report.summary,
+                report.markdown_path.display()
+            ),
+            Err(err) => format!("生成日报失败: {err}"),
+        }
+    }
+
+    fn maybe_persist_auto_memory(
+        &mut self,
+        user_id: &str,
+        intent: &command_router::RouteIntent,
+    ) {
+        let text = match intent {
+            command_router::RouteIntent::ChatContinue { text }
+            | command_router::RouteIntent::ChatCommit { text }
+            | command_router::RouteIntent::ChatPending { text } => text.as_str(),
+            _ => return,
+        };
+        let Some(memory) = extract_auto_memory_candidate(text) else {
+            return;
+        };
+        match self.task_store.has_user_memory(user_id, &memory) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(err) => {
+                log_chat_warn(
+                    "user_memory_auto_extract_failed",
+                    vec![
+                        ("user_id", json!(user_id)),
+                        ("error_kind", json!("user_memory_lookup_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
+                return;
+            }
+        }
+        if let Err(err) = self.task_store.add_user_memory(user_id, &memory) {
+            log_chat_warn(
+                "user_memory_auto_extract_failed",
+                vec![
+                    ("user_id", json!(user_id)),
+                    ("error_kind", json!("user_memory_store_failed")),
+                    ("detail", json!(err.to_string())),
+                ],
+            );
+        } else {
+            log_chat_info(
+                "user_memory_auto_recorded",
+                vec![
+                    ("user_id", json!(user_id)),
+                    ("memory_preview", json!(summarize_text_for_log(&memory, 120))),
+                ],
+            );
+        }
     }
 
     fn handle_task_retry(&mut self, user_id: &str, task_id: &str) {
@@ -657,15 +910,24 @@ impl WeChatBot {
         if let SessionEvent::FlushNow {
             user_id,
             merged_text,
+            message_ids,
+            reason,
         } = event
         {
-            self.send_generated_reply(&user_id, &merged_text);
+            let _ = self.task_store.delete_session_state(&user_id);
+            self.send_generated_reply(&user_id, &merged_text, &message_ids, reason);
         }
     }
 
     fn flush_expired_sessions(&mut self) {
         for item in self.session_router.flush_expired(Instant::now()) {
-            self.send_generated_reply(&item.user_id, &item.merged_text);
+            let _ = self.task_store.delete_session_state(&item.user_id);
+            self.send_generated_reply(
+                &item.user_id,
+                &item.merged_text,
+                &item.message_ids,
+                item.reason,
+            );
         }
     }
 
@@ -680,42 +942,214 @@ impl WeChatBot {
             .unwrap_or(DEFAULT_GET_UPDATES_TIMEOUT)
     }
 
-    fn send_generated_reply(&mut self, user_id: &str, merged_text: &str) {
+    fn send_generated_reply(
+        &mut self,
+        user_id: &str,
+        merged_text: &str,
+        message_ids: &[String],
+        reason: FlushReason,
+    ) {
         if merged_text.trim().is_empty() {
             return;
         }
 
-        let display_text = merged_text.replace('\n', "\\n");
-        println!("[会话提交] {user_id}: {display_text}");
+        log_chat_info(
+            "session_flushed",
+            vec![
+                ("user_id", json!(user_id)),
+                ("trigger", json!(reason.as_str())),
+                ("message_ids", json!(message_ids)),
+                ("message_count", json!(message_ids.len())),
+                ("text_chars", json!(merged_text.chars().count())),
+                (
+                    "text_preview",
+                    json!(summarize_text_for_log(merged_text, 160)),
+                ),
+            ],
+        );
 
-        let reply = self.generate_reply(merged_text);
+        log_chat_info(
+            "agent_reply_started",
+            vec![
+                ("user_id", json!(user_id)),
+                ("trigger", json!(reason.as_str())),
+                ("message_ids", json!(message_ids)),
+                ("message_count", json!(message_ids.len())),
+            ],
+        );
+
+        let reply = self.generate_reply(
+            user_id,
+            merged_text,
+            message_ids,
+            reason,
+            AgentRunContext::wechat_chat(user_id, reason.as_str(), message_ids.to_vec())
+                .with_session_text(merged_text)
+                .with_context_token_present(self.context_token_map.contains_key(user_id)),
+        );
+        log_chat_info(
+            "agent_reply_finished",
+            vec![
+                ("user_id", json!(user_id)),
+                ("trigger", json!(reason.as_str())),
+                ("message_ids", json!(message_ids)),
+                ("message_count", json!(message_ids.len())),
+                ("reply_chars", json!(reply.chars().count())),
+                ("reply_preview", json!(summarize_text_for_log(&reply, 160))),
+            ],
+        );
         self.send_reply_text(user_id, &reply);
     }
 
     fn send_reply_text(&self, user_id: &str, reply: &str) {
-        let Some(token) = self.context_token_map.get(user_id).cloned() else {
-            println!("[警告] 无 {user_id} 的 context_token，跳过回复");
+        let token = self
+            .context_token_map
+            .get(user_id)
+            .cloned()
+            .or_else(|| self.task_store.get_context_token(user_id).ok().flatten());
+        let Some(token) = token else {
+            log_chat_warn(
+                "reply_skipped_no_context_token",
+                vec![
+                    ("user_id", json!(user_id)),
+                    ("reply_chars", json!(reply.chars().count())),
+                    ("reply_preview", json!(summarize_text_for_log(reply, 120))),
+                ],
+            );
             return;
         };
 
         match self.client.send_text_message(user_id, &reply, &token) {
-            Ok(()) => println!("[已回复] {user_id}: {reply}"),
-            Err(err) => eprintln!("[发送失败] {err}"),
+            Ok(()) => log_chat_info(
+                "reply_sent",
+                vec![
+                    ("user_id", json!(user_id)),
+                    ("reply_chars", json!(reply.chars().count())),
+                    ("reply_preview", json!(summarize_text_for_log(reply, 120))),
+                ],
+            ),
+            Err(err) => log_chat_error(
+                "reply_send_failed",
+                vec![
+                    ("user_id", json!(user_id)),
+                    ("error_kind", json!("wechat_send_failed")),
+                    ("detail", json!(err.to_string())),
+                ],
+            ),
         }
+    }
+
+    fn process_scheduled_daily_report_push(&mut self) {
+        let Some(schedule) = &self.daily_report_schedule else {
+            return;
+        };
+        let Some(day) = schedule.should_run_now(Utc::now(), self.last_daily_report_push_day.as_deref()) else {
+            return;
+        };
+        let reply = self.build_daily_report_query_reply(Some(&day));
+        let target_user_id = schedule.report_to_user_id().to_string();
+        let token = self
+            .context_token_map
+            .get(&target_user_id)
+            .cloned()
+            .or_else(|| self.task_store.get_context_token(&target_user_id).ok().flatten());
+        let Some(token) = token else {
+            log_chat_warn(
+                "scheduler_daily_report_skipped",
+                vec![
+                    ("day", json!(day)),
+                    ("user_id", json!(target_user_id)),
+                    ("error_kind", json!("missing_context_token")),
+                ],
+            );
+            return;
+        };
+
+        match self.client.send_text_message(&target_user_id, &reply, &token) {
+            Ok(()) => {
+                self.last_daily_report_push_day = Some(day.clone());
+                log_chat_info(
+                    "scheduler_daily_report_sent",
+                    vec![
+                        ("day", json!(day)),
+                        ("user_id", json!(target_user_id)),
+                        ("reply_chars", json!(reply.chars().count())),
+                    ],
+                );
+            }
+            Err(err) => {
+                log_chat_error(
+                    "scheduler_daily_report_send_failed",
+                    vec![
+                        ("day", json!(day)),
+                        ("user_id", json!(target_user_id)),
+                        ("error_kind", json!("scheduler_daily_report_send_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
+            }
+        }
+    }
+
+    fn persist_session_snapshot(&mut self, user_id: &str) {
+        let Some(snapshot) = self.session_router.snapshot(user_id) else {
+            return;
+        };
+        if let Err(err) = self.task_store.upsert_session_state(
+            &snapshot.user_id,
+            &snapshot.merged_text,
+            &snapshot.message_ids,
+        ) {
+            log_chat_warn(
+                "session_persist_failed",
+                vec![
+                    ("user_id", json!(user_id)),
+                    ("error_kind", json!("session_persist_failed")),
+                    ("detail", json!(err.to_string())),
+                ],
+            );
+        }
+    }
+
+    fn restore_persisted_sessions(&mut self) -> Result<()> {
+        let sessions = self.task_store.list_session_states()?;
+        let now = Instant::now();
+        for session in sessions {
+            self.session_router.restore_session(
+                &session.user_id,
+                &session.merged_text,
+                session.message_ids,
+                now,
+            );
+        }
+        Ok(())
     }
 
     fn process_pending_tasks(&mut self) {
         let pending = match self.task_store.list_pending_tasks(5) {
             Ok(tasks) => tasks,
             Err(err) => {
-                eprintln!("[任务] 查询 pending 失败: {err}");
+                log_chat_error(
+                    "pending_tasks_query_failed",
+                    vec![
+                        ("error_kind", json!("pending_tasks_query_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
                 return;
             }
         };
 
         for task in pending {
             if let Err(err) = self.process_single_pending_task(&task) {
-                eprintln!("[任务] 处理 pending 失败 task_id={} error={err}", task.task_id);
+                log_chat_error(
+                    "pending_task_process_failed",
+                    vec![
+                        ("task_id", json!(task.task_id)),
+                        ("error_kind", json!("pending_task_process_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
             }
         }
     }
@@ -756,10 +1190,16 @@ impl WeChatBot {
                         }),
                     )
                     .with_context(|| format!("更新 archived 失败 task_id={}", task.task_id))?;
-                println!(
-                    "[任务] 已归档 task_id={} output={}",
-                    task.task_id,
-                    result.output_path.display()
+                log_chat_info(
+                    "pending_task_archived",
+                    vec![
+                        ("task_id", json!(task.task_id)),
+                        ("status", json!("archived")),
+                        (
+                            "output_path",
+                            json!(result.output_path.display().to_string()),
+                        ),
+                    ],
                 );
             }
             Err(err) => match err.kind {
@@ -780,16 +1220,29 @@ impl WeChatBot {
                         .with_context(|| {
                             format!("更新 awaiting_manual_input 失败 task_id={}", task.task_id)
                         })?;
-                    eprintln!(
-                        "[任务] 需人工补录 task_id={} page_kind={} error={}",
-                        task.task_id, page_kind, err.message
+                    log_chat_warn(
+                        "pending_task_awaiting_manual_input",
+                        vec![
+                            ("task_id", json!(task.task_id)),
+                            ("status", json!("awaiting_manual_input")),
+                            ("page_kind", json!(page_kind)),
+                            ("detail", json!(err.message)),
+                        ],
                     );
                 }
                 crate::pipeline::PipelineFailureKind::Failed => {
                     self.task_store
                         .mark_task_failed(&task.task_id, &err.message)
                         .with_context(|| format!("更新 failed 失败 task_id={}", task.task_id))?;
-                    eprintln!("[任务] 处理失败 task_id={} error={}", task.task_id, err.message);
+                    log_chat_error(
+                        "pending_task_failed",
+                        vec![
+                            ("task_id", json!(task.task_id)),
+                            ("status", json!("failed")),
+                            ("error_kind", json!("pipeline_task_failed")),
+                            ("detail", json!(err.message)),
+                        ],
+                    );
                 }
             },
         }
@@ -951,6 +1404,54 @@ fn build_task_retry_reply(status: &crate::task_store::TaskStatusRecord) -> Strin
     format!("任务已重试\n{}", build_task_status_reply(status))
 }
 
+fn build_user_memories_reply(memories: &[crate::task_store::UserMemoryRecord]) -> String {
+    if memories.is_empty() {
+        return "当前还没有保存的记忆".to_string();
+    }
+
+    let mut lines = vec!["我的记忆:".to_string()];
+    for memory in memories {
+        lines.push(format!("- {}", memory.content));
+    }
+    lines.join("\n")
+}
+
+fn extract_auto_memory_candidate(input: &str) -> Option<String> {
+    let text = input.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    for prefix in ["我更喜欢", "我喜欢", "我偏好", "I prefer ", "I like "] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            let value = rest.trim();
+            if !value.is_empty() {
+                return Some(format!("偏好: {value}"));
+            }
+        }
+    }
+
+    for prefix in [
+        "我关注",
+        "我在研究",
+        "我最近在看",
+        "我想了解",
+        "我在做",
+        "I am researching ",
+        "I'm researching ",
+        "I want to learn ",
+    ] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            let value = rest.trim();
+            if !value.is_empty() {
+                return Some(format!("主题: {value}"));
+            }
+        }
+    }
+
+    None
+}
+
 fn assert_ok(resp: &Value, action: &str) -> Result<()> {
     let ret = get_i64(resp, "ret").unwrap_or(0);
     let errcode = get_i64(resp, "errcode").unwrap_or(0);
@@ -982,6 +1483,27 @@ fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "<json-serialize-error>".to_string())
 }
 
+fn log_chat_info(event: &str, fields: Vec<(&str, Value)>) {
+    log_chat_event("info", event, fields);
+}
+
+fn log_chat_warn(event: &str, fields: Vec<(&str, Value)>) {
+    log_chat_event("warn", event, fields);
+}
+
+fn log_chat_error(event: &str, fields: Vec<(&str, Value)>) {
+    log_chat_event("error", event, fields);
+}
+
+fn log_chat_event(level: &str, event: &str, fields: Vec<(&str, Value)>) {
+    crate::logging::emit_structured_log(level, event, fields);
+}
+
+#[cfg(test)]
+fn build_chat_log_payload(level: &str, event: &str, fields: Vec<(&str, Value)>) -> Value {
+    crate::logging::build_structured_log_payload(level, event, fields)
+}
+
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
     if input.chars().count() <= max_chars {
         return input.to_string();
@@ -989,6 +1511,10 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
     let mut out: String = input.chars().take(max_chars).collect();
     out.push_str("...");
     out
+}
+
+fn summarize_text_for_log(input: &str, max_chars: usize) -> String {
+    truncate_for_log(&input.replace('\n', "\\n"), max_chars)
 }
 
 fn value_to_string(value: &Value) -> Option<String> {
@@ -1016,10 +1542,13 @@ fn extract_messages(resp: &Value) -> Vec<WireMessage> {
         for raw in array {
             match serde_json::from_value::<WireMessage>(raw.clone()) {
                 Ok(message) => out.push(message),
-                Err(err) => eprintln!(
-                    "[调试] 跳过无法解析的消息: {}; raw={}",
-                    err,
-                    truncate_for_log(&compact_json(raw), 200)
+                Err(err) => log_chat_warn(
+                    "message_parse_skipped",
+                    vec![
+                        ("error_kind", json!("wire_message_parse_failed")),
+                        ("detail", json!(err.to_string())),
+                        ("raw", json!(truncate_for_log(&compact_json(raw), 200))),
+                    ],
                 ),
             }
         }
@@ -1059,10 +1588,14 @@ mod tests {
     use crate::agent_core::AgentCore;
     use crate::config::ResolvedBrowserConfig;
     use crate::pipeline::Pipeline;
-    use crate::session_router::SessionRouter;
+    use crate::reporter::DailyReporter;
+    use crate::session_router::{FlushReason, SessionRouter, SessionSnapshot};
     use crate::task_store::TaskStore;
     use rusqlite::Connection;
+    use serde_json::json;
+    use serde_json::Value;
     use std::collections::{HashMap, HashSet, VecDeque};
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1079,20 +1612,35 @@ mod tests {
         temp_dir().join("amclaw.db")
     }
 
-    fn test_bot(db_path: &std::path::Path) -> WeChatBot {
-        let workspace_root = temp_dir();
-        WeChatBot {
-            agent_core: AgentCore::new(workspace_root).expect("初始化 agent 失败"),
+    fn build_test_bot(db_path: &Path, workspace_root: PathBuf) -> WeChatBot {
+        let reporter_root = temp_dir();
+        let timezone = "Asia/Shanghai"
+            .parse()
+            .expect("解析测试 timezone 失败");
+        let mut bot = WeChatBot {
+            agent_core: AgentCore::with_task_store_db_path(workspace_root, db_path.to_path_buf())
+                .expect("初始化 agent 失败"),
             client: ILinkClient::new("1.0.0").expect("初始化 iLink 客户端失败"),
             pipeline: Pipeline::new(temp_dir(), None::<ResolvedBrowserConfig>),
+            reporter: DailyReporter::new(reporter_root, db_path.to_path_buf(), timezone),
             task_store: TaskStore::open(db_path).expect("初始化 task store 失败"),
             context_token_map: HashMap::new(),
+            daily_report_schedule: None,
+            last_daily_report_push_day: None,
             cursor: String::new(),
             seen_ids: HashSet::new(),
             seen_order: VecDeque::new(),
             session_router: SessionRouter::new(Duration::from_secs(5)),
             running: Arc::new(AtomicBool::new(true)),
-        }
+        };
+        bot.restore_persisted_sessions()
+            .expect("恢复测试 session 失败");
+        bot
+    }
+
+    fn test_bot(db_path: &Path) -> WeChatBot {
+        let workspace_root = temp_dir();
+        build_test_bot(db_path, workspace_root)
     }
 
     fn message_row(
@@ -1521,5 +2069,202 @@ mod tests {
 
         assert_eq!(task_count(&db_path), 1);
         assert_eq!(message_count(&db_path, "msg-19"), 1);
+    }
+
+    #[test]
+    fn send_generated_reply_writes_trace_with_chat_context() {
+        let db_path = temp_db_path();
+        let workspace_root = temp_dir();
+        let mut bot = build_test_bot(&db_path, workspace_root.clone());
+
+        bot.send_generated_reply(
+            "user-a",
+            "读文件 missing.txt",
+            &[String::from("msg-trace-1"), String::from("msg-trace-2")],
+            FlushReason::Commit,
+        );
+
+        let trace_root = workspace_root.join("data").join("agent_traces");
+        let day_dir = std::fs::read_dir(&trace_root)
+            .expect("应存在 trace 根目录")
+            .next()
+            .expect("应存在日期目录")
+            .expect("读取日期目录失败")
+            .path();
+        let trace_path = std::fs::read_dir(day_dir)
+            .expect("应存在 trace 文件")
+            .filter_map(|entry| entry.ok().map(|value| value.path()))
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .expect("应存在至少一个 json trace 文件");
+        let payload: Value = serde_json::from_str(
+            &std::fs::read_to_string(trace_path).expect("读取 trace 文件失败"),
+        )
+        .expect("trace JSON 应合法");
+
+        assert_eq!(payload["source_type"], "wechat_chat");
+        assert_eq!(payload["trigger_type"], "commit");
+        assert_eq!(payload["user_id"], "user-a");
+        assert_eq!(payload["message_count"], 2);
+        assert_eq!(payload["session_text"], "读文件 missing.txt");
+        assert_eq!(payload["context_token_present"], false);
+        assert_eq!(payload["message_ids"][0], "msg-trace-1");
+        assert_eq!(payload["message_ids"][1], "msg-trace-2");
+    }
+
+    #[test]
+    fn daily_report_query_builds_reply() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+        let created = bot
+            .task_store
+            .record_link_submission("https://example.com/daily-query")
+            .expect("写入任务失败");
+        bot.task_store
+            .mark_task_archived(
+                &created.task_id,
+                "/tmp/daily-query.md",
+                Some("Daily Query Title"),
+                Some("article"),
+                None,
+                Some("http"),
+            )
+            .expect("更新 archived 状态失败");
+
+        let day = bot.reporter.current_day();
+        let reply = bot.build_daily_report_query_reply(Some(&day));
+
+        assert!(reply.contains("日报"));
+        assert!(reply.contains("archived_count: 1"));
+        assert!(reply.contains("markdown_path:"));
+    }
+
+    #[test]
+    fn pending_chat_session_is_persisted() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            context_token: "ctx-1".to_string(),
+            text: "先记一条会话".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-session-1".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let sessions = bot
+            .task_store
+            .list_session_states()
+            .expect("查询 session_state 失败");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].user_id, "user-a");
+        assert_eq!(sessions[0].merged_text, "先记一条会话");
+        assert_eq!(sessions[0].message_ids, vec!["msg-session-1".to_string()]);
+    }
+
+    #[test]
+    fn persisted_session_is_restored_on_bot_startup() {
+        let db_path = temp_db_path();
+        {
+            let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+            store
+                .upsert_session_state(
+                    "user-a",
+                    "恢复前的会话",
+                    &["msg-restore-1".to_string()],
+                )
+                .expect("写入 session_state 失败");
+        }
+
+        let bot = test_bot(&db_path);
+        assert_eq!(
+            bot.session_router.snapshot("user-a"),
+            Some(SessionSnapshot {
+                user_id: "user-a".to_string(),
+                merged_text: "恢复前的会话".to_string(),
+                message_ids: vec!["msg-restore-1".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn user_memory_commands_write_and_read_back() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+        bot.context_token_map
+            .insert("user-a".to_string(), "ctx-1".to_string());
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "记住 我喜欢短摘要".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-memory-1".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let memories = bot
+            .task_store
+            .list_user_memories("user-a", 10)
+            .expect("查询 user_memory 失败");
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].content, "我喜欢短摘要");
+
+        let reply = super::build_user_memories_reply(&memories);
+        assert!(reply.contains("我的记忆"));
+        assert!(reply.contains("我喜欢短摘要"));
+    }
+
+    #[test]
+    fn auto_memory_is_extracted_from_chat_text() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "我在研究 Rust Agent".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-auto-memory-1".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let memories = bot
+            .task_store
+            .list_user_memories("user-a", 10)
+            .expect("查询 user_memory 失败");
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].content, "主题: Rust Agent");
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "我在研究 Rust Agent".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-auto-memory-2".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+        let deduped = bot
+            .task_store
+            .list_user_memories("user-a", 10)
+            .expect("查询 user_memory 失败");
+        assert_eq!(deduped.len(), 1);
+    }
+
+    #[test]
+    fn chat_log_payload_keeps_contract_fields() {
+        let payload = super::build_chat_log_payload(
+            "info",
+            "message_received",
+            vec![
+                ("user_id", json!("user-a")),
+                ("message_id", json!("msg-1")),
+                ("detail", Value::Null),
+            ],
+        );
+
+        assert_eq!(payload["level"], "info");
+        assert_eq!(payload["event"], "message_received");
+        assert_eq!(payload["user_id"], "user-a");
+        assert_eq!(payload["message_id"], "msg-1");
+        assert!(payload.get("ts").is_some());
+        assert!(payload.get("detail").is_none());
     }
 }

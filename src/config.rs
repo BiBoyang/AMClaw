@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -36,6 +37,7 @@ pub struct StorageConfig {
 pub struct SchedulerConfig {
     pub enabled: bool,
     pub daily_run_time: String,
+    pub report_to_user_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +117,7 @@ impl Default for SchedulerConfig {
         Self {
             enabled: true,
             daily_run_time: "22:30".to_string(),
+            report_to_user_id: None,
         }
     }
 }
@@ -171,7 +174,10 @@ impl AppConfig {
             let template = toml::to_string_pretty(&default).context("序列化默认配置失败")?;
             fs::write(config_path, format!("{template}\n"))
                 .with_context(|| format!("写入默认配置失败: {}", config_path.display()))?;
-            eprintln!("[启动] 已生成默认配置文件: {}", config_path.display());
+            log_config_info(
+                "config_default_created",
+                vec![("path", json!(config_path.display().to_string()))],
+            );
         }
 
         let content = fs::read_to_string(config_path)
@@ -214,6 +220,10 @@ fn resolve_path(base_dir: &Path, path: &Path) -> PathBuf {
     } else {
         base_dir.join(path)
     }
+}
+
+fn log_config_info(event: &str, fields: Vec<(&str, Value)>) {
+    crate::logging::emit_structured_log("info", event, fields);
 }
 
 #[cfg(test)]

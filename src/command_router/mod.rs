@@ -6,6 +6,9 @@ pub enum RouteIntent {
     TaskRetryRequest { task_id: String },
     ManualTasksQuery,
     RecentTasksQuery,
+    UserMemoryWrite { content: String },
+    UserMemoriesQuery,
+    DailyReportQuery { day: Option<String> },
     TaskStatusQuery { task_id: String },
     LinkSubmission { urls: Vec<String> },
     ChatContinue { text: String },
@@ -30,6 +33,18 @@ pub fn route_text(input: &str) -> RouteIntent {
 
     if is_recent_tasks_query(text) {
         return RouteIntent::RecentTasksQuery;
+    }
+
+    if is_user_memories_query(text) {
+        return RouteIntent::UserMemoriesQuery;
+    }
+
+    if let Some(content) = parse_user_memory_write(text) {
+        return RouteIntent::UserMemoryWrite { content };
+    }
+
+    if let Some(day) = parse_daily_report_query(text) {
+        return RouteIntent::DailyReportQuery { day };
     }
 
     if let Some(task_id) = parse_retry_query(text) {
@@ -102,8 +117,37 @@ fn parse_retry_query(input: &str) -> Option<String> {
     Some(task_id.to_string())
 }
 
+fn parse_daily_report_query(input: &str) -> Option<Option<String>> {
+    if matches!(input, "日报" | "今日整理" | "daily report" | "today digest") {
+        return Some(None);
+    }
+    let rest = input
+        .strip_prefix("日报 ")
+        .or_else(|| input.strip_prefix("daily report "))?;
+    let day = rest.trim();
+    if day.is_empty() {
+        return Some(None);
+    }
+    Some(Some(day.to_string()))
+}
+
+fn parse_user_memory_write(input: &str) -> Option<String> {
+    let rest = input
+        .strip_prefix("记住 ")
+        .or_else(|| input.strip_prefix("记一下 "))?;
+    let content = rest.trim();
+    if content.is_empty() {
+        return None;
+    }
+    Some(content.to_string())
+}
+
 fn is_recent_tasks_query(input: &str) -> bool {
     matches!(input, "最近任务" | "最新任务" | "recent tasks" | "recent")
+}
+
+fn is_user_memories_query(input: &str) -> bool {
+    matches!(input, "我的记忆" | "我的偏好" | "memories" | "my memories")
 }
 
 fn is_manual_tasks_query(input: &str) -> bool {
@@ -254,6 +298,38 @@ mod tests {
             RouteIntent::ManualContentSubmission {
                 task_id: "task-123".to_string(),
                 content: "这是人工补录的正文".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn daily_report_command_is_supported() {
+        assert_eq!(
+            route_text("日报"),
+            RouteIntent::DailyReportQuery { day: None }
+        );
+        assert_eq!(
+            route_text("今日整理"),
+            RouteIntent::DailyReportQuery { day: None }
+        );
+        assert_eq!(
+            route_text("日报 2026-04-10"),
+            RouteIntent::DailyReportQuery {
+                day: Some("2026-04-10".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn user_memory_commands_are_supported() {
+        assert_eq!(
+            route_text("我的记忆"),
+            RouteIntent::UserMemoriesQuery
+        );
+        assert_eq!(
+            route_text("记住 我更喜欢短摘要"),
+            RouteIntent::UserMemoryWrite {
+                content: "我更喜欢短摘要".to_string()
             }
         );
     }

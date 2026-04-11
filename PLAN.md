@@ -18,7 +18,7 @@ AMClaw 是个人 IMAgent 项目，以微信 Bot 为入口，围绕“收消息 -
 ## 一句话判断
 
 - 架构层：已经从“单一 loop”演进到最小 runtime helper 分层，但还不是完整执行内核
-- 业务层：公众号链路已经可用，通用网页处理还没有形成稳定闭环
+- 业务层：公众号链路已经可用，通用网页已有最小 HTTP 抽取 / 分类，摘要还没有形成稳定闭环
 - 工程层：日志与 Trace 基础已经具备，但错误语义、异步化与调度能力还在继续补齐
 
 ## 三层视角
@@ -151,12 +151,13 @@ AMClaw 是个人 IMAgent 项目，以微信 Bot 为入口，围绕“收消息 -
 #### 当前现状
 
 - [x] 公众号正文提取已经可用
-- [ ] 通用网页提取、分类、摘要还没有形成稳定闭环
+- [x] 通用网页 HTTP 归档已开始尝试最小正文抽取，并记录 `source=http` 与 `page_kind`
+- [ ] 通用网页高质量提取、分类、摘要还没有形成稳定闭环
 
 #### 未开始或明显未完成
 
-- [ ] 通用网页抽取策略完善
-- [ ] 更完整的内容分类体系
+- [ ] 通用网页抽取策略继续完善
+- [ ] 更完整的内容分类体系与分类落库
 - [ ] 摘要生成
 - [ ] 更明确的 pipeline 阶段状态拆分
 
@@ -233,6 +234,7 @@ AMClaw 是个人 IMAgent 项目，以微信 Bot 为入口，围绕“收消息 -
 
 ## 最近已落地的关键改动
 
+- 普通 HTTP 网页归档已开始尝试最小正文抽取，并向任务状态透出真实 `page_kind` / `content_source`
 - Agent runtime 已从“单一 loop”继续演进到最小 `planner / executor / watchdog / controller` helper 结构
 - `current_step_index`、richer `expected_observation`、`stalled_trajectory` 与 `replan_budget` 已落地
 - 浏览器 worker 失败分类与日志补强

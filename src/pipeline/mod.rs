@@ -29,6 +29,21 @@ pub struct PipelineResult {
     pub raw_path: PathBuf,
     pub snapshot_path: Option<PathBuf>,
     pub title: Option<String>,
+    pub page_kind: String,
+    pub content_source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpFetchResult {
+    html: String,
+    final_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtractedArchiveBody {
+    markdown: String,
+    page_kind: String,
+    section_title: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,8 +191,8 @@ impl Pipeline {
                 ("status", json!("selected")),
             ],
         );
-        let html = self.fetch_html(&task.normalized_url)?;
-        self.archive_html(task, &html).map_err(|err| {
+        let fetched = self.fetch_html(&task.normalized_url)?;
+        self.archive_html(task, &fetched).map_err(|err| {
             log_pipeline_error(
                 "task_failed",
                 vec![
@@ -234,6 +249,8 @@ impl Pipeline {
             raw_path,
             snapshot_path: None,
             title,
+            page_kind: "manual_input".to_string(),
+            content_source: "manual_input".to_string(),
         };
         log_pipeline_info(
             "task_archived",
@@ -250,7 +267,7 @@ impl Pipeline {
         Ok(result)
     }
 
-    fn fetch_html(&self, url: &str) -> std::result::Result<String, PipelineTaskError> {
+    fn fetch_html(&self, url: &str) -> std::result::Result<HttpFetchResult, PipelineTaskError> {
         log_pipeline_info(
             "http_fetch_started",
             vec![("source", json!("http")), ("url", json!(url))],
@@ -353,7 +370,7 @@ impl Pipeline {
                 ("html_chars", json!(html.chars().count())),
             ],
         );
-        Ok(html)
+        Ok(HttpFetchResult { html, final_url })
     }
 
     fn run_browser_capture(
@@ -685,6 +702,8 @@ impl Pipeline {
             raw_path: capture.html_path.clone(),
             snapshot_path: Some(capture.screenshot_path.clone()),
             title: capture.title.clone(),
+            page_kind: capture.page_kind.clone(),
+            content_source: "browser_capture".to_string(),
         };
         log_pipeline_info(
             "task_archived",
@@ -706,7 +725,11 @@ impl Pipeline {
         Ok(result)
     }
 
-    fn archive_html(&self, task: &PendingTaskRecord, html: &str) -> Result<PipelineResult> {
+    fn archive_html(
+        &self,
+        task: &PendingTaskRecord,
+        fetched: &HttpFetchResult,
+    ) -> Result<PipelineResult> {
         let day = Utc::now().format("%Y-%m-%d").to_string();
         let raw_dir = self.root_dir.join("raw").join(&day);
         let output_dir = self.root_dir.join("processed").join(day);
@@ -717,19 +740,23 @@ impl Pipeline {
 
         let raw_path = raw_dir.join(format!("{}.html", task.task_id));
         let output_path = output_dir.join(format!("{}.md", task.task_id));
-        fs::write(&raw_path, html)
+        fs::write(&raw_path, &fetched.html)
             .with_context(|| format!("写入原始文件失败: {}", raw_path.display()))?;
 
-        let title = extract_html_title(html);
+        let title = extract_html_title(&fetched.html);
+        let extracted = extract_http_archive_body(&fetched.html);
         let content = format!(
-            "# Archived Link\n\n- task_id: {}\n- article_id: {}\n- normalized_url: {}\n- original_url: {}\n- title: {}\n- archived_at: {}\n\n## Preview\n\n{}\n",
+            "# Archived Link\n\n- task_id: {}\n- article_id: {}\n- normalized_url: {}\n- original_url: {}\n- final_url: {}\n- title: {}\n- archived_at: {}\n- source: http\n- page_kind: {}\n\n## {}\n\n{}\n",
             task.task_id,
             task.article_id,
             task.normalized_url,
             task.original_url,
+            fetched.final_url,
             title.clone().unwrap_or_else(|| "(none)".to_string()),
             Utc::now().to_rfc3339(),
-            preview_text(html),
+            extracted.page_kind,
+            extracted.section_title,
+            extracted.markdown,
         );
         fs::write(&output_path, content)
             .with_context(|| format!("写入归档文件失败: {}", output_path.display()))?;
@@ -739,6 +766,8 @@ impl Pipeline {
             raw_path,
             snapshot_path: None,
             title,
+            page_kind: extracted.page_kind.clone(),
+            content_source: "http".to_string(),
         };
         log_pipeline_info(
             "task_archived",
@@ -746,6 +775,7 @@ impl Pipeline {
                 ("task_id", json!(task.task_id)),
                 ("source", json!("http")),
                 ("status", json!("archived")),
+                ("page_kind", json!(result.page_kind)),
                 (
                     "output_path",
                     json!(result.output_path.display().to_string()),
@@ -806,6 +836,14 @@ fn preview_text(html: &str) -> String {
 }
 
 fn extract_primary_body(html: &str) -> Option<String> {
+    if let Some(wechat_body) = extract_wechat_primary_body(html) {
+        return Some(wechat_body);
+    }
+
+    extract_generic_primary_body(html)
+}
+
+fn extract_wechat_primary_body(html: &str) -> Option<String> {
     let activity_title = extract_element_text_by_id(html, "activity-name");
     let body = extract_element_inner_html_by_id(html, "js_content")
         .map(|fragment| html_fragment_to_markdown(&fragment))
@@ -817,6 +855,23 @@ fn extract_primary_body(html: &str) -> Option<String> {
         (Some(title), None) => Some(format!("## {}", title.trim())),
         (None, None) => None,
     }
+}
+
+fn extract_generic_primary_body(html: &str) -> Option<String> {
+    for tag in ["article", "main"] {
+        if let Some(body) = extract_element_inner_html_by_tag(html, tag)
+            .map(|fragment| html_fragment_to_markdown(&fragment))
+            .map(|text| text.trim().to_string())
+            .filter(|text| is_meaningful_extracted_body(text))
+        {
+            return Some(body);
+        }
+    }
+
+    extract_element_inner_html_by_tag(html, "body")
+        .map(|fragment| html_fragment_to_markdown(&fragment))
+        .map(|text| text.trim().to_string())
+        .filter(|text| is_meaningful_extracted_body(text))
 }
 
 fn extract_element_text_by_id(html: &str, element_id: &str) -> Option<String> {
@@ -845,6 +900,60 @@ fn extract_element_inner_html_by_id(html: &str, element_id: &str) -> Option<Stri
     let content_start = tag_open_end + 1;
     let content_end = html[content_start..].find(&close_tag)? + content_start;
     html.get(content_start..content_end).map(ToOwned::to_owned)
+}
+
+fn extract_element_inner_html_by_tag(html: &str, tag_name: &str) -> Option<String> {
+    let open_pattern = format!("<{tag_name}");
+    let start_idx = html.to_ascii_lowercase().find(&open_pattern)?;
+    let tag_open_end = html[start_idx..].find('>')? + start_idx;
+    let close_tag = format!("</{tag_name}>");
+    let content_start = tag_open_end + 1;
+    let content_end = html[content_start..]
+        .to_ascii_lowercase()
+        .find(&close_tag)?
+        + content_start;
+    html.get(content_start..content_end).map(ToOwned::to_owned)
+}
+
+fn extract_http_archive_body(html: &str) -> ExtractedArchiveBody {
+    if let Some(markdown) = extract_primary_body(html) {
+        let page_kind = classify_http_page_kind(html, &markdown);
+        return ExtractedArchiveBody {
+            markdown,
+            page_kind,
+            section_title: "Content",
+        };
+    }
+
+    ExtractedArchiveBody {
+        markdown: preview_text(html),
+        page_kind: "webpage".to_string(),
+        section_title: "Preview",
+    }
+}
+
+fn classify_http_page_kind(html: &str, markdown: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let paragraph_count = markdown.matches("\n\n").count() + 1;
+    let body_chars = markdown.chars().count();
+    let looks_like_article = lower.contains("<article")
+        || lower.contains("property=\"og:type\" content=\"article")
+        || lower.contains("property='og:type' content='article")
+        || lower.contains("name=\"twitter:card\" content=\"summary_large_image")
+        || paragraph_count >= 3
+        || body_chars >= 400;
+
+    if looks_like_article {
+        "article".to_string()
+    } else {
+        "webpage".to_string()
+    }
+}
+
+fn is_meaningful_extracted_body(text: &str) -> bool {
+    let non_empty_lines = text.lines().filter(|line| !line.trim().is_empty()).count();
+    let chars = text.chars().count();
+    chars >= 80 || non_empty_lines >= 3
 }
 
 fn html_fragment_to_markdown(fragment: &str) -> String {
@@ -1137,9 +1246,10 @@ fn detect_wechat_error_page(url: &str, html: &str) -> std::result::Result<(), Pi
 mod tests {
     use super::{
         build_pipeline_log_payload, detect_wechat_error_page, detect_wechat_redirect,
-        extract_html_title, extract_primary_body, should_disable_http_redirects,
-        should_prefer_browser_capture, validate_browser_capture_paths, validate_fetched_html,
-        BrowserCaptureRequest, BrowserCaptureResponse, BrowserCaptureResult, Pipeline,
+        extract_html_title, extract_http_archive_body, extract_primary_body,
+        should_disable_http_redirects, should_prefer_browser_capture,
+        validate_browser_capture_paths, validate_fetched_html, BrowserCaptureRequest,
+        BrowserCaptureResponse, BrowserCaptureResult, HttpFetchResult, Pipeline,
         PipelineFailureKind,
     };
     use crate::task_store::{PendingTaskRecord, TaskContentRecord};
@@ -1167,7 +1277,12 @@ mod tests {
         let result = pipeline
             .archive_html(
                 &task,
-                "<html><head><title>Hello World</title></head><body>content</body></html>",
+                &HttpFetchResult {
+                    html:
+                        "<html><head><title>Hello World</title></head><body>content</body></html>"
+                            .to_string(),
+                    final_url: "https://example.com".to_string(),
+                },
             )
             .expect("处理 pending 任务失败");
         let content = fs::read_to_string(&result.output_path).expect("读取归档文件失败");
@@ -1178,8 +1293,44 @@ mod tests {
         assert!(content.contains("task-1"));
         assert!(content.contains("https://example.com"));
         assert!(content.contains("Hello World"));
+        assert!(content.contains("source: http"));
+        assert!(content.contains("page_kind: webpage"));
         assert_eq!(result.title, Some("Hello World".to_string()));
+        assert_eq!(result.page_kind, "webpage");
+        assert_eq!(result.content_source, "http");
         assert!(raw.contains("<title>Hello World</title>"));
+    }
+
+    #[test]
+    fn http_archive_extracts_generic_article_body() {
+        let html = r#"
+<html>
+  <head>
+    <title>通用文章标题</title>
+    <meta property="og:type" content="article" />
+  </head>
+  <body>
+    <nav>导航</nav>
+    <article>
+      <h1>通用文章标题</h1>
+      <p>第一段正文，包含足够的信息用于形成可读归档。</p>
+      <p><a href="https://example.com/ref">相关阅读</a></p>
+      <img src="https://example.com/image.png" />
+    </article>
+  </body>
+</html>
+"#;
+
+        let body = extract_http_archive_body(html);
+
+        assert_eq!(body.page_kind, "article");
+        assert_eq!(body.section_title, "Content");
+        assert!(body.markdown.contains("第一段正文"));
+        assert!(body.markdown.contains("相关阅读 (https://example.com/ref)"));
+        assert!(body
+            .markdown
+            .contains("![image](https://example.com/image.png)"));
+        assert!(!body.markdown.contains("导航"));
     }
 
     #[test]

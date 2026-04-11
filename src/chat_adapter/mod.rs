@@ -1181,13 +1181,9 @@ impl WeChatBot {
                         &task.task_id,
                         &output_path,
                         result.title.as_deref(),
-                        Some("article"),
+                        Some(&result.page_kind),
                         snapshot_path.as_deref(),
-                        Some(if result.snapshot_path.is_some() {
-                            "browser_capture"
-                        } else {
-                            "http"
-                        }),
+                        Some(&result.content_source),
                     )
                     .with_context(|| format!("更新 archived 失败 task_id={}", task.task_id))?;
                 log_chat_info(

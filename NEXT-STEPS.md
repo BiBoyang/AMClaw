@@ -22,11 +22,11 @@ Agent Trace 当前已具备：
 
 当前更适合优先推进：
 
-- 更真实的多步 `Agent Loop`
-- `RunContext` 扩展
-- 上下文组装与裁剪
-- `Tool Use / Function Calling`
-- 最小 `Planning / ReAct` 闭环
+- `current_step_index`
+- richer `expected_observation`
+- 更稳的 `StepFailureKind / FailureAction`
+- 更强的 trajectory / drift 检测
+- planner / executor / watchdog 分层草案
 
 当前结论是：
 
@@ -35,6 +35,7 @@ Agent Trace 当前已具备：
 - 第一批 skill 只考虑低风险的策略型能力，例如 `chat.reply`、`article.summarize`
 - 当前已补最小会话恢复，下一步更值得继续推进持久记忆而不是重复做会话缓存
 - Memory v1/v2 已补显式记忆与最小自动提炼，下一步可以评估长期主题记忆与语义检索
+- 当前已进入 Plan-aware ReAct 阶段，下一步重点是把执行系统做稳，而不是再回到“只补 prompt”的节奏
 
 ### 2. 系统级日志与错误结构
 
@@ -68,10 +69,10 @@ Agent Trace 当前已具备：
 
 ## 下一轮建议顺序
 
-1. 先做 `Agent Loop`、上下文与 `Tool Use`
-2. 再继续统一系统级结构化日志
-3. 再补通用网页抽取、分类、摘要
-4. 最后再接最小 skill 抽象与少量 skills
+1. 先做 `current_step_index` 与 richer `expected_observation`
+2. 再继续增强 `FailureAction / ReplanScope / trajectory drift`
+3. 然后补通用网页抽取、分类、摘要
+4. 最后再推进 planner / executor / watchdog 分层与最小 skill 抽象
 
 ## 开工标准
 

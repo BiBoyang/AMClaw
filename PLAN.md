@@ -1,6 +1,6 @@
 # AMClaw 当前状态
 
-更新于 2026-04-06。
+更新于 2026-04-11。
 
 这份文件不再记录理想化路线图，而是记录仓库当前真实状态，方便后续判断“做到哪了、下一步该做什么”。
 
@@ -28,6 +28,11 @@ AMClaw 是个人 IMAgent 项目，以微信 Bot 为入口，围绕“收消息 -
 - [x] 普通聊天消息可以进入 LLM 回复链路
 - [x] Memory v1：显式用户记忆写入与上下文读取
 - [x] Memory v2：最小主题 / 偏好自动提炼
+- [x] Plan-aware ReAct：`plan` / `progress_note` / `step_status`
+- [x] 最小完成条件：`expected_observation` / `done_rule`
+- [x] 最小失败语义：`retry_step` / `replan` / `abort`
+- [x] 最小重规划范围：`current_step` / `remaining_plan` / `full`
+- [x] 最小 watchdog：`repeated_action` / `low_value_observation` / `trajectory_drift`
 
 ### 任务系统
 
@@ -148,11 +153,11 @@ AMClaw 是个人 IMAgent 项目，以微信 Bot 为入口，围绕“收消息 -
 
 如果继续开发，优先级建议如下：
 
-1. 把 Agent Trace 接到真实聊天链路
-2. 增加每天的可读索引，例如 `index.md`
-3. 统一系统级日志与错误结构，降低排障成本
+1. 把 `current_step_index` 与 richer `expected_observation` 做稳
+2. 继续增强 `StepFailureKind / FailureAction`
+3. 继续增强 trajectory / drift 检测
 4. 完善通用网页抽取、分类、摘要链路
-5. 再做每日汇总与调度
+5. 再考虑 planner / executor / watchdog 分层
 
 ## 最近已落地的关键改动
 

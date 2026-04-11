@@ -28,11 +28,13 @@ AMClaw 是个人 IMAgent 项目，以微信 Bot 为入口，围绕“收消息 -
 - [x] 普通聊天消息可以进入 LLM 回复链路
 - [x] Memory v1：显式用户记忆写入与上下文读取
 - [x] Memory v2：最小主题 / 偏好自动提炼
-- [x] Plan-aware ReAct：`plan` / `progress_note` / `step_status`
-- [x] 最小完成条件：`expected_observation` / `done_rule`
-- [x] 最小失败语义：`retry_step` / `replan` / `abort`
+- [x] Plan-aware ReAct：`plan` / `progress_note` / `step_status` / `current_step_index`
+- [x] 最小完成条件：`expected_observation` / `done_rule` / `expected_fields` / `minimum_novelty`
+- [x] 最小失败语义：`retry_step` / `replan` / `ask_user` / `abort`
 - [x] 最小重规划范围：`current_step` / `remaining_plan` / `full`
-- [x] 最小 watchdog：`repeated_action` / `low_value_observation` / `trajectory_drift`
+- [x] 最小 watchdog：`repeated_action` / `low_value_observation` / `stalled_trajectory` / `trajectory_drift`
+- [x] 最小 `planner / executor / watchdog` helper 分层
+- [x] 最小 `state/controller` budget：`max_steps` / `replan_budget`
 
 ### 任务系统
 
@@ -153,11 +155,10 @@ AMClaw 是个人 IMAgent 项目，以微信 Bot 为入口，围绕“收消息 -
 
 如果继续开发，优先级建议如下：
 
-1. 把 `current_step_index` 与 richer `expected_observation` 做稳
-2. 继续增强 `StepFailureKind / FailureAction`
-3. 继续增强 trajectory / drift 检测
-4. 完善通用网页抽取、分类、摘要链路
-5. 再考虑 planner / executor / watchdog 分层
+1. 继续把 `state/controller` 从 budget 扩到更完整的策略控制
+2. 完善通用网页抽取、分类、摘要链路
+3. 继续收口系统级日志与错误语义
+4. 再考虑更完整的调度 / 多用户 / 多任务演进
 
 ## 最近已落地的关键改动
 

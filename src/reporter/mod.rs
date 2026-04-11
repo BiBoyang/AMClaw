@@ -51,7 +51,9 @@ impl DailyReporter {
         let archived = store.list_archived_tasks(500)?;
         let entries = archived
             .into_iter()
-            .filter(|record| report_day_for_timestamp(&record.updated_at, self.timezone).as_deref() == Some(day))
+            .filter(|record| {
+                report_day_for_timestamp(&record.updated_at, self.timezone).as_deref() == Some(day)
+            })
             .collect::<Vec<_>>();
 
         let reports_dir = self.root_dir.join("reports");
@@ -68,10 +70,7 @@ impl DailyReporter {
             vec![
                 ("day", json!(day)),
                 ("item_count", json!(entries.len())),
-                (
-                    "markdown_path",
-                    json!(markdown_path.display().to_string()),
-                ),
+                ("markdown_path", json!(markdown_path.display().to_string())),
             ],
         );
         Ok(DailyReportOutput {
@@ -90,7 +89,12 @@ fn parse_timezone(raw: &str) -> Result<Tz> {
 
 fn report_day_for_timestamp(timestamp: &str, timezone: Tz) -> Option<String> {
     let parsed = DateTime::parse_from_rfc3339(timestamp).ok()?;
-    Some(parsed.with_timezone(&timezone).format("%Y-%m-%d").to_string())
+    Some(
+        parsed
+            .with_timezone(&timezone)
+            .format("%Y-%m-%d")
+            .to_string(),
+    )
 }
 
 fn build_daily_summary(day: &str, entries: &[ArchivedTaskRecord]) -> String {
@@ -103,11 +107,12 @@ fn build_daily_summary(day: &str, entries: &[ArchivedTaskRecord]) -> String {
         format!("- archived_count: {}", entries.len()),
     ];
     for entry in entries.iter().take(5) {
-        lines.push(format!(
-            "- {} | {}",
-            entry.task_id,
-            entry.title.as_deref().unwrap_or(&entry.normalized_url)
-        ));
+        let label = entry.title.as_deref().unwrap_or(&entry.normalized_url);
+        if let Some(summary) = &entry.summary {
+            lines.push(format!("- {label} | {}", flatten_summary(summary)));
+        } else {
+            lines.push(format!("- {} | {label}", entry.task_id));
+        }
     }
     lines.join("\n")
 }
@@ -129,7 +134,10 @@ fn render_daily_report_markdown(day: &str, entries: &[ArchivedTaskRecord]) -> St
     }
 
     for entry in entries {
-        lines.push(format!("### {}", entry.title.as_deref().unwrap_or(&entry.task_id)));
+        lines.push(format!(
+            "### {}",
+            entry.title.as_deref().unwrap_or(&entry.task_id)
+        ));
         lines.push(String::new());
         lines.push(format!("- task_id: {}", entry.task_id));
         lines.push(format!("- article_id: {}", entry.article_id));
@@ -142,6 +150,9 @@ fn render_daily_report_markdown(day: &str, entries: &[ArchivedTaskRecord]) -> St
             "- page_kind: {}",
             entry.page_kind.as_deref().unwrap_or("(none)")
         ));
+        if let Some(summary) = &entry.summary {
+            lines.push(format!("- summary: {}", flatten_summary(summary)));
+        }
         lines.push(format!(
             "- output_path: {}",
             entry.output_path.as_deref().unwrap_or("(none)")
@@ -157,11 +168,15 @@ fn log_reporter_info(event: &str, fields: Vec<(&str, Value)>) {
     crate::logging::emit_structured_log("info", event, fields);
 }
 
+fn flatten_summary(summary: &str) -> String {
+    summary.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::DailyReporter;
     use crate::config::AppConfig;
-    use crate::task_store::TaskStore;
+    use crate::task_store::{MarkTaskArchivedInput, TaskStore};
     use std::fs;
     use uuid::Uuid;
 
@@ -195,11 +210,19 @@ timezone = "Asia/Shanghai"
         store
             .mark_task_archived(
                 &created.task_id,
-                &root.join("data").join("processed").join("report-item.md").display().to_string(),
-                Some("Report Item Title"),
-                Some("article"),
-                None,
-                Some("http"),
+                MarkTaskArchivedInput {
+                    output_path: &root
+                        .join("data")
+                        .join("processed")
+                        .join("report-item.md")
+                        .display()
+                        .to_string(),
+                    title: Some("Report Item Title"),
+                    page_kind: Some("article"),
+                    snapshot_path: None,
+                    content_source: Some("http"),
+                    summary: None,
+                },
             )
             .expect("更新 archived 状态失败");
 
@@ -208,9 +231,7 @@ timezone = "Asia/Shanghai"
             .with_timezone(&chrono_tz::Asia::Shanghai)
             .format("%Y-%m-%d")
             .to_string();
-        let output = reporter
-            .generate_for_day(&day)
-            .expect("生成日报失败");
+        let output = reporter.generate_for_day(&day).expect("生成日报失败");
         let markdown = fs::read_to_string(&output.markdown_path).expect("读取日报失败");
 
         assert_eq!(output.day, day);
@@ -218,5 +239,78 @@ timezone = "Asia/Shanghai"
         assert!(markdown.contains("# AMClaw Daily Report"));
         assert!(markdown.contains("Report Item Title"));
         assert!(output.summary.contains("archived_count: 1"));
+    }
+
+    #[test]
+    fn daily_report_includes_summary_when_available() {
+        let root = temp_root();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[storage]
+root_dir = "./data"
+
+[agent]
+timezone = "Asia/Shanghai"
+"#,
+        )
+        .expect("写入配置失败");
+        let config = AppConfig::load_or_create(&config_path).expect("加载配置失败");
+        let db_path = config.db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let with_summary = store
+            .record_link_submission("https://example.com/with-summary")
+            .expect("写入链接失败");
+        store
+            .mark_task_archived(
+                &with_summary.task_id,
+                MarkTaskArchivedInput {
+                    output_path: "/tmp/with-summary.md",
+                    title: Some("Summary Article"),
+                    page_kind: Some("article"),
+                    snapshot_path: None,
+                    content_source: Some("http"),
+                    summary: Some(
+                        "这是一篇关于Rust的文章\n介绍了async运行时的设计\n适合初学者入门",
+                    ),
+                },
+            )
+            .expect("更新 archived 状态失败");
+
+        let without_summary = store
+            .record_link_submission("https://example.com/without-summary")
+            .expect("写入链接失败");
+        store
+            .mark_task_archived(
+                &without_summary.task_id,
+                MarkTaskArchivedInput {
+                    output_path: "/tmp/without-summary.md",
+                    title: Some("No Summary Article"),
+                    page_kind: Some("webpage"),
+                    snapshot_path: None,
+                    content_source: Some("http"),
+                    summary: None,
+                },
+            )
+            .expect("更新 archived 状态失败");
+
+        let reporter = DailyReporter::from_config(&config).expect("初始化 reporter 失败");
+        let day = chrono::Utc::now()
+            .with_timezone(&chrono_tz::Asia::Shanghai)
+            .format("%Y-%m-%d")
+            .to_string();
+        let output = reporter.generate_for_day(&day).expect("生成日报失败");
+        let markdown = fs::read_to_string(&output.markdown_path).expect("读取日报失败");
+
+        assert_eq!(output.item_count, 2);
+        assert!(markdown
+            .contains("summary: 这是一篇关于Rust的文章 介绍了async运行时的设计 适合初学者入门"));
+        assert!(output.summary.contains(
+            "Summary Article | 这是一篇关于Rust的文章 介绍了async运行时的设计 适合初学者入门"
+        ));
+        assert!(output.summary.contains("No Summary Article"));
+        assert!(!markdown.contains("summary: None"));
     }
 }

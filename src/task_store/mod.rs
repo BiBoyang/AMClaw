@@ -50,6 +50,7 @@ pub struct ArchivedTaskRecord {
     pub article_id: String,
     pub normalized_url: String,
     pub title: Option<String>,
+    pub summary: Option<String>,
     pub content_source: Option<String>,
     pub page_kind: Option<String>,
     pub output_path: Option<String>,
@@ -62,6 +63,16 @@ pub struct PendingTaskRecord {
     pub article_id: String,
     pub normalized_url: String,
     pub original_url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkTaskArchivedInput<'a> {
+    pub output_path: &'a str,
+    pub title: Option<&'a str>,
+    pub page_kind: Option<&'a str>,
+    pub snapshot_path: Option<&'a str>,
+    pub content_source: Option<&'a str>,
+    pub summary: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,8 +255,8 @@ impl TaskStore {
         let rows = stmt
             .query_map([], |row| {
                 let message_ids_json: String = row.get(2)?;
-                let message_ids = serde_json::from_str::<Vec<String>>(&message_ids_json)
-                    .unwrap_or_default();
+                let message_ids =
+                    serde_json::from_str::<Vec<String>>(&message_ids_json).unwrap_or_default();
                 Ok(StoredSessionRecord {
                     user_id: row.get(0)?,
                     merged_text: row.get(1)?,
@@ -560,7 +571,7 @@ impl TaskStore {
             .conn
             .prepare(
                 r#"
-                SELECT t.id, t.article_id, a.normalized_url, a.title, t.content_source, t.page_kind, t.output_path, t.updated_at
+                SELECT t.id, t.article_id, a.normalized_url, a.title, a.summary, t.content_source, t.page_kind, t.output_path, t.updated_at
                 FROM tasks t
                 JOIN articles a ON a.id = t.article_id
                 WHERE t.status = 'archived'
@@ -576,10 +587,11 @@ impl TaskStore {
                     article_id: row.get(1)?,
                     normalized_url: row.get(2)?,
                     title: row.get(3)?,
-                    content_source: row.get(4)?,
-                    page_kind: row.get(5)?,
-                    output_path: row.get(6)?,
-                    updated_at: row.get(7)?,
+                    summary: row.get(4)?,
+                    content_source: row.get(5)?,
+                    page_kind: row.get(6)?,
+                    output_path: row.get(7)?,
+                    updated_at: row.get(8)?,
                 })
             })
             .context("查询 archived 任务失败")?;
@@ -718,12 +730,16 @@ impl TaskStore {
     pub fn mark_task_archived(
         &mut self,
         task_id: &str,
-        output_path: &str,
-        title: Option<&str>,
-        page_kind: Option<&str>,
-        snapshot_path: Option<&str>,
-        content_source: Option<&str>,
+        input: MarkTaskArchivedInput<'_>,
     ) -> Result<bool> {
+        let MarkTaskArchivedInput {
+            output_path,
+            title,
+            page_kind,
+            snapshot_path,
+            content_source,
+            summary,
+        } = input;
         let now = Utc::now().to_rfc3339();
         let tx = self.conn.transaction().context("开启 archived 事务失败")?;
         let updated = tx
@@ -754,6 +770,17 @@ impl TaskStore {
                 params![task_id, title, now.clone()],
             )
             .context("更新文章标题失败")?;
+        }
+        if let Some(summary) = summary.filter(|v| !v.trim().is_empty()) {
+            tx.execute(
+                r#"
+                UPDATE articles
+                SET summary = ?2, updated_at = ?3
+                WHERE id = (SELECT article_id FROM tasks WHERE id = ?1)
+                "#,
+                params![task_id, summary, now.clone()],
+            )
+            .context("更新文章摘要失败")?;
         }
         tx.commit().context("提交 archived 事务失败")?;
         log_task_store_info(
@@ -928,6 +955,7 @@ impl TaskStore {
         ensure_column_exists(&self.conn, "tasks", "page_kind", "TEXT")?;
         ensure_column_exists(&self.conn, "tasks", "output_path", "TEXT")?;
         ensure_column_exists(&self.conn, "tasks", "snapshot_path", "TEXT")?;
+        ensure_column_exists(&self.conn, "articles", "summary", "TEXT")?;
         Ok(())
     }
 }
@@ -1038,8 +1066,9 @@ fn source_domain(normalized_url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_task_store_log_payload, ArchivedTaskRecord, LinkTaskRecord, PendingTaskRecord,
-        RecentTaskRecord, StoredSessionRecord, TaskStatusRecord, TaskStore, UserMemoryRecord,
+        build_task_store_log_payload, ArchivedTaskRecord, LinkTaskRecord, MarkTaskArchivedInput,
+        PendingTaskRecord, RecentTaskRecord, StoredSessionRecord, TaskStatusRecord, TaskStore,
+        UserMemoryRecord,
     };
     use rusqlite::Connection;
     use serde_json::{json, Value};
@@ -1406,11 +1435,14 @@ mod tests {
         assert!(store
             .mark_task_archived(
                 &created.task_id,
-                "/tmp/example.md",
-                Some("Example Title"),
-                Some("article"),
-                Some("/tmp/example.png"),
-                Some("browser_capture"),
+                MarkTaskArchivedInput {
+                    output_path: "/tmp/example.md",
+                    title: Some("Example Title"),
+                    page_kind: Some("article"),
+                    snapshot_path: Some("/tmp/example.png"),
+                    content_source: Some("browser_capture"),
+                    summary: None,
+                },
             )
             .expect("更新 archived 状态失败"));
 
@@ -1527,11 +1559,14 @@ mod tests {
         assert!(store
             .mark_task_archived(
                 &created.task_id,
-                "/tmp/archived-list.md",
-                Some("Archived List Title"),
-                Some("article"),
-                None,
-                Some("http"),
+                MarkTaskArchivedInput {
+                    output_path: "/tmp/archived-list.md",
+                    title: Some("Archived List Title"),
+                    page_kind: Some("article"),
+                    snapshot_path: None,
+                    content_source: Some("http"),
+                    summary: None,
+                },
             )
             .expect("更新 archived 状态失败"));
 
@@ -1543,6 +1578,7 @@ mod tests {
                 article_id: created.article_id,
                 normalized_url: "https://example.com/archived-list".to_string(),
                 title: Some("Archived List Title".to_string()),
+                summary: None,
                 content_source: Some("http".to_string()),
                 page_kind: Some("article".to_string()),
                 output_path: Some("/tmp/archived-list.md".to_string()),
@@ -1586,7 +1622,9 @@ mod tests {
             )
             .expect("写入 session_state 失败");
 
-        let sessions = store.list_session_states().expect("查询 session_state 失败");
+        let sessions = store
+            .list_session_states()
+            .expect("查询 session_state 失败");
         assert_eq!(
             sessions.len(),
             1,
@@ -1670,5 +1708,54 @@ mod tests {
         assert_eq!(payload["status"], "failed");
         assert!(payload.get("ts").is_some());
         assert!(payload.get("detail").is_none());
+    }
+
+    #[test]
+    fn summary_is_overwritten_on_rerun() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        let created = store
+            .record_link_submission("https://example.com/summary-rerun")
+            .expect("写入链接失败");
+
+        store
+            .mark_task_archived(
+                &created.task_id,
+                MarkTaskArchivedInput {
+                    output_path: "/tmp/summary-rerun.md",
+                    title: Some("Summary Rerun"),
+                    page_kind: Some("article"),
+                    snapshot_path: None,
+                    content_source: Some("http"),
+                    summary: Some("初始摘要"),
+                },
+            )
+            .expect("首次 archived 失败");
+
+        // Simulate retry: reset then re-archive with better summary
+        let conn = Connection::open(&db_path).expect("打开数据库失败");
+        conn.execute(
+            "UPDATE tasks SET status = 'pending', output_path = NULL WHERE id = ?1",
+            [created.task_id.as_str()],
+        )
+        .expect("重置任务状态失败");
+        drop(conn);
+
+        store
+            .mark_task_archived(
+                &created.task_id,
+                MarkTaskArchivedInput {
+                    output_path: "/tmp/summary-rerun-v2.md",
+                    title: Some("Summary Rerun"),
+                    page_kind: Some("article"),
+                    snapshot_path: None,
+                    content_source: Some("http"),
+                    summary: Some("更精确的LLM摘要"),
+                },
+            )
+            .expect("二次 archived 失败");
+
+        let archived = store.list_archived_tasks(10).expect("查询失败");
+        assert_eq!(archived[0].summary, Some("更精确的LLM摘要".to_string()));
     }
 }

@@ -322,10 +322,7 @@ mod tests {
 
     #[test]
     fn user_memory_commands_are_supported() {
-        assert_eq!(
-            route_text("我的记忆"),
-            RouteIntent::UserMemoriesQuery
-        );
+        assert_eq!(route_text("我的记忆"), RouteIntent::UserMemoriesQuery);
         assert_eq!(
             route_text("记住 我更喜欢短摘要"),
             RouteIntent::UserMemoryWrite {

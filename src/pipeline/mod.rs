@@ -12,7 +12,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -31,6 +31,7 @@ pub struct PipelineResult {
     pub title: Option<String>,
     pub page_kind: String,
     pub content_source: String,
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,6 +252,7 @@ impl Pipeline {
             title,
             page_kind: "manual_input".to_string(),
             content_source: "manual_input".to_string(),
+            summary: None,
         };
         log_pipeline_info(
             "task_archived",
@@ -704,6 +706,7 @@ impl Pipeline {
             title: capture.title.clone(),
             page_kind: capture.page_kind.clone(),
             content_source: "browser_capture".to_string(),
+            summary: None,
         };
         log_pipeline_info(
             "task_archived",
@@ -745,8 +748,13 @@ impl Pipeline {
 
         let title = extract_html_title(&fetched.html);
         let extracted = extract_http_archive_body(&fetched.html);
+        let summary = generate_rule_summary(title.as_deref(), &extracted.markdown);
+        let summary_section = match &summary {
+            Some(s) => format!("\n## Summary\n\n{}\n", s),
+            None => String::new(),
+        };
         let content = format!(
-            "# Archived Link\n\n- task_id: {}\n- article_id: {}\n- normalized_url: {}\n- original_url: {}\n- final_url: {}\n- title: {}\n- archived_at: {}\n- source: http\n- page_kind: {}\n\n## {}\n\n{}\n",
+            "# Archived Link\n\n- task_id: {}\n- article_id: {}\n- normalized_url: {}\n- original_url: {}\n- final_url: {}\n- title: {}\n- archived_at: {}\n- source: http\n- page_kind: {}\n{}## {}\n\n{}\n",
             task.task_id,
             task.article_id,
             task.normalized_url,
@@ -755,6 +763,7 @@ impl Pipeline {
             title.clone().unwrap_or_else(|| "(none)".to_string()),
             Utc::now().to_rfc3339(),
             extracted.page_kind,
+            summary_section,
             extracted.section_title,
             extracted.markdown,
         );
@@ -768,6 +777,7 @@ impl Pipeline {
             title,
             page_kind: extracted.page_kind.clone(),
             content_source: "http".to_string(),
+            summary,
         };
         log_pipeline_info(
             "task_archived",
@@ -812,7 +822,7 @@ fn extract_html_title(html: &str) -> Option<String> {
     let start = lower.find("<title>")?;
     let end = lower[start + 7..].find("</title>")?;
     let raw = &html[start + 7..start + 7 + end];
-    let title = raw.replace('\n', " ").replace('\r', " ");
+    let title = raw.replace(['\n', '\r'], " ");
     let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
     if title.is_empty() {
         None
@@ -823,8 +833,7 @@ fn extract_html_title(html: &str) -> Option<String> {
 
 fn preview_text(html: &str) -> String {
     let text = html
-        .replace('\n', " ")
-        .replace('\r', " ")
+        .replace(['\n', '\r'], " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
@@ -925,35 +934,174 @@ fn extract_http_archive_body(html: &str) -> ExtractedArchiveBody {
         };
     }
 
+    let preview = preview_text(html);
+    let page_kind = classify_http_page_kind(html, &preview);
     ExtractedArchiveBody {
-        markdown: preview_text(html),
-        page_kind: "webpage".to_string(),
+        markdown: preview,
+        page_kind,
         section_title: "Preview",
     }
 }
 
 fn classify_http_page_kind(html: &str, markdown: &str) -> String {
     let lower = html.to_ascii_lowercase();
+
+    if is_error_page(html, &lower) {
+        return "error_page".to_string();
+    }
+    if looks_like_article(html, &lower, markdown) {
+        return "article".to_string();
+    }
+    if is_index_like_page(&lower, markdown) {
+        return "index_like".to_string();
+    }
+    if is_link_post(markdown) {
+        return "link_post".to_string();
+    }
+
+    "webpage".to_string()
+}
+
+fn is_error_page(html: &str, lower_html: &str) -> bool {
+    // Pages with <article> or og:type=article are not error pages
+    if lower_html.contains("<article")
+        || lower_html.contains("property=\"og:type\" content=\"article")
+        || lower_html.contains("property='og:type' content='article")
+    {
+        return false;
+    }
+    let body_text_len = lower_html
+        .split("<body")
+        .last()
+        .map(|rest| {
+            rest.chars()
+                .filter(|c| !c.is_whitespace() && *c != '<' && *c != '>' && *c != '/')
+                .count()
+        })
+        .unwrap_or(0);
+    if body_text_len > 1500 {
+        return false;
+    }
+    let title = extract_html_title(html)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let error_keywords = [
+        "404",
+        "not found",
+        "页面不存在",
+        "找不到页面",
+        "page not found",
+        "页面未找到",
+    ];
+    error_keywords.iter().any(|k| title.contains(k))
+}
+
+fn is_index_like_page(lower_html: &str, markdown: &str) -> bool {
+    let link_count = lower_html.matches("<a ").count();
+    let prose_chars = markdown.chars().count();
+    if link_count >= 10 && prose_chars < 500 {
+        return true;
+    }
+    let li_count = lower_html.matches("<li").count();
+    li_count >= 8 && prose_chars < 800
+}
+
+fn is_link_post(markdown: &str) -> bool {
+    let prose_chars = markdown.chars().count();
+    prose_chars < 300 && markdown.contains("http")
+}
+
+fn looks_like_article(_html: &str, lower_html: &str, markdown: &str) -> bool {
     let paragraph_count = markdown.matches("\n\n").count() + 1;
     let body_chars = markdown.chars().count();
-    let looks_like_article = lower.contains("<article")
-        || lower.contains("property=\"og:type\" content=\"article")
-        || lower.contains("property='og:type' content='article")
-        || lower.contains("name=\"twitter:card\" content=\"summary_large_image")
+    lower_html.contains("<article")
+        || lower_html.contains("property=\"og:type\" content=\"article")
+        || lower_html.contains("property='og:type' content='article")
+        || lower_html.contains("name=\"twitter:card\" content=\"summary_large_image")
         || paragraph_count >= 3
-        || body_chars >= 400;
-
-    if looks_like_article {
-        "article".to_string()
-    } else {
-        "webpage".to_string()
-    }
+        || body_chars >= 400
 }
 
 fn is_meaningful_extracted_body(text: &str) -> bool {
     let non_empty_lines = text.lines().filter(|line| !line.trim().is_empty()).count();
     let chars = text.chars().count();
     chars >= 80 || non_empty_lines >= 3
+}
+
+fn generate_rule_summary(title: Option<&str>, markdown: &str) -> Option<String> {
+    let paragraphs: Vec<&str> = markdown
+        .split("\n\n")
+        .map(|p| p.trim())
+        .filter(|p| is_meaningful_summary_paragraph(p))
+        .take(3)
+        .collect();
+
+    if paragraphs.is_empty() {
+        return None;
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+
+    if let Some(t) = title.filter(|t| !t.trim().is_empty()) {
+        lines.push(truncate_line(t, 200));
+    }
+
+    for p in &paragraphs {
+        let first_line = p.lines().next().unwrap_or(p);
+        lines.push(truncate_line(first_line, 150));
+    }
+
+    if lines.is_empty() {
+        return None;
+    }
+
+    Some(lines.join("\n"))
+}
+
+fn is_meaningful_summary_paragraph(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().count() < 20 {
+        return false;
+    }
+    !is_navigation_like(trimmed)
+}
+
+fn is_navigation_like(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let short = text.chars().count() < 60;
+    let nav_keywords = [
+        "版权所有",
+        "备案号",
+        "icp",
+        "关注我们",
+        "扫码关注",
+        "点击阅读原文",
+        "分享到",
+        "copyright",
+        "all rights reserved",
+        "cookie",
+        "privacy policy",
+        "隐私政策",
+        "回到顶部",
+        "返回顶部",
+        "top ↑",
+    ];
+    if short && nav_keywords.iter().any(|k| lower.contains(k)) {
+        return true;
+    }
+    if lower.starts_with("http") && !lower.contains(' ') {
+        return true;
+    }
+    false
+}
+
+fn truncate_line(text: &str, max_chars: usize) -> String {
+    let cleaned: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        format!("{cleaned}...")
+    } else {
+        cleaned
+    }
 }
 
 fn html_fragment_to_markdown(fragment: &str) -> String {
@@ -1070,17 +1218,16 @@ fn replace_img_tags(fragment: &str) -> String {
 }
 
 fn extract_attribute_value(tag: &str, attr: &str) -> Option<String> {
-    for quote in ['"', '\''] {
+    ['"', '\''].into_iter().find_map(|quote| {
         let pattern = format!("{attr}={quote}");
-        let start = tag.find(&pattern)? + pattern.len();
-        let end = tag[start..].find(quote)? + start;
-        return Some(tag[start..end].to_string());
-    }
-    None
+        let start = tag.find(&pattern).map(|idx| idx + pattern.len())?;
+        let end = tag[start..].find(quote).map(|idx| idx + start)?;
+        Some(tag[start..end].to_string())
+    })
 }
 
-fn existing_file_path(path: &PathBuf) -> Option<PathBuf> {
-    path.exists().then(|| path.clone())
+fn existing_file_path(path: &Path) -> Option<PathBuf> {
+    path.exists().then(|| path.to_path_buf())
 }
 
 fn summarize_output(output: &str) -> String {
@@ -1245,8 +1392,9 @@ fn detect_wechat_error_page(url: &str, html: &str) -> std::result::Result<(), Pi
 #[cfg(test)]
 mod tests {
     use super::{
-        build_pipeline_log_payload, detect_wechat_error_page, detect_wechat_redirect,
-        extract_html_title, extract_http_archive_body, extract_primary_body,
+        build_pipeline_log_payload, classify_http_page_kind, detect_wechat_error_page,
+        detect_wechat_redirect, extract_html_title, extract_http_archive_body,
+        extract_primary_body, generate_rule_summary, is_navigation_like,
         should_disable_http_redirects, should_prefer_browser_capture,
         validate_browser_capture_paths, validate_fetched_html, BrowserCaptureRequest,
         BrowserCaptureResponse, BrowserCaptureResult, HttpFetchResult, Pipeline,
@@ -1569,5 +1717,176 @@ mod tests {
 
         assert!(body.contains("相关阅读 (https://example.com/link)"));
         assert!(body.contains("![image](https://example.com/image.jpg)"));
+    }
+
+    #[test]
+    fn primary_body_keeps_links_and_images_with_single_quoted_attrs() {
+        let html = r#"
+<html>
+  <body>
+    <h1 id='activity-name'>公众号标题</h1>
+    <div id='js_content'>
+      <p>正文第一段</p>
+      <p><a href='https://example.com/link'>相关阅读</a></p>
+      <img data-src='https://example.com/image.jpg' />
+    </div>
+  </body>
+</html>
+"#;
+
+        let body = extract_primary_body(html).expect("应提取出正文");
+
+        assert!(body.contains("相关阅读 (https://example.com/link)"));
+        assert!(body.contains("![image](https://example.com/image.jpg)"));
+    }
+
+    #[test]
+    fn rule_summary_generates_from_title_and_paragraphs() {
+        let markdown = "这是第一段有效正文，包含了足够多的字符来通过过滤条件。\n\n这是第二段有效正文，同样有足够的字符来通过过滤。\n\n这是第三段有效正文。";
+
+        let summary = generate_rule_summary(Some("文章标题"), markdown).expect("应生成摘要");
+
+        assert!(summary.contains("文章标题"));
+        assert!(summary.contains("这是第一段有效正文"));
+        assert!(summary.contains("这是第二段有效正文"));
+    }
+
+    #[test]
+    fn rule_summary_skips_short_paragraphs() {
+        let markdown = "短\n\n这是第一段有效正文，包含了足够多的字符来通过过滤条件。";
+
+        let summary = generate_rule_summary(None, markdown).expect("应生成摘要");
+
+        assert!(!summary.contains("短"));
+        assert!(summary.contains("这是第一段有效正文"));
+    }
+
+    #[test]
+    fn rule_summary_filters_navigation_text() {
+        assert!(is_navigation_like("版权所有 保留一切权利"));
+        assert!(is_navigation_like("https://example.com"));
+        assert!(!is_navigation_like(
+            "这是一段正常的文章正文内容，用来测试过滤逻辑是否正确工作"
+        ));
+    }
+
+    #[test]
+    fn rule_summary_returns_none_for_empty_input() {
+        assert_eq!(generate_rule_summary(None, ""), None);
+        assert_eq!(generate_rule_summary(None, "短文本"), None);
+    }
+
+    #[test]
+    fn http_archive_includes_summary_section() {
+        let root = temp_dir();
+        let pipeline = Pipeline::new(&root, None);
+        let task = PendingTaskRecord {
+            task_id: "task-summary".to_string(),
+            article_id: "article-1".to_string(),
+            normalized_url: "https://example.com/article".to_string(),
+            original_url: "https://example.com/article".to_string(),
+        };
+
+        let html = r#"<html><head><title>测试文章</title><meta property="og:type" content="article" /></head><body><article><p>这是第一段正文内容，包含了足够多的信息用于形成可读归档和有效摘要。</p><p>这是第二段正文内容，进一步补充了文章的核心观点和论述。</p></article></body></html>"#;
+
+        let result = pipeline
+            .archive_html(
+                &task,
+                &HttpFetchResult {
+                    html: html.to_string(),
+                    final_url: "https://example.com/article".to_string(),
+                },
+            )
+            .expect("处理失败");
+
+        let content = fs::read_to_string(&result.output_path).expect("读取归档失败");
+        assert!(content.contains("## Summary"));
+        assert!(content.contains("测试文章"));
+        assert!(content.contains("这是第一段正文内容"));
+        assert!(result.summary.is_some());
+    }
+
+    #[test]
+    fn page_kind_error_page_short_with_error_title() {
+        let html = "<html><head><title>404 Not Found</title></head><body><p>The page was not found.</p></body></html>";
+        let markdown = "The page was not found.";
+        assert_eq!(classify_http_page_kind(html, markdown), "error_page");
+    }
+
+    #[test]
+    fn page_kind_error_page_chinese() {
+        let html = "<html><head><title>页面不存在</title></head><body>抱歉，您访问的页面不存在。</body></html>";
+        let markdown = "抱歉，您访问的页面不存在。";
+        assert_eq!(classify_http_page_kind(html, markdown), "error_page");
+    }
+
+    #[test]
+    fn page_kind_long_article_about_404_not_classified_as_error() {
+        let mut body = String::from("这是一篇关于HTTP 404错误的技术文章。");
+        for i in 0..20 {
+            body.push_str(&format!("\n\n第{}段正文内容，用于增加文章长度确保超过3000字符的阈值。这段文字会不断重复以填满空间。", i));
+        }
+        let html = format!(
+            "<html><head><title>深入理解HTTP 404错误</title></head><body><article>{}</article></body></html>",
+            body
+        );
+        assert_eq!(classify_http_page_kind(&html, &body), "article");
+    }
+
+    #[test]
+    fn page_kind_index_like_many_links_little_prose() {
+        let mut links = String::new();
+        for i in 0..15 {
+            links.push_str(&format!("<a href=\"/item/{}\">链接{}</a>\n", i, i));
+        }
+        let html = format!(
+            "<html><head><title>文章列表</title></head><body>{}</body></html>",
+            links
+        );
+        let markdown = "简短描述";
+        assert_eq!(classify_http_page_kind(&html, markdown), "index_like");
+    }
+
+    #[test]
+    fn page_kind_index_like_many_list_items() {
+        let mut items = String::new();
+        for i in 0..10 {
+            items.push_str(&format!("<li><a href=\"/p/{}\">帖子{}</a></li>\n", i, i));
+        }
+        let html = format!(
+            "<html><head><title>最新帖子</title></head><body><ul>{}</ul></body></html>",
+            items
+        );
+        let markdown = "帖子0 帖子1 帖子2";
+        assert_eq!(classify_http_page_kind(&html, markdown), "index_like");
+    }
+
+    #[test]
+    fn page_kind_link_post_short_with_link() {
+        let html = "<html><head><title>分享</title></head><body><p>推荐阅读 https://example.com/great-article</p></body></html>";
+        let markdown = "推荐阅读 https://example.com/great-article";
+        assert_eq!(classify_http_page_kind(html, markdown), "link_post");
+    }
+
+    #[test]
+    fn page_kind_article_keeps_existing_logic() {
+        let html = r#"<html><head><title>技术博客</title><meta property="og:type" content="article" /></head><body><article><p>正文段落一，包含足够多的内容。</p><p>正文段落二，继续补充论点。</p><p>正文段落三，总结全文。</p></article></body></html>"#;
+        let markdown = "正文段落一，包含足够多的内容。\n\n正文段落二，继续补充论点。\n\n正文段落三，总结全文。";
+        assert_eq!(classify_http_page_kind(html, markdown), "article");
+    }
+
+    #[test]
+    fn page_kind_error_page_detected_without_primary_body() {
+        // No <article>/<main>/body content extraction, but error title should still classify
+        let html = "<html><head><title>404 Not Found</title></head><body><div>Error occurred.</div></body></html>";
+        let body = extract_http_archive_body(html);
+        assert_eq!(body.page_kind, "error_page");
+    }
+
+    #[test]
+    fn page_kind_webpage_fallback() {
+        let html = "<html><head><title>Hello World</title></head><body>content</body></html>";
+        let markdown = "content";
+        assert_eq!(classify_http_page_kind(html, markdown), "webpage");
     }
 }

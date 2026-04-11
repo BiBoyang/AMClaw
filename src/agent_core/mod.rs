@@ -2684,9 +2684,7 @@ fn detect_low_value_observation_failure(
     previous: Option<&AgentObservation>,
 ) -> Option<FailureDecision> {
     let expected = expected?;
-    if expected.effective_minimum_novelty().is_none() {
-        return None;
-    }
+    expected.effective_minimum_novelty()?;
     let previous = previous?;
 
     if matches!(expected.kind, ObservationKind::FileMutation) {

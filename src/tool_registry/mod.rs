@@ -291,7 +291,7 @@ fn render_recent_task_record(record: &RecentTaskRecord) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{ToolAction, ToolRegistry};
-    use crate::task_store::TaskStore;
+    use crate::task_store::{MarkTaskArchivedInput, TaskStore};
     use serde_json::Value;
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -362,8 +362,7 @@ mod tests {
                 task_id: record.task_id.clone(),
             })
             .expect("查询任务状态失败");
-        let payload: Value =
-            serde_json::from_str(&result.output).expect("工具输出应为合法 JSON");
+        let payload: Value = serde_json::from_str(&result.output).expect("工具输出应为合法 JSON");
 
         assert_eq!(result.tool, "get_task_status");
         assert_eq!(payload["found"], true);
@@ -421,23 +420,23 @@ mod tests {
         let record = store
             .record_link_submission("https://example.com/archive")
             .expect("写入任务失败");
-        let archive_path = root.join("processed").join(format!("{}.md", record.task_id));
-        std::fs::create_dir_all(
-            archive_path
-                .parent()
-                .expect("归档路径应存在父目录"),
-        )
-        .expect("创建归档目录失败");
-        std::fs::write(&archive_path, "# Archived\n\nhello archive")
-            .expect("写入归档文件失败");
+        let archive_path = root
+            .join("processed")
+            .join(format!("{}.md", record.task_id));
+        std::fs::create_dir_all(archive_path.parent().expect("归档路径应存在父目录"))
+            .expect("创建归档目录失败");
+        std::fs::write(&archive_path, "# Archived\n\nhello archive").expect("写入归档文件失败");
         store
             .mark_task_archived(
                 &record.task_id,
-                &archive_path.display().to_string(),
-                Some("Archive Title"),
-                None,
-                None,
-                Some("http"),
+                MarkTaskArchivedInput {
+                    output_path: &archive_path.display().to_string(),
+                    title: Some("Archive Title"),
+                    page_kind: None,
+                    snapshot_path: None,
+                    content_source: Some("http"),
+                    summary: None,
+                },
             )
             .expect("更新 archived 状态失败");
 
@@ -448,11 +447,13 @@ mod tests {
                 task_id: record.task_id.clone(),
             })
             .expect("读取归档内容失败");
-        let payload: Value =
-            serde_json::from_str(&result.output).expect("工具输出应为合法 JSON");
+        let payload: Value = serde_json::from_str(&result.output).expect("工具输出应为合法 JSON");
 
         assert_eq!(result.tool, "read_article_archive");
         assert_eq!(payload["task_id"], record.task_id);
-        assert!(payload["content"].as_str().unwrap_or("").contains("hello archive"));
+        assert!(payload["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("hello archive"));
     }
 }

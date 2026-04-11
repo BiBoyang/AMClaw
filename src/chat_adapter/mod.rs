@@ -3,9 +3,9 @@ use crate::command_router;
 use crate::config::{AppConfig, ResolvedBrowserConfig};
 use crate::pipeline::Pipeline;
 use crate::reporter::DailyReporter;
-use crate::session_router::{FlushReason, SessionEvent, SessionRouter};
 use crate::scheduler::DailyReportSchedule;
-use crate::task_store::TaskStore;
+use crate::session_router::{FlushReason, SessionEvent, SessionRouter};
+use crate::task_store::{MarkTaskArchivedInput, TaskStore};
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -808,11 +808,7 @@ impl WeChatBot {
         }
     }
 
-    fn maybe_persist_auto_memory(
-        &mut self,
-        user_id: &str,
-        intent: &command_router::RouteIntent,
-    ) {
+    fn maybe_persist_auto_memory(&mut self, user_id: &str, intent: &command_router::RouteIntent) {
         let text = match intent {
             command_router::RouteIntent::ChatContinue { text }
             | command_router::RouteIntent::ChatCommit { text }
@@ -851,7 +847,10 @@ impl WeChatBot {
                 "user_memory_auto_recorded",
                 vec![
                     ("user_id", json!(user_id)),
-                    ("memory_preview", json!(summarize_text_for_log(&memory, 120))),
+                    (
+                        "memory_preview",
+                        json!(summarize_text_for_log(&memory, 120)),
+                    ),
                 ],
             );
         }
@@ -885,11 +884,14 @@ impl WeChatBot {
                     let output_path = result.output_path.to_string_lossy().to_string();
                     match self.task_store.mark_task_archived(
                         task_id,
-                        &output_path,
-                        result.title.as_deref(),
-                        Some("manual_input"),
-                        None,
-                        Some("manual_input"),
+                        MarkTaskArchivedInput {
+                            output_path: &output_path,
+                            title: result.title.as_deref(),
+                            page_kind: Some("manual_input"),
+                            snapshot_path: None,
+                            content_source: Some("manual_input"),
+                            summary: None,
+                        },
                     ) {
                         Ok(true) => format!(
                             "已写入人工补正文\ntask_id: {task_id}\noutput_path: {output_path}"
@@ -1019,7 +1021,7 @@ impl WeChatBot {
             return;
         };
 
-        match self.client.send_text_message(user_id, &reply, &token) {
+        match self.client.send_text_message(user_id, reply, &token) {
             Ok(()) => log_chat_info(
                 "reply_sent",
                 vec![
@@ -1043,7 +1045,9 @@ impl WeChatBot {
         let Some(schedule) = &self.daily_report_schedule else {
             return;
         };
-        let Some(day) = schedule.should_run_now(Utc::now(), self.last_daily_report_push_day.as_deref()) else {
+        let Some(day) =
+            schedule.should_run_now(Utc::now(), self.last_daily_report_push_day.as_deref())
+        else {
             return;
         };
         let reply = self.build_daily_report_query_reply(Some(&day));
@@ -1052,7 +1056,12 @@ impl WeChatBot {
             .context_token_map
             .get(&target_user_id)
             .cloned()
-            .or_else(|| self.task_store.get_context_token(&target_user_id).ok().flatten());
+            .or_else(|| {
+                self.task_store
+                    .get_context_token(&target_user_id)
+                    .ok()
+                    .flatten()
+            });
         let Some(token) = token else {
             log_chat_warn(
                 "scheduler_daily_report_skipped",
@@ -1065,7 +1074,10 @@ impl WeChatBot {
             return;
         };
 
-        match self.client.send_text_message(&target_user_id, &reply, &token) {
+        match self
+            .client
+            .send_text_message(&target_user_id, &reply, &token)
+        {
             Ok(()) => {
                 self.last_daily_report_push_day = Some(day.clone());
                 log_chat_info(
@@ -1179,11 +1191,14 @@ impl WeChatBot {
                 self.task_store
                     .mark_task_archived(
                         &task.task_id,
-                        &output_path,
-                        result.title.as_deref(),
-                        Some(&result.page_kind),
-                        snapshot_path.as_deref(),
-                        Some(&result.content_source),
+                        MarkTaskArchivedInput {
+                            output_path: &output_path,
+                            title: result.title.as_deref(),
+                            page_kind: Some(&result.page_kind),
+                            snapshot_path: snapshot_path.as_deref(),
+                            content_source: Some(&result.content_source),
+                            summary: result.summary.as_deref(),
+                        },
                     )
                     .with_context(|| format!("更新 archived 失败 task_id={}", task.task_id))?;
                 log_chat_info(
@@ -1586,7 +1601,7 @@ mod tests {
     use crate::pipeline::Pipeline;
     use crate::reporter::DailyReporter;
     use crate::session_router::{FlushReason, SessionRouter, SessionSnapshot};
-    use crate::task_store::TaskStore;
+    use crate::task_store::{MarkTaskArchivedInput, TaskStore};
     use rusqlite::Connection;
     use serde_json::json;
     use serde_json::Value;
@@ -1610,9 +1625,7 @@ mod tests {
 
     fn build_test_bot(db_path: &Path, workspace_root: PathBuf) -> WeChatBot {
         let reporter_root = temp_dir();
-        let timezone = "Asia/Shanghai"
-            .parse()
-            .expect("解析测试 timezone 失败");
+        let timezone = "Asia/Shanghai".parse().expect("解析测试 timezone 失败");
         let mut bot = WeChatBot {
             agent_core: AgentCore::with_task_store_db_path(workspace_root, db_path.to_path_buf())
                 .expect("初始化 agent 失败"),
@@ -1690,10 +1703,9 @@ mod tests {
         .ok()
     }
 
-    fn task_status_details(
-        db_path: &std::path::Path,
-        task_id: &str,
-    ) -> Option<(String, Option<String>, Option<String>, Option<String>)> {
+    type TaskStatusDetails = (String, Option<String>, Option<String>, Option<String>);
+
+    fn task_status_details(db_path: &std::path::Path, task_id: &str) -> Option<TaskStatusDetails> {
         let conn = Connection::open(db_path).expect("打开数据库失败");
         conn.query_row(
             "SELECT status, page_kind, output_path, last_error FROM tasks WHERE id = ?1",
@@ -2118,11 +2130,14 @@ mod tests {
         bot.task_store
             .mark_task_archived(
                 &created.task_id,
-                "/tmp/daily-query.md",
-                Some("Daily Query Title"),
-                Some("article"),
-                None,
-                Some("http"),
+                MarkTaskArchivedInput {
+                    output_path: "/tmp/daily-query.md",
+                    title: Some("Daily Query Title"),
+                    page_kind: Some("article"),
+                    snapshot_path: None,
+                    content_source: Some("http"),
+                    summary: None,
+                },
             )
             .expect("更新 archived 状态失败");
 
@@ -2164,11 +2179,7 @@ mod tests {
         {
             let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
             store
-                .upsert_session_state(
-                    "user-a",
-                    "恢复前的会话",
-                    &["msg-restore-1".to_string()],
-                )
+                .upsert_session_state("user-a", "恢复前的会话", &["msg-restore-1".to_string()])
                 .expect("写入 session_state 失败");
         }
 

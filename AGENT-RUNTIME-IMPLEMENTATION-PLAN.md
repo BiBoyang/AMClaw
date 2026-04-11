@@ -26,7 +26,7 @@
 - `Context v2` 已完成最小版：
   - planner 可看到当前任务摘要
   - planner 可看到最近任务摘要
-- 本轮实现记录与技术选型原因见 `AGENT-RUNTIME-01-REACT-FOUNDATION-2026-04-10.md`
+- 本轮实现记录与技术选型原因见 `notes/runtime-evolution/AGENT-RUNTIME-01-REACT-FOUNDATION-2026-04-10.md`
 
 ## 一、当前起点
 

@@ -150,7 +150,7 @@
 
 今天还补了一份关键文档：
 
-- `AGENT-RUNTIME-04-PARADIGM-EVOLUTION-2026-04-11.md`
+- `../runtime-evolution/AGENT-RUNTIME-04-PARADIGM-EVOLUTION-2026-04-11.md`
 
 它专门回答：
 
@@ -345,4 +345,3 @@
 > **把 `AMClaw` 从一个会调工具的 Bot，推进成了一个开始拥有执行状态、完成条件、失败语义和重规划范围的混合执行系统。**
 
 而且这个系统现在已经能被测试、能被复盘、也开始能被治理。
-

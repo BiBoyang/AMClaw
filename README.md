@@ -274,7 +274,9 @@ cargo test
 - `NEXT-STEPS.md`：当前阶段执行备忘
 - `CORE-SKILL-ROADMAP.md`：`core/runtime`、`service/tool` 与 `skill` 的分层路线
 - `AGENT-RUNTIME-IMPLEMENTATION-PLAN.md`：`agent_core`、上下文与 `Tool Use` 的分阶段实施计划
-- `AGENT-RUNTIME-01-REACT-FOUNDATION-2026-04-10.md`：最小 ReAct runtime 的实现记录与技术选型原因
+- `notes/README.md`：记录类文档总索引（runtime 演进、retro、约束记录）
+- `notes/runtime-evolution/README.md`：runtime 演进记录索引（含 `AGENT-RUNTIME-01~04`）
+- `sessions/README.md`：按日期归档的开发 session 索引与命名约定
 - `AMCLAW-FEATURE-ROADMAP.md`：未来功能路线与优先级、分层归属建议
 - `DEVELOPMENT.md`：后续开发、维护与提交流程说明
 - `LOGGING.md`：当前结构化日志字段、事件名与扩展约定

@@ -1,0 +1,10 @@
+# Runtime Evolution Notes
+
+本目录收录 `agent_core / runtime` 的阶段演进记录，按时间顺序保留设计决策上下文。
+
+## 索引
+
+- `AGENT-RUNTIME-01-REACT-FOUNDATION-2026-04-10.md`
+- `AGENT-RUNTIME-02-PLAN-EXECUTE-FAILURE-MODEL-2026-04-10.md`
+- `AGENT-RUNTIME-03-PLAN-AWARE-REACT-STATUS-2026-04-11.md`
+- `AGENT-RUNTIME-04-PARADIGM-EVOLUTION-2026-04-11.md`

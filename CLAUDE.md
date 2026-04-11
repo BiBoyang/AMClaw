@@ -95,6 +95,22 @@ cargo clippy --all-targets --all-features
 cargo run
 ```
 
+## 协作口令（单人 + AI）
+
+为提高单人研发效率，约定以下口令流程：
+
+1. 当用户发送 `收尾` 时，助手默认执行：
+   - 更新当日 `sessions/SESSION-YYYY-MM-DD.md`（若不存在则基于模板创建）；
+   - 判断是否需要同步 `README.md`（仅限用户可见行为变化）；
+   - 执行基础校验（至少 `cargo check`，通常建议补跑 `cargo fmt --check` / `cargo clippy --all-targets --all-features` / `cargo test`）；
+   - 给出建议 commit message，并在用户确认后执行提交/推送。
+2. 当用户发送 `收尾并发布` 时，在 `收尾` 基础上追加：
+   - 版本号最小升级（默认 patch）；
+   - 版本相关文档同步；
+   - 打 tag 并推送 tags。
+3. 用户单独发送 `o` 默认表示同意继续执行上一条最直接的下一步操作。
+4. 未经用户明确同意，不应默认执行超出当前目标的额外发布动作。
+
 ## 大改动全流程回归（必须）
 
 当出现以下任一情况，视为“大改动”，必须执行一次完整人工回归后再合并：

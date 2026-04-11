@@ -135,11 +135,65 @@ struct ExecutionPlan {
     steps: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PlanStepStatus {
+    Pending,
+    Running,
+    Done,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StepFailureKind {
+    Expectation,
+    RepeatedAction,
+    Semantic,
+    Irrecoverable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FailureAction {
+    Replan,
+    Abort,
+}
+
+impl PlanStepStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct RuntimePlanStep {
+    description: String,
+    status: PlanStepStatus,
+    expected_observation: Option<ExpectedObservation>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlannedDecision {
     decision: AgentDecision,
     plan: Option<ExecutionPlan>,
     progress_note: Option<String>,
+    expected_observation: Option<ExpectedObservation>,
+}
+
+#[derive(Debug, Clone)]
+struct FailureDecision {
+    kind: StepFailureKind,
+    action: FailureAction,
+    detail: String,
+    source: String,
 }
 
 impl PlannedDecision {
@@ -148,6 +202,7 @@ impl PlannedDecision {
             decision,
             plan: None,
             progress_note: None,
+            expected_observation: None,
         }
     }
 
@@ -161,8 +216,53 @@ impl PlannedDecision {
         self
     }
 
+    fn with_expected_observation(
+        mut self,
+        expected_observation: Option<ExpectedObservation>,
+    ) -> Self {
+        self.expected_observation = expected_observation;
+        self
+    }
+
     fn summary(&self) -> String {
         self.decision.summary()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ObservationKind {
+    Text,
+    JsonObject,
+    FileMutation,
+    TaskStatus,
+    TaskList,
+    ArchiveContent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DoneRule {
+    ToolSuccess,
+    NonEmptyOutput,
+    RequiresJsonField { field: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ExpectedObservation {
+    kind: ObservationKind,
+    done_rule: DoneRule,
+}
+
+impl ExpectedObservation {
+    fn summary(&self) -> String {
+        match &self.done_rule {
+            DoneRule::ToolSuccess => format!("kind={:?}, done=tool_success", self.kind),
+            DoneRule::NonEmptyOutput => format!("kind={:?}, done=non_empty_output", self.kind),
+            DoneRule::RequiresJsonField { field } => {
+                format!("kind={:?}, done=json_field:{field}", self.kind)
+            }
+        }
     }
 }
 
@@ -250,7 +350,11 @@ impl ContextAssembler {
             sections.push(String::new());
             sections.push("## Active Plan".to_string());
             for (idx, step) in trace.active_plan_steps.iter().enumerate() {
-                sections.push(format!("{}. {}", idx + 1, step));
+                let mut line = format!("{}. [{}] {}", idx + 1, step.status.as_str(), step.description);
+                if let Some(expected) = &step.expected_observation {
+                    line.push_str(&format!(" | expect: {}", expected.summary()));
+                }
+                sections.push(line);
             }
             if let Some(progress_note) = &trace.last_progress_note {
                 sections.push(format!("- progress_note: {}", progress_note));
@@ -334,7 +438,7 @@ pub struct AgentCore {
     max_steps: usize,
     planning_policy: PlanningPolicy,
     #[cfg(test)]
-    scripted_decisions: RefCell<VecDeque<AgentDecision>>,
+    scripted_decisions: RefCell<VecDeque<PlannedDecision>>,
 }
 
 impl AgentCore {
@@ -400,7 +504,7 @@ impl AgentCore {
         agent
             .scripted_decisions
             .borrow_mut()
-            .extend(decisions.into_iter());
+            .extend(decisions.into_iter().map(PlannedDecision::new));
         Ok(agent)
     }
 
@@ -417,24 +521,73 @@ impl AgentCore {
             for step in 0..self.max_steps {
                 trace.step_count = step + 1;
                 let planned = self.decide(user_input, last_observation.as_ref(), step, &mut trace)?;
+                if let Some(failure) =
+                    detect_repeated_action_failure(step, &planned, &trace, last_observation.as_ref())
+                {
+                    trace.record_failure(step, &failure);
+                    trace.mark_next_plan_step_running(planned.expected_observation.clone());
+                    trace.mark_running_plan_step_failed();
+                    if self.can_replan() {
+                        last_observation = Some(failure_to_observation(step, &failure));
+                        continue;
+                    }
+                    return Err(anyhow!(failure.detail));
+                }
                 match planned.decision {
                     AgentDecision::CallTool(action) => {
+                        trace.mark_next_plan_step_running(planned.expected_observation.clone());
+                        let action_source = resulting_source_name(&action);
                         let tool_trace = trace.start_tool_call(step, &action);
                         match self.tool_registry.execute(action) {
                             Ok(result) => {
+                                let observation =
+                                    AgentObservation::tool_result(step, result.tool, &result.output);
+                                if let Err(err) = validate_expected_observation(
+                                    trace.running_plan_expected_observation(),
+                                    &observation,
+                                ) {
+                                    let failure = FailureDecision {
+                                        kind: StepFailureKind::Expectation,
+                                        action: FailureAction::Replan,
+                                        detail: err.to_string(),
+                                        source: observation.source.clone(),
+                                    };
+                                    trace.finish_tool_call_error(
+                                        tool_trace,
+                                        &format!("expected_observation_failed: {err}"),
+                                    );
+                                    trace.record_observation(&observation);
+                                    trace.record_failure(step, &failure);
+                                    if self.can_replan() {
+                                        last_observation =
+                                            Some(failure_to_observation(step, &failure));
+                                        continue;
+                                    }
+                                    return Err(anyhow!(failure.detail));
+                                }
                                 trace.finish_tool_call_success(
                                     tool_trace,
                                     result.tool,
                                     &result.output,
                                 );
-                                let observation =
-                                    AgentObservation::tool_result(step, result.tool, &result.output);
                                 trace.record_observation(&observation);
                                 last_observation = Some(observation);
                             }
                             Err(err) => {
                                 trace.finish_tool_call_error(tool_trace, &err.to_string());
-                                return Err(err);
+                                let failure = classify_tool_execution_failure(action_source, &err.to_string());
+                                trace.record_failure(step, &failure);
+                                match failure.action {
+                                    FailureAction::Replan => {
+                                        if self.can_replan() {
+                                            last_observation =
+                                                Some(failure_to_observation(step, &failure));
+                                            continue;
+                                        }
+                                        return Err(anyhow!(failure.detail));
+                                    }
+                                    FailureAction::Abort => return Err(err),
+                                }
                             }
                         }
                     }
@@ -492,8 +645,7 @@ impl AgentCore {
         );
 
         #[cfg(test)]
-        if let Some(decision) = self.scripted_decisions.borrow_mut().pop_front() {
-            let planned = PlannedDecision::new(decision);
+        if let Some(planned) = self.scripted_decisions.borrow_mut().pop_front() {
             trace.record_decision(step, "scripted", &planned);
             return Ok(planned);
         }
@@ -597,6 +749,19 @@ impl AgentCore {
         let planned = PlannedDecision::new(AgentDecision::Final("没有可执行的动作".to_string()));
         trace.record_decision(step, "default", &planned);
         Ok(planned)
+    }
+
+    fn can_replan(&self) -> bool {
+        if self.llm_client.is_some() {
+            return true;
+        }
+        #[cfg(test)]
+        {
+            if !self.scripted_decisions.borrow().is_empty() {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -910,7 +1075,8 @@ struct AgentRunTrace {
     rule_parse_error: Option<String>,
     decisions: Vec<DecisionTrace>,
     observations: Vec<ObservationTrace>,
-    active_plan_steps: Vec<String>,
+    failures: Vec<FailureTrace>,
+    active_plan_steps: Vec<RuntimePlanStep>,
     last_progress_note: Option<String>,
     llm_calls: Vec<LlmCallTrace>,
     tool_calls: Vec<ToolCallTrace>,
@@ -926,6 +1092,7 @@ struct DecisionTrace {
     summary: String,
     plan_steps: Vec<String>,
     progress_note: Option<String>,
+    expected_observation: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -981,6 +1148,15 @@ struct ObservationTrace {
     source: String,
     summary: String,
     content_chars: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct FailureTrace {
+    step: usize,
+    kind: StepFailureKind,
+    action: FailureAction,
+    source: String,
+    detail: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1048,6 +1224,7 @@ impl AgentRunTrace {
             rule_parse_error: None,
             decisions: Vec::new(),
             observations: Vec::new(),
+            failures: Vec::new(),
             active_plan_steps: Vec::new(),
             last_progress_note: None,
             llm_calls: Vec::new(),
@@ -1058,7 +1235,15 @@ impl AgentRunTrace {
 
     fn record_decision(&mut self, step: usize, source: &str, planned: &PlannedDecision) {
         if let Some(plan) = &planned.plan {
-            self.active_plan_steps = plan.steps.clone();
+            self.active_plan_steps = plan
+                .steps
+                .iter()
+                .map(|description| RuntimePlanStep {
+                    description: description.clone(),
+                    status: PlanStepStatus::Pending,
+                    expected_observation: None,
+                })
+                .collect();
         }
         if let Some(progress_note) = &planned.progress_note {
             self.last_progress_note = Some(progress_note.clone());
@@ -1074,7 +1259,57 @@ impl AgentRunTrace {
                 .map(|plan| plan.steps.clone())
                 .unwrap_or_default(),
             progress_note: planned.progress_note.clone(),
+            expected_observation: planned
+                .expected_observation
+                .as_ref()
+                .map(ExpectedObservation::summary),
         });
+    }
+
+    fn mark_next_plan_step_running(&mut self, expected_observation: Option<ExpectedObservation>) {
+        if let Some(step) = self
+            .active_plan_steps
+            .iter_mut()
+            .find(|step| step.status == PlanStepStatus::Pending)
+        {
+            step.status = PlanStepStatus::Running;
+            step.expected_observation = expected_observation;
+        }
+    }
+
+    fn mark_running_plan_step_done(&mut self) {
+        if let Some(step) = self
+            .active_plan_steps
+            .iter_mut()
+            .find(|step| step.status == PlanStepStatus::Running)
+        {
+            step.status = PlanStepStatus::Done;
+        }
+    }
+
+    fn mark_running_plan_step_failed(&mut self) {
+        if let Some(step) = self
+            .active_plan_steps
+            .iter_mut()
+            .find(|step| step.status == PlanStepStatus::Running)
+        {
+            step.status = PlanStepStatus::Failed;
+        }
+    }
+
+    fn mark_remaining_plan_steps_skipped(&mut self) {
+        for step in &mut self.active_plan_steps {
+            if step.status == PlanStepStatus::Pending {
+                step.status = PlanStepStatus::Skipped;
+            }
+        }
+    }
+
+    fn running_plan_expected_observation(&self) -> Option<&ExpectedObservation> {
+        self.active_plan_steps
+            .iter()
+            .find(|step| step.status == PlanStepStatus::Running)
+            .and_then(|step| step.expected_observation.as_ref())
     }
 
     fn record_llm_fallback(&mut self, reason: &str) {
@@ -1091,6 +1326,16 @@ impl AgentRunTrace {
             source: observation.source.clone(),
             summary: truncate_for_trace(&observation.content, 240),
             content_chars: observation.content.chars().count(),
+        });
+    }
+
+    fn record_failure(&mut self, step: usize, failure: &FailureDecision) {
+        self.failures.push(FailureTrace {
+            step,
+            kind: failure.kind.clone(),
+            action: failure.action.clone(),
+            source: failure.source.clone(),
+            detail: failure.detail.clone(),
         });
     }
 
@@ -1196,6 +1441,7 @@ impl AgentRunTrace {
             call.duration_ms = call.started_at.map(|v| v.elapsed().as_millis());
             call.started_at = None;
         }
+        self.mark_running_plan_step_done();
     }
 
     fn finish_tool_call_error(&mut self, index: usize, error: &str) {
@@ -1204,6 +1450,7 @@ impl AgentRunTrace {
             call.duration_ms = call.started_at.map(|v| v.elapsed().as_millis());
             call.started_at = None;
         }
+        self.mark_running_plan_step_failed();
     }
 
     fn finish_success(&mut self, output: &str, duration: Duration) {
@@ -1211,6 +1458,7 @@ impl AgentRunTrace {
         self.final_output = Some(output.to_string());
         self.finished_at = Some(Utc::now().to_rfc3339());
         self.duration_ms = Some(duration.as_millis());
+        self.mark_remaining_plan_steps_skipped();
     }
 
     fn finish_error(&mut self, error: &str, duration: Duration) {
@@ -1422,6 +1670,9 @@ impl AgentRunTrace {
                 if let Some(progress_note) = &decision.progress_note {
                     lines.push(format!("  - progress_note: {}", progress_note));
                 }
+                if let Some(expected) = &decision.expected_observation {
+                    lines.push(format!("  - expected_observation: {}", expected));
+                }
             }
         }
 
@@ -1430,7 +1681,11 @@ impl AgentRunTrace {
             lines.push("## Active Plan".to_string());
             lines.push(String::new());
             for (idx, step) in self.active_plan_steps.iter().enumerate() {
-                lines.push(format!("{}. {}", idx + 1, step));
+                let mut line = format!("{}. [{}] {}", idx + 1, step.status.as_str(), step.description);
+                if let Some(expected) = &step.expected_observation {
+                    line.push_str(&format!(" | expect: {}", expected.summary()));
+                }
+                lines.push(line);
             }
             if let Some(progress_note) = &self.last_progress_note {
                 lines.push(String::new());
@@ -1543,6 +1798,24 @@ impl AgentRunTrace {
                     observation.source,
                     observation.content_chars,
                     observation.summary
+                ));
+            }
+        }
+
+        lines.push(String::new());
+        lines.push("## Failures".to_string());
+        lines.push(String::new());
+        if self.failures.is_empty() {
+            lines.push("- (none)".to_string());
+        } else {
+            for failure in &self.failures {
+                lines.push(format!(
+                    "- step={} kind={} action={} source={} detail={}",
+                    failure.step,
+                    failure.kind.as_str(),
+                    failure.action.as_str(),
+                    failure.source,
+                    failure.detail
                 ));
             }
         }
@@ -1837,10 +2110,185 @@ fn build_context_summary(trace: &AgentRunTrace, observation: Option<&AgentObserv
     parts.join(", ")
 }
 
+fn default_expected_observation_for_decision(decision: &AgentDecision) -> Option<ExpectedObservation> {
+    match decision {
+        AgentDecision::CallTool(ToolAction::Create { .. })
+        | AgentDecision::CallTool(ToolAction::Write { .. }) => Some(ExpectedObservation {
+            kind: ObservationKind::FileMutation,
+            done_rule: DoneRule::ToolSuccess,
+        }),
+        AgentDecision::CallTool(ToolAction::Read { .. }) => Some(ExpectedObservation {
+            kind: ObservationKind::Text,
+            done_rule: DoneRule::NonEmptyOutput,
+        }),
+        AgentDecision::CallTool(ToolAction::GetTaskStatus { .. }) => Some(ExpectedObservation {
+            kind: ObservationKind::TaskStatus,
+            done_rule: DoneRule::RequiresJsonField {
+                field: "found".to_string(),
+            },
+        }),
+        AgentDecision::CallTool(ToolAction::ListRecentTasks { .. })
+        | AgentDecision::CallTool(ToolAction::ListManualTasks { .. }) => Some(ExpectedObservation {
+            kind: ObservationKind::TaskList,
+            done_rule: DoneRule::ToolSuccess,
+        }),
+        AgentDecision::CallTool(ToolAction::ReadArticleArchive { .. }) => {
+            Some(ExpectedObservation {
+                kind: ObservationKind::ArchiveContent,
+                done_rule: DoneRule::RequiresJsonField {
+                    field: "content".to_string(),
+                },
+            })
+        }
+        AgentDecision::Final(_) => None,
+    }
+}
+
+fn validate_expected_observation(
+    expected: Option<&ExpectedObservation>,
+    observation: &AgentObservation,
+) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+
+    match expected.kind {
+        ObservationKind::Text | ObservationKind::FileMutation => {}
+        ObservationKind::JsonObject
+        | ObservationKind::TaskStatus
+        | ObservationKind::TaskList
+        | ObservationKind::ArchiveContent => {
+            let value: Value = serde_json::from_str(&observation.content)
+                .with_context(|| format!("期望 JSON observation，但解析失败: {}", observation.source))?;
+            if !value.is_object() {
+                bail!("期望 JSON object observation，但返回不是 object");
+            }
+        }
+    }
+
+    match &expected.done_rule {
+        DoneRule::ToolSuccess => Ok(()),
+        DoneRule::NonEmptyOutput => {
+            if observation.content.trim().is_empty() {
+                bail!("期望非空输出，但 observation 为空");
+            }
+            Ok(())
+        }
+        DoneRule::RequiresJsonField { field } => {
+            let value: Value = serde_json::from_str(&observation.content)
+                .with_context(|| format!("done_rule 需要 JSON field，但解析失败: {}", observation.source))?;
+            let object = value
+                .as_object()
+                .context("done_rule 需要 JSON object observation")?;
+            let field_value = object
+                .get(field)
+                .with_context(|| format!("缺少期望字段: {field}"))?;
+            if field_value.is_null() {
+                bail!("期望字段 {field} 不能为空");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn detect_repeated_action_failure(
+    step: usize,
+    planned: &PlannedDecision,
+    trace: &AgentRunTrace,
+    observation: Option<&AgentObservation>,
+) -> Option<FailureDecision> {
+    if step == 0 || observation.is_none() {
+        return None;
+    }
+    if !matches!(planned.decision, AgentDecision::CallTool(_)) {
+        return None;
+    }
+    let current_summary = planned.summary();
+    let last_summary = trace
+        .decisions
+        .iter()
+        .rev()
+        .nth(1)
+        .map(|decision| decision.summary.as_str())?;
+    if current_summary != last_summary {
+        return None;
+    }
+    Some(FailureDecision {
+        kind: StepFailureKind::RepeatedAction,
+        action: FailureAction::Replan,
+        detail: format!("重复动作检测命中: {}", current_summary),
+        source: "watchdog:repeated_action".to_string(),
+    })
+}
+
+fn failure_to_observation(step: usize, failure: &FailureDecision) -> AgentObservation {
+    AgentObservation {
+        step,
+        source: format!("failure:{}", failure.kind.as_str()),
+        content: serde_json::to_string(&json!({
+            "failure_kind": failure.kind.as_str(),
+            "failure_action": failure.action.as_str(),
+            "detail": failure.detail,
+            "source": failure.source,
+        }))
+        .unwrap_or_else(|_| "{\"failure_kind\":\"unknown\"}".to_string()),
+    }
+}
+
+fn classify_tool_execution_failure(source: String, detail: &str) -> FailureDecision {
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("路径越界") || lower.contains("不能为空") || lower.contains("不支持") {
+        return FailureDecision {
+            kind: StepFailureKind::Irrecoverable,
+            action: FailureAction::Abort,
+            detail: detail.to_string(),
+            source,
+        };
+    }
+    if lower.contains("读取文件失败") || lower.contains("未找到") {
+        return FailureDecision {
+            kind: StepFailureKind::Semantic,
+            action: FailureAction::Replan,
+            detail: detail.to_string(),
+            source,
+        };
+    }
+    FailureDecision {
+        kind: StepFailureKind::Irrecoverable,
+        action: FailureAction::Abort,
+        detail: detail.to_string(),
+        source,
+    }
+}
+
+impl StepFailureKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Expectation => "expectation",
+            Self::RepeatedAction => "repeated_action",
+            Self::Semantic => "semantic",
+            Self::Irrecoverable => "irrecoverable",
+        }
+    }
+}
+
+impl FailureAction {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Replan => "replan",
+            Self::Abort => "abort",
+        }
+    }
+}
+
+fn resulting_source_name(action: &ToolAction) -> String {
+    format!("tool:{}", action.name())
+}
+
 fn build_system_prompt(planning_policy: PlanningPolicy) -> &'static str {
     match planning_policy {
         PlanningPolicy::Reactive => {
-            "你是一个工具规划器，采用最小 ReAct 风格工作：先根据上下文判断下一步，再决定是调用一个工具还是直接给出最终结果。每轮最多只调用一个工具。只输出 JSON，不要解释。格式为 {\"action\":\"read|write|create|get_task_status|list_recent_tasks|list_manual_tasks|read_article_archive|final\",\"path\":\"...\",\"content\":\"...\",\"task_id\":\"...\",\"limit\":5,\"answer\":\"...\",\"plan\":[\"步骤1\",\"步骤2\"],\"progress_note\":\"当前做到哪\"}。read 只需要 path；write/create 需要 path 与 content；get_task_status 需要 task_id；list_recent_tasks/list_manual_tasks 可选 limit；read_article_archive 需要 task_id；final 需要 answer。plan 与 progress_note 为可选字段，用于表达当前计划和执行进度。"
+            "你是一个工具规划器，采用最小 ReAct 风格工作：先根据上下文判断下一步，再决定是调用一个工具还是直接给出最终结果。每轮最多只调用一个工具。只输出 JSON，不要解释。格式为 {\"action\":\"read|write|create|get_task_status|list_recent_tasks|list_manual_tasks|read_article_archive|final\",\"path\":\"...\",\"content\":\"...\",\"task_id\":\"...\",\"limit\":5,\"answer\":\"...\",\"plan\":[\"步骤1\",\"步骤2\"],\"progress_note\":\"当前做到哪\",\"expected_kind\":\"text|json_object|file_mutation|task_status|task_list|archive_content\",\"done_rule\":\"tool_success|non_empty_output|required_json_field\",\"required_field\":\"field_name\"}。read 只需要 path；write/create 需要 path 与 content；get_task_status 需要 task_id；list_recent_tasks/list_manual_tasks 可选 limit；read_article_archive 需要 task_id；final 需要 answer。plan、progress_note、expected_kind、done_rule、required_field 都是可选字段，用于表达当前计划、进度和期望观测。"
         }
     }
 }
@@ -2005,6 +2453,9 @@ struct LlmPlan {
     limit: Option<usize>,
     plan: Option<Vec<String>>,
     progress_note: Option<String>,
+    expected_kind: Option<String>,
+    done_rule: Option<String>,
+    required_field: Option<String>,
 }
 
 fn parse_user_command(input: &str) -> Result<AgentDecision> {
@@ -2154,9 +2605,55 @@ fn map_llm_plan(plan: LlmPlan) -> Result<PlannedDecision> {
         other => bail!("LLM action 不支持: {other}"),
     };
 
+    let expected_observation = parse_expected_observation(
+        plan.expected_kind.as_deref(),
+        plan.done_rule.as_deref(),
+        plan.required_field.as_deref(),
+    )?
+    .or_else(|| default_expected_observation_for_decision(&decision));
+
     Ok(PlannedDecision::new(decision)
         .with_plan(execution_plan)
-        .with_progress_note(progress_note))
+        .with_progress_note(progress_note)
+        .with_expected_observation(expected_observation))
+}
+
+fn parse_expected_observation(
+    expected_kind: Option<&str>,
+    done_rule: Option<&str>,
+    required_field: Option<&str>,
+) -> Result<Option<ExpectedObservation>> {
+    let kind = match expected_kind.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("text") => Some(ObservationKind::Text),
+        Some("json_object") => Some(ObservationKind::JsonObject),
+        Some("file_mutation") => Some(ObservationKind::FileMutation),
+        Some("task_status") => Some(ObservationKind::TaskStatus),
+        Some("task_list") => Some(ObservationKind::TaskList),
+        Some("archive_content") => Some(ObservationKind::ArchiveContent),
+        Some(other) => bail!("expected_kind 不支持: {other}"),
+        None => None,
+    };
+    let done_rule = match done_rule.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("tool_success") => Some(DoneRule::ToolSuccess),
+        Some("non_empty_output") => Some(DoneRule::NonEmptyOutput),
+        Some("required_json_field") => {
+            let field = required_field
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .context("done_rule=required_json_field 时必须提供 required_field")?;
+            Some(DoneRule::RequiresJsonField {
+                field: field.to_string(),
+            })
+        }
+        Some(other) => bail!("done_rule 不支持: {other}"),
+        None => None,
+    };
+
+    match (kind, done_rule) {
+        (None, None) => Ok(None),
+        (Some(kind), Some(done_rule)) => Ok(Some(ExpectedObservation { kind, done_rule })),
+        _ => bail!("expected_kind 与 done_rule 必须同时提供"),
+    }
 }
 
 fn extract_json_object(raw: &str) -> Option<&str> {
@@ -2185,7 +2682,8 @@ mod tests {
     use super::{
         build_agent_log_payload, build_context_summary, load_business_context_snapshot,
         map_llm_plan, parse_llm_plan, AgentCore, AgentObservation, AgentRunContext, AgentRunTrace,
-        BusinessContextSnapshot, ContextAssembler, LlmPlan,
+        BusinessContextSnapshot, ContextAssembler, DoneRule, ExecutionPlan,
+        ExpectedObservation, LlmPlan, ObservationKind, PlannedDecision,
     };
     use crate::task_store::TaskStore;
     use serde_json::{json, Value};
@@ -2473,6 +2971,151 @@ mod tests {
     }
 
     #[test]
+    fn plan_step_statuses_are_tracked_in_trace() {
+        let root = temp_workspace();
+        let agent = AgentCore::with_max_steps_and_task_store_db_path(
+            root.clone(),
+            5,
+            None::<std::path::PathBuf>,
+        )
+        .expect("初始化 agent 失败");
+        agent.scripted_decisions.borrow_mut().extend([
+            PlannedDecision::new(super::AgentDecision::CallTool(super::ToolAction::Create {
+                path: "demo/plan.txt".to_string(),
+                content: "hello".to_string(),
+            }))
+            .with_plan(Some(ExecutionPlan {
+                steps: vec!["创建文件".to_string(), "读取文件".to_string()],
+            }))
+            .with_progress_note(Some("执行第一步".to_string())),
+            PlannedDecision::new(super::AgentDecision::CallTool(super::ToolAction::Read {
+                path: "demo/plan.txt".to_string(),
+            }))
+            .with_progress_note(Some("执行第二步".to_string())),
+            PlannedDecision::new(super::AgentDecision::Final("done".to_string()))
+                .with_progress_note(Some("计划完成".to_string())),
+        ]);
+
+        let result = agent.run("执行计划").expect("执行计划应成功");
+        assert_eq!(result, "done");
+
+        let trace_root = root.join("data").join("agent_traces");
+        let day_dir = std::fs::read_dir(&trace_root)
+            .expect("应存在 trace 根目录")
+            .next()
+            .expect("应存在日期目录")
+            .expect("读取日期目录失败")
+            .path();
+        let trace_path = std::fs::read_dir(day_dir)
+            .expect("应存在 trace 文件")
+            .filter_map(|entry| entry.ok().map(|value| value.path()))
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .expect("应存在至少一个 json trace 文件");
+        let payload: Value = serde_json::from_str(
+            &std::fs::read_to_string(trace_path).expect("读取 trace 文件失败"),
+        )
+        .expect("trace JSON 应合法");
+
+        assert_eq!(payload["active_plan_steps"][0]["status"], "done");
+        assert_eq!(payload["active_plan_steps"][1]["status"], "done");
+        assert_eq!(payload["last_progress_note"], "计划完成");
+    }
+
+    #[test]
+    fn failed_tool_marks_plan_step_failed() {
+        let root = temp_workspace();
+        let agent = AgentCore::with_max_steps_and_task_store_db_path(
+            root.clone(),
+            3,
+            None::<std::path::PathBuf>,
+        )
+        .expect("初始化 agent 失败");
+        agent.scripted_decisions.borrow_mut().extend([PlannedDecision::new(
+            super::AgentDecision::CallTool(super::ToolAction::Read {
+                path: "missing.txt".to_string(),
+            }),
+        )
+        .with_plan(Some(ExecutionPlan {
+            steps: vec!["读取缺失文件".to_string()],
+        }))]);
+
+        let err = agent.run("读取不存在文件").expect_err("应当失败");
+        assert!(err.to_string().contains("读取文件失败"));
+
+        let trace_root = root.join("data").join("agent_traces");
+        let day_dir = std::fs::read_dir(&trace_root)
+            .expect("应存在 trace 根目录")
+            .next()
+            .expect("应存在日期目录")
+            .expect("读取日期目录失败")
+            .path();
+        let trace_path = std::fs::read_dir(day_dir)
+            .expect("应存在 trace 文件")
+            .filter_map(|entry| entry.ok().map(|value| value.path()))
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .expect("应存在至少一个 json trace 文件");
+        let payload: Value = serde_json::from_str(
+            &std::fs::read_to_string(trace_path).expect("读取 trace 文件失败"),
+        )
+        .expect("trace JSON 应合法");
+
+        assert_eq!(payload["active_plan_steps"][0]["status"], "failed");
+    }
+
+    #[test]
+    fn successful_tool_can_fail_done_rule_validation() {
+        let root = temp_workspace();
+        let empty_path = root.join("demo").join("empty.txt");
+        std::fs::create_dir_all(
+            empty_path
+                .parent()
+                .expect("空文件路径应存在父目录"),
+        )
+        .expect("创建空文件目录失败");
+        std::fs::write(&empty_path, "").expect("写入空文件失败");
+        let agent = AgentCore::with_max_steps_and_task_store_db_path(
+            root.clone(),
+            3,
+            None::<std::path::PathBuf>,
+        )
+        .expect("初始化 agent 失败");
+        agent.scripted_decisions.borrow_mut().extend([PlannedDecision::new(
+            super::AgentDecision::CallTool(super::ToolAction::Read {
+                path: "demo/empty.txt".to_string(),
+            }),
+        )
+        .with_plan(Some(ExecutionPlan {
+            steps: vec!["读取非空文件".to_string()],
+        }))
+        .with_expected_observation(Some(ExpectedObservation {
+            kind: ObservationKind::Text,
+            done_rule: DoneRule::NonEmptyOutput,
+        }))]);
+
+        let err = agent.run("读取空文件").expect_err("done_rule 校验应失败");
+        assert!(err.to_string().contains("期望非空输出"));
+
+        let trace_root = root.join("data").join("agent_traces");
+        let day_dir = std::fs::read_dir(&trace_root)
+            .expect("应存在 trace 根目录")
+            .next()
+            .expect("应存在日期目录")
+            .expect("读取日期目录失败")
+            .path();
+        let trace_path = std::fs::read_dir(day_dir)
+            .expect("应存在 trace 文件")
+            .filter_map(|entry| entry.ok().map(|value| value.path()))
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .expect("应存在至少一个 json trace 文件");
+        let payload: Value = serde_json::from_str(
+            &std::fs::read_to_string(trace_path).expect("读取 trace 文件失败"),
+        )
+        .expect("trace JSON 应合法");
+
+        assert_eq!(payload["active_plan_steps"][0]["status"], "failed");
+    }
+
+    #[test]
     fn context_assembler_includes_runtime_fields_and_observation() {
         let workspace = temp_workspace();
         let trace = AgentRunTrace::new(
@@ -2651,6 +3294,9 @@ mod tests {
             limit: None,
             plan: None,
             progress_note: None,
+            expected_kind: None,
+            done_rule: None,
+            required_field: None,
         })
         .expect_err("read 无 path 应失败");
         assert!(err.to_string().contains("path"));
@@ -2696,5 +3342,21 @@ mod tests {
             Some(vec!["查询任务".to_string(), "总结结果".to_string()])
         );
         assert_eq!(planned.progress_note.as_deref(), Some("先查任务状态"));
+    }
+
+    #[test]
+    fn llm_plan_with_expected_observation_is_supported() {
+        let planned = parse_llm_plan(
+            r#"{"action":"get_task_status","task_id":"task-1","expected_kind":"task_status","done_rule":"required_json_field","required_field":"found"}"#,
+        )
+        .expect("带 expected_observation 的 LLM JSON 解析失败");
+
+        assert!(matches!(
+            planned.expected_observation,
+            Some(ExpectedObservation {
+                kind: ObservationKind::TaskStatus,
+                done_rule: DoneRule::RequiresJsonField { .. }
+            })
+        ));
     }
 }

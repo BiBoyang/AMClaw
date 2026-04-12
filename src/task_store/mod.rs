@@ -123,6 +123,15 @@ pub struct UserMemoryRecord {
     pub updated_at: String,
 }
 
+/// search_user_memories 的返回结果，区分检索阶段和注入阶段
+#[derive(Debug, Clone)]
+pub struct MemorySearchResult {
+    /// 从 DB 中取出的候选记忆条数（含被预算裁剪掉的）
+    pub retrieved_count: usize,
+    /// 经去重 + 单条长度 + 总预算裁剪后，实际可注入 prompt 的记忆
+    pub memories: Vec<UserMemoryRecord>,
+}
+
 #[derive(Debug)]
 pub struct TaskStore {
     conn: Connection,
@@ -294,10 +303,15 @@ impl TaskStore {
         Ok(sessions)
     }
 
+    /// 写入显式用户记忆（用户明确要求"记住"）
+    /// memory_type="explicit", priority=100
     pub fn add_user_memory(&mut self, user_id: &str, content: &str) -> Result<UserMemoryRecord> {
         self.add_user_memory_typed(user_id, content, "explicit", 100)
     }
 
+    /// 写入带类型和优先级的用户记忆
+    /// - explicit: 用户显式要求记住，priority=100
+    /// - auto: 系统自动提炼，priority=60
     pub fn add_user_memory_typed(
         &mut self,
         user_id: &str,
@@ -385,13 +399,14 @@ impl TaskStore {
     }
 
     /// 按 budget 检索 active 记忆（优先级 + 时间衰减 + 去重 + 预算裁剪）
+    /// 返回 MemorySearchResult，区分 retrieved_count（DB 取出数）和 injected（经裁剪后实际可用）
     pub fn search_user_memories(
         &self,
         user_id: &str,
         max_items: usize,
         max_total_chars: usize,
         max_single_chars: usize,
-    ) -> Result<Vec<UserMemoryRecord>> {
+    ) -> Result<MemorySearchResult> {
         let limit = i64::try_from(max_items * 3).context("memory limit 超出范围")?;
         let mut stmt = self
             .conn
@@ -422,12 +437,18 @@ impl TaskStore {
             })
             .context("检索 user_memory 失败")?;
 
-        let mut seen_normalized = HashSet::new();
-        let mut results = Vec::new();
-        let mut total_chars = 0;
-
+        let mut retrieved = Vec::new();
         for row in rows {
             let mem = row.context("读取 user_memory 失败")?;
+            retrieved.push(mem);
+        }
+        let retrieved_count = retrieved.len();
+
+        let mut seen_normalized = HashSet::new();
+        let mut injected = Vec::new();
+        let mut total_chars = 0;
+
+        for mem in retrieved {
             // 规范化去重：trim + 多空格压缩
             let normalized: String = mem.content.split_whitespace().collect::<Vec<_>>().join(" ");
             if seen_normalized.contains(&normalized) {
@@ -439,16 +460,19 @@ impl TaskStore {
             }
             // 总预算检查
             total_chars += mem.content.chars().count();
-            if results.len() >= max_items || total_chars > max_total_chars {
+            if injected.len() >= max_items || total_chars > max_total_chars {
                 break;
             }
             seen_normalized.insert(normalized);
-            results.push(mem);
+            injected.push(mem);
         }
-        Ok(results)
+        Ok(MemorySearchResult {
+            retrieved_count,
+            memories: injected,
+        })
     }
 
-    /// 命中回写：use_count + 1, last_used_at = now
+    /// 命中回写：use_count += 1（被注入 prompt 次数），last_used_at = now
     pub fn mark_memory_used(&self, memory_id: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         self.conn
@@ -2099,8 +2123,8 @@ mod tests {
         // "显式  偏好"和"显式 偏好"规范化后都是"显式 偏好"，去重后只保留一条
         // 总共 3 条：显式偏好(explicit), 显式  偏好(explicit), 自动偏好(auto)
         // 其中"显式  偏好"和"显式 偏好"去重后只保留先命中的"显式  偏好"
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0].memory_type, "explicit");
+        assert_eq!(results.memories.len(), 3);
+        assert_eq!(results.memories[0].memory_type, "explicit");
     }
 
     #[test]
@@ -2122,7 +2146,56 @@ mod tests {
         let results = store
             .search_user_memories("user-a", 2, 500, 160)
             .expect("检索失败");
-        assert_eq!(results.len(), 2);
+        assert_eq!(results.memories.len(), 2);
+        // retrieved_count 应 >= injected count
+        assert!(results.retrieved_count >= results.memories.len());
+    }
+
+    #[test]
+    fn search_memories_retrieved_count_exceeds_injected_when_trimmed() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        // 写入 4 条记忆，但 max_items=2
+        for i in 1..=4 {
+            store
+                .add_user_memory("user-a", &format!("记忆内容 {}", i))
+                .expect("写入失败");
+        }
+
+        let results = store
+            .search_user_memories("user-a", 2, 500, 160)
+            .expect("检索失败");
+        // retrieved_count 应为 4（或更多，SQL LIMIT = max_items * 3 = 6）
+        assert!(results.retrieved_count >= 4);
+        // injected count 应为 2（max_items=2）
+        assert_eq!(results.memories.len(), 2);
+        // retrieved >= injected
+        assert!(results.retrieved_count >= results.memories.len());
+    }
+
+    #[test]
+    fn explicit_memory_sorts_before_auto() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        // 先写 auto，再写 explicit
+        store
+            .add_user_memory_typed("user-a", "自动偏好", "auto", 60)
+            .expect("写入 auto 失败");
+        store
+            .add_user_memory("user-a", "显式偏好")
+            .expect("写入 explicit 失败");
+
+        let results = store
+            .search_user_memories("user-a", 5, 500, 160)
+            .expect("检索失败");
+        assert_eq!(results.memories.len(), 2);
+        // explicit (priority=100) 应排在 auto (priority=60) 前面
+        assert_eq!(results.memories[0].memory_type, "explicit");
+        assert_eq!(results.memories[0].priority, 100);
+        assert_eq!(results.memories[1].memory_type, "auto");
+        assert_eq!(results.memories[1].priority, 60);
     }
 
     #[test]
@@ -2140,8 +2213,8 @@ mod tests {
         let results = store
             .search_user_memories("user-a", 5, 500, 160)
             .expect("检索失败");
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].content, "短记忆");
+        assert_eq!(results.memories.len(), 1);
+        assert_eq!(results.memories[0].content, "短记忆");
     }
 
     #[test]
@@ -2182,7 +2255,7 @@ mod tests {
         let searched = store
             .search_user_memories("user-a", 5, 500, 160)
             .expect("检索失败");
-        assert!(searched.is_empty());
+        assert!(searched.memories.is_empty());
 
         // has_user_memory 也排除 suppressed
         assert!(!store

@@ -1,4 +1,6 @@
-use crate::task_store::{RecentTaskRecord, TaskStatusRecord, TaskStore, UserMemoryRecord};
+use crate::task_store::{
+    MemorySearchResult, RecentTaskRecord, TaskStatusRecord, TaskStore, UserMemoryRecord,
+};
 use crate::tool_registry::{ToolAction, ToolRegistry};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
@@ -390,10 +392,21 @@ struct BusinessContextSnapshot {
     user_memories: Vec<UserMemoryRecord>,
 }
 
+/// Memory 注入统计（语义：检索后经预算裁剪实际注入 prompt 的记忆）
+///
+/// 语义定义：
+/// - retrieved: 从 DB 中取出的候选数量
+/// - injected: 经去重 + 单条长度 + 总预算裁剪后实际注入 prompt 的数量（即 hit_count）
+/// - useful: 真正帮助本轮决策的数量（当前不自动判定，字段预留）
 #[derive(Debug, Clone, Default)]
 struct MemoryStats {
+    /// 从 DB 取出的候选记忆条数
+    retrieved_count: usize,
+    /// 实际注入 prompt 的记忆条数
     hit_count: usize,
+    /// 注入记忆的总字符数
     total_chars: usize,
+    /// 注入记忆的 ID 列表（同时用于 mark_memories_used 回写）
     ids: Vec<String>,
 }
 
@@ -934,6 +947,7 @@ impl AgentCore {
             };
         if step == 0 && memory_stats.hit_count > 0 {
             trace.memory_hit_count = memory_stats.hit_count;
+            trace.memory_retrieved_count = memory_stats.retrieved_count;
             trace.memory_total_chars = memory_stats.total_chars;
             trace.memory_ids = memory_stats.ids;
         }
@@ -1384,9 +1398,10 @@ struct AgentRunTrace {
     last_progress_note: Option<String>,
     llm_calls: Vec<LlmCallTrace>,
     tool_calls: Vec<ToolCallTrace>,
-    memory_hit_count: usize,
-    memory_total_chars: usize,
-    memory_ids: Vec<String>,
+    memory_hit_count: usize,       // 实际注入 prompt 的记忆条数
+    memory_retrieved_count: usize, // 从 DB 取出的候选记忆条数
+    memory_total_chars: usize,     // 注入记忆的总字符数
+    memory_ids: Vec<String>,       // 注入记忆的 ID 列表
     #[serde(skip_serializing)]
     trace_dir_root: PathBuf,
 }
@@ -1497,6 +1512,7 @@ struct AgentTraceIndexEntry {
     error: Option<String>,
     llm_fallback_reason: Option<String>,
     memory_hit_count: usize,
+    memory_retrieved_count: usize,
     memory_total_chars: usize,
     json_file: String,
     markdown_file: String,
@@ -1547,6 +1563,7 @@ impl AgentRunTrace {
             tool_calls: Vec::new(),
             trace_dir_root: workspace_root.join("data").join("agent_traces"),
             memory_hit_count: 0,
+            memory_retrieved_count: 0,
             memory_total_chars: 0,
             memory_ids: Vec::new(),
         }
@@ -1961,6 +1978,7 @@ impl AgentRunTrace {
                 .clone()
                 .map(|v| summarize_for_markdown(&v, 240)),
             memory_hit_count: self.memory_hit_count,
+            memory_retrieved_count: self.memory_retrieved_count,
             memory_total_chars: self.memory_total_chars,
             json_file: json_path
                 .file_name()
@@ -2050,8 +2068,12 @@ impl AgentRunTrace {
             ),
             format!("- failure_count: {}", self.controller_state.failure_count),
             format!("- ask_user_count: {}", self.controller_state.ask_user_count),
-            format!("- memory_hit_count: {}", self.memory_hit_count),
-            format!("- memory_total_chars: {}", self.memory_total_chars),
+            format!("- memory_hit_count: {} (injected)", self.memory_hit_count),
+            format!("- memory_retrieved_count: {}", self.memory_retrieved_count),
+            format!(
+                "- memory_total_chars: {} (injected)",
+                self.memory_total_chars
+            ),
             String::new(),
             "## User Input".to_string(),
             String::new(),
@@ -2558,19 +2580,28 @@ fn load_business_context_snapshot(
     let mut memory_stats = MemoryStats::default();
     let user_memories = if let Some(user_id) = &trace.user_id {
         match store.search_user_memories(user_id, 5, 500, 160) {
-            Ok(memories) => {
+            Ok(MemorySearchResult {
+                retrieved_count,
+                memories,
+            }) => {
+                memory_stats.retrieved_count = retrieved_count;
                 memory_stats.hit_count = memories.len();
                 memory_stats.total_chars = memories.iter().map(|m| m.content.chars().count()).sum();
                 memory_stats.ids = memories.iter().map(|m| m.id.clone()).collect();
                 log_agent_info(
-                    "agent_memory_retrieved",
+                    "agent_memory_injected",
                     vec![
                         ("user_id", json!(user_id)),
+                        (
+                            "memory_retrieved_count",
+                            json!(memory_stats.retrieved_count),
+                        ),
                         ("memory_hit_count", json!(memory_stats.hit_count)),
                         ("memory_total_chars", json!(memory_stats.total_chars)),
                         ("memory_ids", json!(memory_stats.ids)),
                     ],
                 );
+                // mark_memories_used: use_count += 1 表示"被注入次数"
                 if let Err(err) = store.mark_memories_used(&memory_stats.ids) {
                     log_agent_warn(
                         "agent_memory_mark_used_failed",
@@ -4489,7 +4520,7 @@ mod tests {
         let after = store
             .search_user_memories("user-memory", 5, 500, 160)
             .expect("再次检索失败");
-        assert_eq!(after[0].use_count, 1);
+        assert_eq!(after.memories[0].use_count, 1);
     }
 
     #[test]

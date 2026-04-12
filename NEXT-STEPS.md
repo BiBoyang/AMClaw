@@ -27,14 +27,78 @@
 
 ### 目标
 
-基于已落地的 Memory 消费链路，继续推进系统工程层的补齐。
+基于已落地的 `Memory v3`，把 AMClaw 的 `context / memory` 从“最小可用”推进到“可稳定演进”。
 
 ### 方向
 
-1. 继续收口系统级日志与错误语义
-2. 再考虑异步化、`tracing` 与错误分层
-3. 然后用轻量评测驱动 runtime 稳定性增强
-4. 最后再推进更完整的调度 / 多用户 / 多任务演进
+1. 先收口现有 memory 语义与观测
+2. 再补显式 `session state`
+3. 然后抽结构化 `context pack`
+4. 之后再扩少量高价值长期 memory
+5. 最后用 trace 驱动评测闭环
+
+统一路线文档：
+
+- `notes/context-memory/CONTEXT-MEMORY-EVOLUTION-ROADMAP-2026-04-13.md`
+
+## v0.3.3 推荐执行顺序
+
+### Phase 1：收口 `Memory v3` 语义
+
+优先要做：
+
+1. 统一自动记忆与显式记忆的写入语义
+2. 区分 `retrieved_memory_count` / `injected_memory_count`
+3. 明确 `use_count` 的真实含义
+4. 保持日志、trace、文档三者口径一致
+
+### Phase 2：补显式 `SessionState`
+
+优先要做：
+
+1. 引入最小状态槽位：
+   - `goal`
+   - `current_subtask`
+   - `constraints`
+   - `confirmed_facts`
+   - `done_items`
+   - `next_step`
+   - `open_questions`
+2. 让这些槽位进入 trace 与 prompt
+3. 保证无状态时仍可退化运行
+
+### Phase 3：抽 `ContextPack`
+
+优先要做：
+
+1. 把“当前喂给模型的内容”抽象成结构体
+2. 拆清来源：
+   - runtime context
+   - session state
+   - business context
+   - memories
+   - latest observation
+   - active plan
+3. 让 trace 同时保留：
+   - 结构化 context pack
+   - 最终渲染 prompt
+
+### Phase 4：扩长期 Memory 类型
+
+只优先考虑三类：
+
+1. `user_preference`
+2. `project_fact`
+3. `lesson`
+
+### Phase 5：建立 Trace 驱动评测闭环
+
+优先要做：
+
+1. 从真实 trace 中抽样
+2. 标注失败类型
+3. 比较机制变更前后差异
+4. 一次只验证一个机制
 
 ### 不优先做
 
@@ -51,3 +115,4 @@
 - 不先做多用户/多任务架构重构
 - 不先做 `tokio` 全量迁移或 `sqlx` async 化
 - 不回头重写 ReAct / Planning 主框架
+- 不同时叠加多个 memory 机制

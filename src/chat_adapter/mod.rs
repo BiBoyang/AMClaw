@@ -859,7 +859,10 @@ impl WeChatBot {
                 return;
             }
         }
-        if let Err(err) = self.task_store.add_user_memory(user_id, &memory) {
+        if let Err(err) = self
+            .task_store
+            .add_user_memory_typed(user_id, &memory, "auto", 60)
+        {
             log_chat_warn(
                 "user_memory_auto_extract_failed",
                 vec![

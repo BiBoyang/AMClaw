@@ -277,9 +277,8 @@ impl Pipeline {
         let redirect_policy = if should_disable_http_redirects(url) {
             Policy::none()
         } else {
-            // SSRF 防护：每次重定向前检查目标是否为私有地址
             Policy::custom(|attempt| {
-                if crate::task_store::is_private_url(attempt.url().as_str()) {
+                if should_reject_http_redirect_target(attempt.url().as_str()) {
                     return attempt.stop();
                 }
                 if attempt.previous().len() >= 10 {
@@ -1307,6 +1306,10 @@ fn should_disable_http_redirects(url: &str) -> bool {
     is_wechat_mp_url(url)
 }
 
+fn should_reject_http_redirect_target(url: &str) -> bool {
+    crate::task_store::is_private_url(url)
+}
+
 fn validate_browser_capture_paths(
     request: &BrowserCaptureRequest,
     response: &BrowserCaptureResponse,
@@ -1405,6 +1408,7 @@ mod tests {
         detect_wechat_redirect, extract_html_title, extract_http_archive_body,
         extract_primary_body, generate_rule_summary, is_navigation_like,
         should_disable_http_redirects, should_prefer_browser_capture,
+        should_reject_http_redirect_target,
         validate_browser_capture_paths, validate_fetched_html, BrowserCaptureRequest,
         BrowserCaptureResponse, BrowserCaptureResult, HttpFetchResult, Pipeline,
         PipelineFailureKind,
@@ -1576,6 +1580,18 @@ mod tests {
             "https://mp.weixin.qq.com/s/demo"
         ));
         assert!(!should_disable_http_redirects(
+            "https://example.com/article"
+        ));
+    }
+
+    #[test]
+    fn http_redirect_to_private_target_is_rejected() {
+        assert!(should_reject_http_redirect_target(
+            "http://169.254.169.254/latest/meta-data/"
+        ));
+        assert!(should_reject_http_redirect_target("http://127.0.0.1/admin"));
+        assert!(should_reject_http_redirect_target("http://[::1]/secret"));
+        assert!(!should_reject_http_redirect_target(
             "https://example.com/article"
         ));
     }

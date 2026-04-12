@@ -277,7 +277,16 @@ impl Pipeline {
         let redirect_policy = if should_disable_http_redirects(url) {
             Policy::none()
         } else {
-            Policy::limited(10)
+            // SSRF 防护：每次重定向前检查目标是否为私有地址
+            Policy::custom(|attempt| {
+                if crate::task_store::is_private_url(attempt.url().as_str()) {
+                    return attempt.stop();
+                }
+                if attempt.previous().len() >= 10 {
+                    return attempt.stop();
+                }
+                attempt.follow()
+            })
         };
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))

@@ -1203,43 +1203,91 @@ fn normalize_url(input: &str) -> Result<String> {
     Ok(normalized)
 }
 
-/// 检查 host 是否属于私有/本地地址
+/// 公开：检查 URL 是否指向私有/本地/元数据地址
+pub fn is_private_url(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    parsed.host_str().is_some_and(is_private_host)
+}
+
+/// 检查 host 是否属于私有/本地/元数据地址
 fn is_private_host(host: &str) -> bool {
-    let lower = host.to_ascii_lowercase();
+    // IPv6 地址在 URL 中带方括号 [::1]，需去掉
+    let trimmed = host.trim_start_matches('[').trim_end_matches(']');
+    let lower = trimmed.to_ascii_lowercase();
+    // 特殊域名
     if lower == "localhost"
         || lower == "0.0.0.0"
-        || lower == "::1"
         || lower.ends_with(".local")
         || lower.ends_with(".internal")
+        || lower.ends_with(".localhost")
     {
         return true;
     }
-    // IPv4 私有网段
-    let octets: Vec<&str> = lower.split('.').collect();
-    if octets.len() == 4 {
-        if let Ok(first) = octets[0].parse::<u8>() {
-            match first {
-                10 => return true,  // 10.0.0.0/8
-                127 => return true, // 127.0.0.0/8
-                172 => {
-                    if let Ok(second) = octets[1].parse::<u8>() {
-                        if (16..=31).contains(&second) {
-                            return true; // 172.16.0.0/12
-                        }
-                    }
-                }
-                192 => {
-                    if let Ok(second) = octets[1].parse::<u8>() {
-                        if second == 168 {
-                            return true; // 192.168.0.0/16
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+    // IPv6 私有/本地地址
+    if lower.starts_with("::1")
+        || lower.starts_with("fc")
+        || lower.starts_with("fd")
+        || lower.starts_with("fe80:")
+        || lower.starts_with("fe::")
+        || lower.starts_with("::ffff:")
+    {
+        return true;
+    }
+    // 尝试解析为 IPv4 各进制表示
+    if let Some(octets) = parse_ipv4_octets(&lower) {
+        return is_private_ipv4(&octets);
     }
     false
+}
+
+/// 尝试从 host 字符串解析出 4 个 u8 作为 IPv4 八位组。
+/// 支持十进制、八进制(0前缀)、十六进制(0x前缀)及混合表示。
+fn parse_ipv4_octets(host: &str) -> Option<[u8; 4]> {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let mut octets = [0u8; 4];
+    for (i, part) in parts.iter().enumerate() {
+        octets[i] = parse_ip_segment(part)?;
+    }
+    Some(octets)
+}
+
+/// 解析单个 IP 段：支持十进制、八进制(0前缀)、十六进制(0x前缀)
+fn parse_ip_segment(s: &str) -> Option<u8> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u8::from_str_radix(hex, 16).ok()
+    } else if s.len() > 1 && s.starts_with('0') {
+        // 八进制：0777 等；但 "0" 本身是十进制 0
+        u8::from_str_radix(s, 8).ok()
+    } else {
+        s.parse::<u8>().ok()
+    }
+}
+
+/// 判断 IPv4 八位组是否属于私有/保留地址
+fn is_private_ipv4(octets: &[u8; 4]) -> bool {
+    match octets[0] {
+        0 => true,                                      // 0.0.0.0/8
+        10 => true,                                     // 10.0.0.0/8
+        100 if (64..=127).contains(&octets[1]) => true, // 100.64.0.0/10 (CGN)
+        127 => true,                                    // 127.0.0.0/8
+        169 if octets[1] == 254 => true,                // 169.254.0.0/16 (link-local / 云元数据)
+        172 if (16..=31).contains(&octets[1]) => true,  // 172.16.0.0/12
+        192 => match octets[1] {
+            0 if octets[2] == 0 => true, // 192.0.0.0/24
+            168 => true,                 // 192.168.0.0/16
+            _ => false,
+        },
+        198 if octets[1] == 51 && octets[2] == 100 => true, // 198.51.100.0/24 (文档)
+        203 if octets[1] == 0 && octets[2] == 113 => true,  // 203.0.113.0/24 (文档)
+        224..=239 => true,                                  // 组播
+        240..=255 => true,                                  // 保留
+        _ => false,
+    }
 }
 
 fn strip_tracking_query_pairs(url: &mut Url) {
@@ -1481,12 +1529,27 @@ mod tests {
         let db_path = temp_db_path();
         let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
         let private_urls = vec![
+            // 经典私有段
             "http://127.0.0.1/secret",
             "http://localhost/admin",
             "http://192.168.1.1/router",
             "http://10.0.0.1/internal",
             "http://172.16.0.1/corp",
             "http://172.31.255.255/corp",
+            // 云元数据 / link-local
+            "http://169.254.169.254/metadata",
+            "http://169.254.0.1/whatever",
+            // IPv6
+            "http://[::1]/secret",
+            "http://[fc00::1]/internal",
+            "http://[fe80::1]/link",
+            // 非十进制表示
+            "http://0x7f000001/secret",
+            "http://0177.0.0.1/secret",
+            "http://2130706433/secret",
+            // 特殊域名
+            "http://myapp.localhost/",
+            "http://myapp.local/",
         ];
         for url in private_urls {
             let err = store
@@ -1503,6 +1566,22 @@ mod tests {
         store
             .record_link_submission("https://example.com/public")
             .expect("公网 URL 应正常通过");
+    }
+
+    #[test]
+    fn is_private_url_detects_all_known_patterns() {
+        assert!(super::is_private_url(
+            "http://169.254.169.254/latest/meta-data/"
+        ));
+        assert!(super::is_private_url("http://100.64.0.1/cgn"));
+        assert!(super::is_private_url("http://0x7f000001/ping"));
+        assert!(super::is_private_url("http://0177.0.0.1/ping"));
+        assert!(super::is_private_url("http://[::1]/ping"));
+        assert!(super::is_private_url("http://[fc00::1]/ping"));
+        // 公网不应命中
+        assert!(!super::is_private_url("https://example.com/page"));
+        assert!(!super::is_private_url("https://1.1.1.1/dns"));
+        assert!(!super::is_private_url("https://8.8.8.8/dns"));
     }
 
     #[test]

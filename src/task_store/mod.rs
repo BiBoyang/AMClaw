@@ -97,6 +97,11 @@ pub struct UserMemoryRecord {
     pub id: String,
     pub user_id: String,
     pub content: String,
+    pub memory_type: String,
+    pub status: String,
+    pub priority: i64,
+    pub last_used_at: Option<String>,
+    pub use_count: i64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -273,6 +278,16 @@ impl TaskStore {
     }
 
     pub fn add_user_memory(&mut self, user_id: &str, content: &str) -> Result<UserMemoryRecord> {
+        self.add_user_memory_typed(user_id, content, "explicit", 100)
+    }
+
+    pub fn add_user_memory_typed(
+        &mut self,
+        user_id: &str,
+        content: &str,
+        memory_type: &str,
+        priority: i64,
+    ) -> Result<UserMemoryRecord> {
         let user_id = user_id.trim();
         let content = content.trim();
         if user_id.is_empty() || content.is_empty() {
@@ -283,16 +298,21 @@ impl TaskStore {
         self.conn
             .execute(
                 r#"
-                INSERT INTO user_memories (id, user_id, content, created_at, updated_at)
-                VALUES (?1, ?2, ?3, ?4, ?5)
+                INSERT INTO user_memories (id, user_id, content, memory_type, status, priority, last_used_at, use_count, created_at, updated_at)
+                VALUES (?1, ?2, ?3, ?4, 'active', ?5, NULL, 0, ?6, ?7)
                 "#,
-                params![id, user_id, content, now.clone(), now.clone()],
+                params![id, user_id, content, memory_type, priority, now.clone(), now.clone()],
             )
             .context("写入 user_memory 失败")?;
         Ok(UserMemoryRecord {
             id,
             user_id: user_id.to_string(),
             content: content.to_string(),
+            memory_type: memory_type.to_string(),
+            status: "active".to_string(),
+            priority,
+            last_used_at: None,
+            use_count: 0,
             created_at: now.clone(),
             updated_at: now,
         })
@@ -304,10 +324,10 @@ impl TaskStore {
             .conn
             .prepare(
                 r#"
-                SELECT id, user_id, content, created_at, updated_at
+                SELECT id, user_id, content, memory_type, status, priority, last_used_at, use_count, created_at, updated_at
                 FROM user_memories
-                WHERE user_id = ?1
-                ORDER BY updated_at DESC, created_at DESC
+                WHERE user_id = ?1 AND status = 'active'
+                ORDER BY priority DESC, COALESCE(last_used_at, updated_at) DESC, use_count DESC
                 LIMIT ?2
                 "#,
             )
@@ -318,8 +338,13 @@ impl TaskStore {
                     id: row.get(0)?,
                     user_id: row.get(1)?,
                     content: row.get(2)?,
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
+                    memory_type: row.get(3)?,
+                    status: row.get(4)?,
+                    priority: row.get(5)?,
+                    last_used_at: row.get(6)?,
+                    use_count: row.get(7)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
                 })
             })
             .context("查询 user_memory 失败")?;
@@ -334,12 +359,107 @@ impl TaskStore {
         let count: i64 = self
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM user_memories WHERE user_id = ?1 AND content = ?2",
+                "SELECT COUNT(*) FROM user_memories WHERE user_id = ?1 AND content = ?2 AND status = 'active'",
                 params![user_id, content],
                 |row| row.get(0),
             )
             .context("查询 user_memory 去重失败")?;
         Ok(count > 0)
+    }
+
+    /// 按 budget 检索 active 记忆（优先级 + 时间衰减 + 去重 + 预算裁剪）
+    pub fn search_user_memories(
+        &self,
+        user_id: &str,
+        max_items: usize,
+        max_total_chars: usize,
+        max_single_chars: usize,
+    ) -> Result<Vec<UserMemoryRecord>> {
+        let limit = i64::try_from(max_items * 3).context("memory limit 超出范围")?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+                SELECT id, user_id, content, memory_type, status, priority, last_used_at, use_count, created_at, updated_at
+                FROM user_memories
+                WHERE user_id = ?1 AND status = 'active'
+                ORDER BY priority DESC, COALESCE(last_used_at, updated_at) DESC, use_count DESC
+                LIMIT ?2
+                "#,
+            )
+            .context("准备 user_memory 检索失败")?;
+        let rows = stmt
+            .query_map(params![user_id, limit], |row| {
+                Ok(UserMemoryRecord {
+                    id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    content: row.get(2)?,
+                    memory_type: row.get(3)?,
+                    status: row.get(4)?,
+                    priority: row.get(5)?,
+                    last_used_at: row.get(6)?,
+                    use_count: row.get(7)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            })
+            .context("检索 user_memory 失败")?;
+
+        let mut seen_normalized = HashSet::new();
+        let mut results = Vec::new();
+        let mut total_chars = 0;
+
+        for row in rows {
+            let mem = row.context("读取 user_memory 失败")?;
+            // 规范化去重：trim + 多空格压缩
+            let normalized: String = mem.content.split_whitespace().collect::<Vec<_>>().join(" ");
+            if seen_normalized.contains(&normalized) {
+                continue;
+            }
+            // 单条超长跳过
+            if mem.content.chars().count() > max_single_chars {
+                continue;
+            }
+            // 总预算检查
+            total_chars += mem.content.chars().count();
+            if results.len() >= max_items || total_chars > max_total_chars {
+                break;
+            }
+            seen_normalized.insert(normalized);
+            results.push(mem);
+        }
+        Ok(results)
+    }
+
+    /// 命中回写：use_count + 1, last_used_at = now
+    pub fn mark_memory_used(&self, memory_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE user_memories SET use_count = use_count + 1, last_used_at = ?1 WHERE id = ?2",
+                params![now, memory_id],
+            )
+            .context("更新 memory 命中计数失败")?;
+        Ok(())
+    }
+
+    /// 批量命中回写
+    pub fn mark_memories_used(&self, memory_ids: &[String]) -> Result<()> {
+        for id in memory_ids {
+            self.mark_memory_used(id)?;
+        }
+        Ok(())
+    }
+
+    /// 软删除：将 status 设为 'suppressed'
+    pub fn suppress_memory(&self, memory_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE user_memories SET status = 'suppressed' WHERE id = ?1",
+                params![memory_id],
+            )
+            .context("抑制 memory 失败")?;
+        Ok(())
     }
 
     pub fn record_link_submission(&mut self, original_url: &str) -> Result<LinkTaskRecord> {
@@ -936,11 +1056,16 @@ impl TaskStore {
             );
 
             CREATE TABLE IF NOT EXISTS user_memories (
-                id         TEXT PRIMARY KEY,
-                user_id    TEXT NOT NULL,
-                content    TEXT NOT NULL,
-                created_at DATETIME NOT NULL,
-                updated_at DATETIME NOT NULL
+                id          TEXT PRIMARY KEY,
+                user_id     TEXT NOT NULL,
+                content     TEXT NOT NULL,
+                memory_type TEXT NOT NULL DEFAULT 'explicit',
+                status      TEXT NOT NULL DEFAULT 'active',
+                priority    INTEGER NOT NULL DEFAULT 100,
+                last_used_at DATETIME,
+                use_count   INTEGER NOT NULL DEFAULT 0,
+                created_at  DATETIME NOT NULL,
+                updated_at  DATETIME NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_articles_normalized_url ON articles(normalized_url);
@@ -956,6 +1081,31 @@ impl TaskStore {
         ensure_column_exists(&self.conn, "tasks", "output_path", "TEXT")?;
         ensure_column_exists(&self.conn, "tasks", "snapshot_path", "TEXT")?;
         ensure_column_exists(&self.conn, "articles", "summary", "TEXT")?;
+        ensure_column_exists(
+            &self.conn,
+            "user_memories",
+            "memory_type",
+            "TEXT NOT NULL DEFAULT 'explicit'",
+        )?;
+        ensure_column_exists(
+            &self.conn,
+            "user_memories",
+            "status",
+            "TEXT NOT NULL DEFAULT 'active'",
+        )?;
+        ensure_column_exists(
+            &self.conn,
+            "user_memories",
+            "priority",
+            "INTEGER NOT NULL DEFAULT 100",
+        )?;
+        ensure_column_exists(&self.conn, "user_memories", "last_used_at", "DATETIME")?;
+        ensure_column_exists(
+            &self.conn,
+            "user_memories",
+            "use_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(())
     }
 }
@@ -1668,6 +1818,11 @@ mod tests {
                 id: created.id,
                 user_id: "user-a".to_string(),
                 content: "我更喜欢短摘要".to_string(),
+                memory_type: "explicit".to_string(),
+                status: "active".to_string(),
+                priority: 100,
+                last_used_at: None,
+                use_count: 0,
                 created_at: created.created_at,
                 updated_at: created.updated_at,
             }]
@@ -1688,6 +1843,196 @@ mod tests {
         assert!(!store
             .has_user_memory("user-a", "主题: Rust")
             .expect("查询 user_memory 去重失败"));
+    }
+
+    #[test]
+    fn user_memory_schema_has_new_fields() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let created = store
+            .add_user_memory("user-a", "显式记忆")
+            .expect("写入 user_memory 失败");
+        assert_eq!(created.memory_type, "explicit");
+        assert_eq!(created.status, "active");
+        assert_eq!(created.priority, 100);
+        assert!(created.last_used_at.is_none());
+        assert_eq!(created.use_count, 0);
+    }
+
+    #[test]
+    fn user_memory_typed_auto() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let created = store
+            .add_user_memory_typed("user-a", "自动提炼主题", "auto", 60)
+            .expect("写入 auto memory 失败");
+        assert_eq!(created.memory_type, "auto");
+        assert_eq!(created.priority, 60);
+    }
+
+    #[test]
+    fn user_memory_migration_adds_columns() {
+        // 模拟老库：手动建只有旧字段的表，然后重新 open 触发 migration
+        let db_path = temp_db_path();
+        {
+            let conn = Connection::open(&db_path).expect("打开数据库失败");
+            conn.execute(
+                "CREATE TABLE user_memories (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, content TEXT NOT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)",
+                [],
+            ).expect("建旧表失败");
+            conn.execute(
+                "INSERT INTO user_memories (id, user_id, content, created_at, updated_at) VALUES ('m1', 'user-x', '旧数据', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                [],
+            ).expect("插入旧数据失败");
+        }
+        // 重新 open 触发 migration
+        let store = TaskStore::open(&db_path).expect("migration 后打开失败");
+        let memories = store.list_user_memories("user-x", 10).expect("查询失败");
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].memory_type, "explicit"); // DEFAULT 值
+        assert_eq!(memories[0].status, "active");
+        assert_eq!(memories[0].priority, 100);
+        assert_eq!(memories[0].use_count, 0);
+    }
+
+    #[test]
+    fn search_memories_sorts_by_priority_and_dedupes() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        // auto 记忆优先级低
+        store
+            .add_user_memory_typed("user-a", "自动偏好", "auto", 60)
+            .expect("写入 auto 失败");
+        // explicit 记忆优先级高
+        store
+            .add_user_memory("user-a", "显式偏好")
+            .expect("写入 explicit 失败");
+        // 重复内容（多空格版本，split_whitespace 后与"显式偏好"不同，但与"显式 偏好"相同）
+        store
+            .add_user_memory("user-a", "显式  偏好")
+            .expect("写入重复失败");
+        // 真正的重复内容（只有空格差异）
+        store
+            .add_user_memory("user-a", "显式 偏好")
+            .expect("写入真重复失败");
+
+        let results = store
+            .search_user_memories("user-a", 5, 500, 160)
+            .expect("检索失败");
+        // "显式  偏好"和"显式 偏好"规范化后都是"显式 偏好"，去重后只保留一条
+        // 总共 3 条：显式偏好(explicit), 显式  偏好(explicit), 自动偏好(auto)
+        // 其中"显式  偏好"和"显式 偏好"去重后只保留先命中的"显式  偏好"
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].memory_type, "explicit");
+    }
+
+    #[test]
+    fn search_memories_respects_budget() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        store
+            .add_user_memory("user-a", "短记忆一")
+            .expect("写入失败");
+        store
+            .add_user_memory("user-a", "短记忆二")
+            .expect("写入失败");
+        store
+            .add_user_memory("user-a", "短记忆三")
+            .expect("写入失败");
+
+        // max_items=2，只返回 2 条
+        let results = store
+            .search_user_memories("user-a", 2, 500, 160)
+            .expect("检索失败");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn search_memories_skips_long_single_item() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let long_content: String = "很".repeat(200);
+        store
+            .add_user_memory("user-a", &long_content)
+            .expect("写入失败");
+        store.add_user_memory("user-a", "短记忆").expect("写入失败");
+
+        // max_single_chars=160，长记忆被跳过
+        let results = store
+            .search_user_memories("user-a", 5, 500, 160)
+            .expect("检索失败");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "短记忆");
+    }
+
+    #[test]
+    fn mark_memory_used_updates_count_and_time() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let created = store
+            .add_user_memory("user-a", "测试命中")
+            .expect("写入失败");
+        assert_eq!(created.use_count, 0);
+        assert!(created.last_used_at.is_none());
+
+        store.mark_memory_used(&created.id).expect("命中回写失败");
+
+        let memories = store.list_user_memories("user-a", 10).expect("查询失败");
+        assert_eq!(memories[0].use_count, 1);
+        assert!(memories[0].last_used_at.is_some());
+    }
+
+    #[test]
+    fn suppress_memory_excludes_from_results() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let created = store
+            .add_user_memory("user-a", "将被抑制")
+            .expect("写入失败");
+        store.suppress_memory(&created.id).expect("抑制失败");
+
+        // list 只返回 active
+        let listed = store.list_user_memories("user-a", 10).expect("查询失败");
+        assert!(listed.is_empty());
+
+        // search 也排除 suppressed
+        let searched = store
+            .search_user_memories("user-a", 5, 500, 160)
+            .expect("检索失败");
+        assert!(searched.is_empty());
+
+        // has_user_memory 也排除 suppressed
+        assert!(!store
+            .has_user_memory("user-a", "将被抑制")
+            .expect("查询失败"));
+    }
+
+    #[test]
+    fn user_memory_isolation() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        store
+            .add_user_memory("user-a", "A 的记忆")
+            .expect("写入失败");
+        store
+            .add_user_memory("user-b", "B 的记忆")
+            .expect("写入失败");
+
+        let a_memories = store.list_user_memories("user-a", 10).expect("查询失败");
+        assert_eq!(a_memories.len(), 1);
+        assert_eq!(a_memories[0].content, "A 的记忆");
+
+        let b_memories = store.list_user_memories("user-b", 10).expect("查询失败");
+        assert_eq!(b_memories.len(), 1);
+        assert_eq!(b_memories[0].content, "B 的记忆");
     }
 
     #[test]

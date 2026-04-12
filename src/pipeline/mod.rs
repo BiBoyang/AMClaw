@@ -1408,10 +1408,9 @@ mod tests {
         detect_wechat_redirect, extract_html_title, extract_http_archive_body,
         extract_primary_body, generate_rule_summary, is_navigation_like,
         should_disable_http_redirects, should_prefer_browser_capture,
-        should_reject_http_redirect_target,
-        validate_browser_capture_paths, validate_fetched_html, BrowserCaptureRequest,
-        BrowserCaptureResponse, BrowserCaptureResult, HttpFetchResult, Pipeline,
-        PipelineFailureKind,
+        should_reject_http_redirect_target, validate_browser_capture_paths, validate_fetched_html,
+        BrowserCaptureRequest, BrowserCaptureResponse, BrowserCaptureResult, HttpFetchResult,
+        Pipeline, PipelineFailureKind,
     };
     use crate::task_store::{PendingTaskRecord, TaskContentRecord};
     use serde_json::{json, Value};

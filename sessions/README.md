@@ -11,3 +11,4 @@
 
 - `SESSION-TEMPLATE.md`：每日 session 模板（复制后改名为当日日期）。
 - `SESSION-2026-04-12.md`：HTTP 规则摘要、五分类 page_kind、summary 落库与 reporter 接入等改动记录。
+- `SESSION-2026-04-13.md`：T1-T5 复核、微信日报路径脱敏、README 同步与收尾校验。

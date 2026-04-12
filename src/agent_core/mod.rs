@@ -390,6 +390,13 @@ struct BusinessContextSnapshot {
     user_memories: Vec<UserMemoryRecord>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct MemoryStats {
+    hit_count: usize,
+    total_chars: usize,
+    ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum PlanningPolicy {
     Reactive,
@@ -551,7 +558,17 @@ impl ContextAssembler {
                 sections.push(String::new());
                 sections.push("## User Memories".to_string());
                 for memory in &business_context.user_memories {
-                    sections.push(format!("- {}", memory.content));
+                    let type_tag = if memory.memory_type == "explicit" {
+                        "[explicit]"
+                    } else {
+                        "[auto]"
+                    };
+                    sections.push(format!(
+                        "- {} (priority={}) {}",
+                        type_tag,
+                        memory.priority,
+                        sanitize_for_prompt(&memory.content)
+                    ));
                 }
             }
         }
@@ -900,9 +917,9 @@ impl AgentCore {
         step: usize,
         trace: &mut AgentRunTrace,
     ) -> Result<PlannedDecision> {
-        let business_context =
+        let (business_context, memory_stats) =
             match load_business_context_snapshot(self.task_store_db_path.as_deref(), trace) {
-                Ok(snapshot) => snapshot,
+                Ok(result) => result,
                 Err(err) => {
                     log_agent_warn(
                         "agent_context_snapshot_failed",
@@ -912,9 +929,14 @@ impl AgentCore {
                             ("detail", json!(err.to_string())),
                         ],
                     );
-                    None
+                    (None, MemoryStats::default())
                 }
             };
+        if step == 0 && memory_stats.hit_count > 0 {
+            trace.memory_hit_count = memory_stats.hit_count;
+            trace.memory_total_chars = memory_stats.total_chars;
+            trace.memory_ids = memory_stats.ids;
+        }
         let planner_input = ContextAssembler.assemble(
             trace,
             user_input,
@@ -1362,6 +1384,9 @@ struct AgentRunTrace {
     last_progress_note: Option<String>,
     llm_calls: Vec<LlmCallTrace>,
     tool_calls: Vec<ToolCallTrace>,
+    memory_hit_count: usize,
+    memory_total_chars: usize,
+    memory_ids: Vec<String>,
     #[serde(skip_serializing)]
     trace_dir_root: PathBuf,
 }
@@ -1471,6 +1496,8 @@ struct AgentTraceIndexEntry {
     final_output_chars: Option<usize>,
     error: Option<String>,
     llm_fallback_reason: Option<String>,
+    memory_hit_count: usize,
+    memory_total_chars: usize,
     json_file: String,
     markdown_file: String,
 }
@@ -1519,6 +1546,9 @@ impl AgentRunTrace {
             llm_calls: Vec::new(),
             tool_calls: Vec::new(),
             trace_dir_root: workspace_root.join("data").join("agent_traces"),
+            memory_hit_count: 0,
+            memory_total_chars: 0,
+            memory_ids: Vec::new(),
         }
     }
 
@@ -1930,6 +1960,8 @@ impl AgentRunTrace {
                 .llm_fallback_reason
                 .clone()
                 .map(|v| summarize_for_markdown(&v, 240)),
+            memory_hit_count: self.memory_hit_count,
+            memory_total_chars: self.memory_total_chars,
             json_file: json_path
                 .file_name()
                 .and_then(|v| v.to_str())
@@ -2018,6 +2050,8 @@ impl AgentRunTrace {
             ),
             format!("- failure_count: {}", self.controller_state.failure_count),
             format!("- ask_user_count: {}", self.controller_state.ask_user_count),
+            format!("- memory_hit_count: {}", self.memory_hit_count),
+            format!("- memory_total_chars: {}", self.memory_total_chars),
             String::new(),
             "## User Input".to_string(),
             String::new(),
@@ -2335,6 +2369,21 @@ fn truncate_for_trace(input: &str, max_chars: usize) -> String {
     text
 }
 
+/// 清理注入 prompt 的用户内容：移除控制字符，截断超长内容
+fn sanitize_for_prompt(input: &str) -> String {
+    let cleaned: String = input
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect();
+    // 单条 memory 不超过 160 字符（与 search_user_memories 预算一致）
+    if cleaned.chars().count() > 160 {
+        let truncated: String = cleaned.chars().take(157).collect();
+        format!("{truncated}...")
+    } else {
+        cleaned
+    }
+}
+
 fn summarize_for_markdown(input: &str, max_chars: usize) -> String {
     let count = input.chars().count();
     if count <= max_chars {
@@ -2490,9 +2539,9 @@ fn normalize_optional_text(input: String) -> Option<String> {
 fn load_business_context_snapshot(
     task_store_db_path: Option<&std::path::Path>,
     trace: &AgentRunTrace,
-) -> Result<Option<BusinessContextSnapshot>> {
+) -> Result<(Option<BusinessContextSnapshot>, MemoryStats)> {
     let Some(db_path) = task_store_db_path else {
-        return Ok(None);
+        return Ok((None, MemoryStats::default()));
     };
 
     let store = TaskStore::open(db_path)?;
@@ -2506,17 +2555,56 @@ fn load_business_context_snapshot(
     if let Some(current_task) = &current_task {
         recent_tasks.retain(|task| task.task_id != current_task.task_id);
     }
+    let mut memory_stats = MemoryStats::default();
     let user_memories = if let Some(user_id) = &trace.user_id {
-        store.list_user_memories(user_id, 5)?
+        match store.search_user_memories(user_id, 5, 500, 160) {
+            Ok(memories) => {
+                memory_stats.hit_count = memories.len();
+                memory_stats.total_chars = memories.iter().map(|m| m.content.chars().count()).sum();
+                memory_stats.ids = memories.iter().map(|m| m.id.clone()).collect();
+                log_agent_info(
+                    "agent_memory_retrieved",
+                    vec![
+                        ("user_id", json!(user_id)),
+                        ("memory_hit_count", json!(memory_stats.hit_count)),
+                        ("memory_total_chars", json!(memory_stats.total_chars)),
+                        ("memory_ids", json!(memory_stats.ids)),
+                    ],
+                );
+                if let Err(err) = store.mark_memories_used(&memory_stats.ids) {
+                    log_agent_warn(
+                        "agent_memory_mark_used_failed",
+                        vec![
+                            ("user_id", json!(user_id)),
+                            ("detail", json!(err.to_string())),
+                        ],
+                    );
+                }
+                memories
+            }
+            Err(err) => {
+                log_agent_warn(
+                    "agent_memory_search_failed",
+                    vec![
+                        ("user_id", json!(user_id)),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
+                Vec::new()
+            }
+        }
     } else {
         Vec::new()
     };
 
-    Ok(Some(BusinessContextSnapshot {
-        current_task,
-        recent_tasks,
-        user_memories,
-    }))
+    Ok((
+        Some(BusinessContextSnapshot {
+            current_task,
+            recent_tasks,
+            user_memories,
+        }),
+        memory_stats,
+    ))
 }
 
 fn build_context_summary(trace: &AgentRunTrace, observation: Option<&AgentObservation>) -> String {
@@ -4320,9 +4408,9 @@ mod tests {
                 .with_task_id(current.task_id.clone()),
         );
 
-        let business = load_business_context_snapshot(Some(db_path.as_path()), &trace)
-            .expect("读取业务上下文失败")
-            .expect("应存在业务上下文");
+        let (business, _) = load_business_context_snapshot(Some(db_path.as_path()), &trace)
+            .expect("读取业务上下文失败");
+        let business = business.expect("应存在业务上下文");
 
         assert_eq!(
             business
@@ -4351,9 +4439,9 @@ mod tests {
             AgentRunContext::wechat_chat("user-biz-ctx", "commit", vec![])
                 .with_task_id(current.task_id.clone()),
         );
-        let business = load_business_context_snapshot(Some(db_path.as_path()), &trace)
-            .expect("读取业务上下文失败")
-            .expect("应存在业务上下文");
+        let (business, _) = load_business_context_snapshot(Some(db_path.as_path()), &trace)
+            .expect("读取业务上下文失败");
+        let business = business.expect("应存在业务上下文");
 
         let planner_input = ContextAssembler.assemble(
             &trace,
@@ -4388,12 +4476,86 @@ mod tests {
             AgentRunContext::wechat_chat("user-memory", "commit", vec![]),
         );
 
-        let business = load_business_context_snapshot(Some(db_path.as_path()), &trace)
-            .expect("读取业务上下文失败")
-            .expect("应存在业务上下文");
+        let (business, memory_stats) =
+            load_business_context_snapshot(Some(db_path.as_path()), &trace)
+                .expect("读取业务上下文失败");
+        let business = business.expect("应存在业务上下文");
 
         assert_eq!(business.user_memories.len(), 1);
         assert_eq!(business.user_memories[0].content, "我喜欢短摘要");
+        assert_eq!(memory_stats.hit_count, 1);
+        assert_eq!(memory_stats.ids.len(), 1);
+        // 验证命中回写：use_count 应该 > 0
+        let after = store
+            .search_user_memories("user-memory", 5, 500, 160)
+            .expect("再次检索失败");
+        assert_eq!(after[0].use_count, 1);
+    }
+
+    #[test]
+    fn memory_user_isolation_prevents_cross_user_leak() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        store
+            .add_user_memory("user-a", "用户A的偏好")
+            .expect("写入 memory 失败");
+        store
+            .add_user_memory("user-b", "用户B的偏好")
+            .expect("写入 memory 失败");
+        // user-b 的 trace 不应看到 user-a 的记忆
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "帮我总结",
+            AgentRunContext::wechat_chat("user-b", "commit", vec![]),
+        );
+        let (business, memory_stats) =
+            load_business_context_snapshot(Some(db_path.as_path()), &trace)
+                .expect("读取业务上下文失败");
+        let business = business.expect("应存在业务上下文");
+        assert_eq!(business.user_memories.len(), 1);
+        assert_eq!(business.user_memories[0].content, "用户B的偏好");
+        assert_eq!(memory_stats.hit_count, 1);
+    }
+
+    #[test]
+    fn memory_budget_trimming_removes_excess() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        // 写 6 条记忆，预算 max_items=5 应只返回 5 条
+        for i in 0..6 {
+            store
+                .add_user_memory_typed("user-budget", &format!("记忆内容 {}", i), "explicit", 100)
+                .expect("写入 memory 失败");
+        }
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "帮我总结",
+            AgentRunContext::wechat_chat("user-budget", "commit", vec![]),
+        );
+        let (business, _) = load_business_context_snapshot(Some(db_path.as_path()), &trace)
+            .expect("读取业务上下文失败");
+        let business = business.expect("应存在业务上下文");
+        assert_eq!(business.user_memories.len(), 5);
+    }
+
+    #[test]
+    fn memory_no_user_id_degrades_gracefully() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        store
+            .add_user_memory("user-x", "有些记忆")
+            .expect("写入 memory 失败");
+        // 没有 user_id 的 trace（agent_demo）
+        let trace = AgentRunTrace::new(&workspace, "帮我总结", AgentRunContext::agent_demo());
+        let (business, memory_stats) =
+            load_business_context_snapshot(Some(db_path.as_path()), &trace)
+                .expect("读取业务上下文失败");
+        let business = business.expect("应存在业务上下文");
+        assert!(business.user_memories.is_empty());
+        assert_eq!(memory_stats.hit_count, 0);
     }
 
     #[test]

@@ -799,11 +799,26 @@ impl WeChatBot {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| self.reporter.current_day());
         match self.reporter.generate_for_day(&day) {
-            Ok(report) => format!(
-                "{}\nmarkdown_path: {}",
-                report.summary,
-                report.markdown_path.display()
-            ),
+            Ok(report) => {
+                // 如果 summary 太短（空任务场景），尝试补上 markdown 文件中的详细内容
+                let detailed = std::fs::read_to_string(&report.markdown_path)
+                    .ok()
+                    .map(|content| sanitize_report_markdown_for_wechat(&content));
+                if let Some(content) = detailed {
+                    // 微信单条消息限制约 4096 字符，截断到安全长度
+                    if content.chars().count() > 3800 {
+                        let truncated: String = content.chars().take(3800).collect();
+                        format!(
+                            "{truncated}\n\n...(已截断，共 {item_count} 条)",
+                            item_count = report.item_count
+                        )
+                    } else {
+                        content
+                    }
+                } else {
+                    report.summary
+                }
+            }
             Err(err) => format!("生成日报失败: {err}"),
         }
     }
@@ -1278,6 +1293,19 @@ fn is_agent_command(text: &str) -> bool {
 
 fn is_llm_auth_error(err: &str) -> bool {
     err.contains("HTTP 401") || err.contains("Authentication Fails")
+}
+
+fn sanitize_report_markdown_for_wechat(content: &str) -> String {
+    content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("- output_path:")
+                && !trimmed.starts_with("- snapshot_path:")
+                && !trimmed.starts_with("- markdown_path:")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn is_poll_timeout_error(err: &anyhow::Error) -> bool {
@@ -2144,9 +2172,11 @@ mod tests {
         let day = bot.reporter.current_day();
         let reply = bot.build_daily_report_query_reply(Some(&day));
 
-        assert!(reply.contains("日报"));
+        assert!(reply.contains("Daily Report") || reply.contains("日报"));
         assert!(reply.contains("archived_count: 1"));
-        assert!(reply.contains("markdown_path:"));
+        // 不应暴露服务器路径
+        assert!(!reply.contains("markdown_path:"));
+        assert!(!reply.contains("output_path:"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # AMClaw 当前状态
 
-更新于 2026-04-12。
+更新于 2026-04-12。v0.3.2 收口。
 
 这份文件记录的是仓库当前真实状态，不是理想化路线图。  
 它的作用是回答三件事：
@@ -53,6 +53,8 @@ AMClaw 是个人 IMAgent 项目，以微信 Bot 为入口，围绕“收消息 -
 - [x] 最小 `planner / executor / watchdog` helper 分层
 - [x] 最小 `state/controller` budget：`max_steps` / `replan_budget`
 - [x] Agent Trace 已包含运行上下文、决策、observation、failure、tool call、LLM call 与每日索引
+- [x] Memory v3：search_user_memories 接入 agent_core context 拼装（优先级排序 + 去重 + 预算裁剪 + 命中回写）
+- [x] Agent Trace 已包含 memory_hit_count / memory_total_chars 统计
 
 ### 进行中
 
@@ -186,6 +188,8 @@ AMClaw 是个人 IMAgent 项目，以微信 Bot 为入口，围绕“收消息 -
 - [x] `main` / `config` / `agent_core` 已补第一版结构化事件
 - [x] 已有最小日志契约测试，防止 payload 字段漂移
 - [x] Agent Trace 已有 JSON / Markdown / 每日 `index.jsonl` / 每日 `index.md`
+- [x] Memory 消费链路可观测：`memory_hit_count` / `memory_total_chars` / `memory_ids` 结构化日志与 Trace 记录
+- [x] Memory 回归测试覆盖：用户隔离、预算裁剪、无记忆退化、命中回写
 
 ### 进行中
 
@@ -229,33 +233,29 @@ AMClaw 是个人 IMAgent 项目，以微信 Bot 为入口，围绕“收消息 -
 
 如果继续开发，优先级建议如下：
 
-1. 先推进 `Context & Memory Minimal`（`v0.3.2`）
-2. 再继续收口系统级日志与错误语义
-3. 然后用轻量评测驱动 runtime 稳定性增强
-4. 最后再推进更完整的调度 / 多用户 / 多任务演进
+1. 继续收口系统级日志与错误语义
+2. 用轻量评测驱动 runtime 稳定性增强
+3. 再考虑异步化、`tracing` 与错误分层
+4. 最后推进更完整的调度 / 多用户 / 多任务演进
 
-## Now 阶段执行顺序（v0.3.2）
+## Now 阶段执行顺序（v0.3.2 已完成）
 
-`Now` 阶段优先项：`2 上下文工程`、`5 Memory`、`6 状态管理`、`7 错误恢复`、`9 安全边界`。  
-这些项有依赖关系，建议按以下顺序推进：
+v0.3.2 "Context & Memory Minimal" 已完成并通过 DoD 验收。执行路径：
 
-1. **先做 `6 状态管理`**
-   - 先定 memory/context 所需状态字段、生命周期与优先级规则；
-   - 没有状态契约，后续 context/memory 会频繁返工。
-2. **再做 `2 上下文工程`**
-   - 建统一 `context snapshot` 入口；
-   - 所有 planner/executor 注入从同一入口出，便于测试与裁剪。
-3. **然后做 `5 Memory 设计`**
-   - 在统一入口上接入 memory 检索（显式优先、`top_k`、去重、预算裁剪）。
-4. **接着做 `7 错误恢复与反馈闭环`**
-   - 检索失败、注入失败、超限裁剪都必须可回退，不阻断主链路；
-   - 补齐可观测日志字段（命中数、注入长度、来源）。
-5. **`9 安全与权限边界` 贯穿全程并作为阶段门禁**
-   - 开发期间持续收紧输入/注入边界；
-   - 阶段收口前做一次系统化安全检查（工具调用、路径边界、越权风险）。
+1. **✅ `6 状态管理`** — `user_memories` schema 补字段 + 自动迁移
+2. **✅ `2 上下文工程`** — `load_business_context_snapshot` 统一入口
+3. **✅ `5 Memory 设计`** — `search_user_memories` 接入 + 预算裁剪 + 命中回写
+4. **✅ `7 错误恢复与反馈闭环`** — 检索/注入失败可回退，不阻断主链路
+5. **`9 安全与权限边界` 贯穿全程** — 阶段收口前需做一次系统化安全检查
 
 ## 最近已落地的关键改动
 
+- `user_memories` schema 补齐 5 字段（memory_type / status / priority / last_used_at / use_count）+ 自动迁移
+- `search_user_memories`：优先级排序 + 时间衰减 + 去重 + 预算裁剪，替代旧 `list_user_memories`
+- `mark_memories_used` / `suppress_memory`：命中回写 + 软删除
+- agent_core context 拼装接入 `search_user_memories`，带 `memory_type` / `priority` 标注入 prompt
+- Agent Trace 新增 `memory_hit_count` / `memory_total_chars` 统计与 index 记录
+- 回归测试覆盖：用户隔离、预算裁剪、无记忆退化、命中回写验证
 - 普通 HTTP 网页归档已开始尝试最小正文抽取，并向任务状态透出真实 `page_kind` / `content_source`
 - Agent runtime 已从“单一 loop”继续演进到最小 `planner / executor / watchdog / controller` helper 结构
 - `current_step_index`、richer `expected_observation`、`stalled_trajectory` 与 `replan_budget` 已落地

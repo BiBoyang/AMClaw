@@ -3,6 +3,21 @@ use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use thiserror::Error;
+
+/// tool_registry 模块的错误类型
+#[derive(Debug, Error)]
+#[allow(dead_code)]
+pub enum ToolError {
+    #[error("路径越界，禁止访问工作区外路径: {0}")]
+    PathTraversal(String),
+    #[error("文件路径不能为空")]
+    EmptyPath,
+    #[error("文件已存在: {0}")]
+    FileExists(String),
+    #[error("{0}")]
+    Io(#[source] std::io::Error),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolAction {
@@ -106,7 +121,7 @@ impl ToolRegistry {
     fn create_file(&self, raw_path: &str, content: &str) -> Result<ToolResult> {
         let path = self.resolve_path(raw_path)?;
         if path.exists() {
-            bail!("文件已存在: {}", path.display());
+            return Err(ToolError::FileExists(path.display().to_string()).into());
         }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -189,16 +204,16 @@ impl ToolRegistry {
             .clone()
             .filter(|value| !value.trim().is_empty())
             .context("任务尚未生成归档 output_path")?;
-        let resolved_path = if Path::new(&output_path).is_absolute() {
-            PathBuf::from(&output_path)
-        } else {
-            self.workspace_root.join(&output_path)
-        };
+        // 安全：归档路径必须落在 workspace 内
+        let resolved_path = self.resolve_path(&output_path)?;
         let content = fs::read_to_string(&resolved_path)
             .with_context(|| format!("读取归档文件失败: {}", resolved_path.display()))?;
+        let relative_path = resolved_path
+            .strip_prefix(&self.workspace_root)
+            .unwrap_or(&resolved_path);
         let payload = json!({
             "task_id": task_id,
-            "output_path": resolved_path.display().to_string(),
+            "output_path": relative_path.display().to_string(),
             "content_chars": content.chars().count(),
             "content": content,
         });
@@ -218,7 +233,7 @@ impl ToolRegistry {
     fn resolve_path(&self, raw_path: &str) -> Result<PathBuf> {
         let raw_path = raw_path.trim();
         if raw_path.is_empty() {
-            bail!("文件路径不能为空");
+            return Err(ToolError::EmptyPath.into());
         }
 
         let joined = if Path::new(raw_path).is_absolute() {
@@ -230,7 +245,7 @@ impl ToolRegistry {
         let normalized = normalize_absolute(joined)?;
         // 路径必须落在 workspace_root 内，阻断 ../../ 越界访问
         if !normalized.starts_with(&self.workspace_root) {
-            bail!("路径越界，禁止访问工作区外路径: {}", normalized.display());
+            return Err(ToolError::PathTraversal(normalized.display().to_string()).into());
         }
         Ok(normalized)
     }
@@ -342,6 +357,40 @@ mod tests {
                 path: "../../etc/hosts".to_string(),
             })
             .expect_err("应当禁止越界路径");
+
+        assert!(err.to_string().contains("路径越界"));
+    }
+
+    #[test]
+    fn deny_archive_path_outside_workspace() {
+        let root = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        let record = store
+            .record_link_submission("https://example.com/escape")
+            .expect("写入任务失败");
+        // 注入一个指向 workspace 外的 output_path
+        store
+            .mark_task_archived(
+                &record.task_id,
+                crate::task_store::MarkTaskArchivedInput {
+                    output_path: "/etc/passwd",
+                    title: None,
+                    page_kind: None,
+                    snapshot_path: None,
+                    content_source: None,
+                    summary: None,
+                },
+            )
+            .expect("更新状态失败");
+        let registry = ToolRegistry::with_task_store_db_path(root, Some(db_path))
+            .expect("初始化 registry 失败");
+
+        let err = registry
+            .execute(ToolAction::ReadArticleArchive {
+                task_id: record.task_id,
+            })
+            .expect_err("应当禁止越界归档路径");
 
         assert!(err.to_string().contains("路径越界"));
     }

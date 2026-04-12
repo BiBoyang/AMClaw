@@ -6,7 +6,24 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use thiserror::Error;
 use uuid::Uuid;
+
+/// task_store 模块的错误类型
+#[derive(Debug, Error)]
+#[allow(dead_code)]
+pub enum TaskStoreError {
+    #[error("无效 URL: {0}")]
+    InvalidUrl(String),
+    #[error("不支持内网/本地地址: {0}")]
+    PrivateNetworkUrl(String),
+    #[error("仅支持 http/https URL: {0}")]
+    UnsupportedScheme(String),
+    #[error("{0}")]
+    Validation(String),
+    #[error("数据库错误: {0}")]
+    Database(#[from] rusqlite::Error),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkTaskRecord {
@@ -1167,9 +1184,15 @@ fn summarize_text_for_log(input: &str, max_chars: usize) -> String {
 }
 
 fn normalize_url(input: &str) -> Result<String> {
-    let mut url = Url::parse(input).with_context(|| format!("无效 URL: {input}"))?;
+    let mut url = Url::parse(input).map_err(|_| TaskStoreError::InvalidUrl(input.to_string()))?;
     if !matches!(url.scheme(), "http" | "https") {
-        bail!("仅支持 http/https URL: {input}");
+        return Err(TaskStoreError::UnsupportedScheme(input.to_string()).into());
+    }
+    // 安全：拒绝内网/本地地址，防止 SSRF
+    if let Some(host) = url.host_str() {
+        if is_private_host(host) {
+            return Err(TaskStoreError::PrivateNetworkUrl(input.to_string()).into());
+        }
     }
     url.set_fragment(None);
     strip_tracking_query_pairs(&mut url);
@@ -1178,6 +1201,45 @@ fn normalize_url(input: &str) -> Result<String> {
         normalized.pop();
     }
     Ok(normalized)
+}
+
+/// 检查 host 是否属于私有/本地地址
+fn is_private_host(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost"
+        || lower == "0.0.0.0"
+        || lower == "::1"
+        || lower.ends_with(".local")
+        || lower.ends_with(".internal")
+    {
+        return true;
+    }
+    // IPv4 私有网段
+    let octets: Vec<&str> = lower.split('.').collect();
+    if octets.len() == 4 {
+        if let Ok(first) = octets[0].parse::<u8>() {
+            match first {
+                10 => return true,  // 10.0.0.0/8
+                127 => return true, // 127.0.0.0/8
+                172 => {
+                    if let Ok(second) = octets[1].parse::<u8>() {
+                        if (16..=31).contains(&second) {
+                            return true; // 172.16.0.0/12
+                        }
+                    }
+                }
+                192 => {
+                    if let Ok(second) = octets[1].parse::<u8>() {
+                        if second == 168 {
+                            return true; // 192.168.0.0/16
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 fn strip_tracking_query_pairs(url: &mut Url) {
@@ -1412,6 +1474,35 @@ mod tests {
         assert_eq!(first.normalized_url, "https://example.com/page?id=42");
         assert_eq!(second.normalized_url, "https://example.com/page?id=42");
         assert!(!second.created_new);
+    }
+
+    #[test]
+    fn private_network_urls_are_rejected() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        let private_urls = vec![
+            "http://127.0.0.1/secret",
+            "http://localhost/admin",
+            "http://192.168.1.1/router",
+            "http://10.0.0.1/internal",
+            "http://172.16.0.1/corp",
+            "http://172.31.255.255/corp",
+        ];
+        for url in private_urls {
+            let err = store
+                .record_link_submission(url)
+                .expect_err(&format!("应拒绝内网 URL: {url}"));
+            assert!(
+                err.to_string().contains("内网"),
+                "错误信息应包含'内网': {} => {}",
+                url,
+                err
+            );
+        }
+        // 公网 URL 应正常通过
+        store
+            .record_link_submission("https://example.com/public")
+            .expect("公网 URL 应正常通过");
     }
 
     #[test]

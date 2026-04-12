@@ -7,6 +7,7 @@
 - `runtime-evolution/`：Agent runtime 方案演进与阶段记录（`AGENT-RUNTIME-01~04`）。
 - `retros/`：阶段复盘记录（如 sprint retro）。
 - `constraints/`：实验中的约束与规则记录。
+- `context-memory/`：`Context & Memory` 设计与状态管理相关纪要。
 
 ## 说明
 

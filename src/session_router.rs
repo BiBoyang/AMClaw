@@ -86,6 +86,7 @@ impl SessionRouter {
             | RouteIntent::ManualContentSubmission { .. }
             | RouteIntent::ManualTasksQuery
             | RouteIntent::UserMemoryWrite { .. }
+            | RouteIntent::UserMemorySuppress { .. }
             | RouteIntent::UserMemoriesQuery
             | RouteIntent::DailyReportQuery { .. }
             | RouteIntent::TaskStatusQuery { .. }

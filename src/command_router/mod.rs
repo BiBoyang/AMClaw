@@ -7,6 +7,7 @@ pub enum RouteIntent {
     ManualTasksQuery,
     RecentTasksQuery,
     UserMemoryWrite { content: String },
+    UserMemorySuppress { memory_id: String },
     UserMemoriesQuery,
     DailyReportQuery { day: Option<String> },
     TaskStatusQuery { task_id: String },
@@ -37,6 +38,10 @@ pub fn route_text(input: &str) -> RouteIntent {
 
     if is_user_memories_query(text) {
         return RouteIntent::UserMemoriesQuery;
+    }
+
+    if let Some(memory_id) = parse_user_memory_suppress(text) {
+        return RouteIntent::UserMemorySuppress { memory_id };
     }
 
     if let Some(content) = parse_user_memory_write(text) {
@@ -148,6 +153,18 @@ fn is_recent_tasks_query(input: &str) -> bool {
 
 fn is_user_memories_query(input: &str) -> bool {
     matches!(input, "我的记忆" | "我的偏好" | "memories" | "my memories")
+}
+
+fn parse_user_memory_suppress(input: &str) -> Option<String> {
+    let rest = input
+        .strip_prefix("忘记 ")
+        .or_else(|| input.strip_prefix("屏蔽记忆 "))
+        .or_else(|| input.strip_prefix("forget "))?;
+    let memory_id = rest.trim();
+    if memory_id.is_empty() {
+        return None;
+    }
+    Some(memory_id.to_string())
 }
 
 fn is_manual_tasks_query(input: &str) -> bool {
@@ -327,6 +344,28 @@ mod tests {
             route_text("记住 我更喜欢短摘要"),
             RouteIntent::UserMemoryWrite {
                 content: "我更喜欢短摘要".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn user_memory_suppress_commands_are_supported() {
+        assert_eq!(
+            route_text("忘记 abc-123"),
+            RouteIntent::UserMemorySuppress {
+                memory_id: "abc-123".to_string()
+            }
+        );
+        assert_eq!(
+            route_text("屏蔽记忆 abc-123"),
+            RouteIntent::UserMemorySuppress {
+                memory_id: "abc-123".to_string()
+            }
+        );
+        assert_eq!(
+            route_text("forget abc-123"),
+            RouteIntent::UserMemorySuppress {
+                memory_id: "abc-123".to_string()
             }
         );
     }

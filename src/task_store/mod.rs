@@ -469,13 +469,17 @@ impl TaskStore {
     }
 
     /// 软删除：将 status 设为 'suppressed'
-    pub fn suppress_memory(&self, memory_id: &str) -> Result<()> {
-        self.conn
+    pub fn suppress_memory(&self, user_id: &str, memory_id: &str) -> Result<()> {
+        let affected = self
+            .conn
             .execute(
-                "UPDATE user_memories SET status = 'suppressed' WHERE id = ?1",
-                params![memory_id],
+                "UPDATE user_memories SET status = 'suppressed' WHERE id = ?1 AND user_id = ?2 AND status = 'active'",
+                params![memory_id, user_id],
             )
             .context("抑制 memory 失败")?;
+        if affected == 0 {
+            bail!("未找到该记忆，或无权屏蔽: {memory_id}");
+        }
         Ok(())
     }
 
@@ -2166,7 +2170,9 @@ mod tests {
         let created = store
             .add_user_memory("user-a", "将被抑制")
             .expect("写入失败");
-        store.suppress_memory(&created.id).expect("抑制失败");
+        store
+            .suppress_memory("user-a", &created.id)
+            .expect("抑制失败");
 
         // list 只返回 active
         let listed = store.list_user_memories("user-a", 10).expect("查询失败");
@@ -2203,6 +2209,36 @@ mod tests {
         let b_memories = store.list_user_memories("user-b", 10).expect("查询失败");
         assert_eq!(b_memories.len(), 1);
         assert_eq!(b_memories[0].content, "B 的记忆");
+    }
+
+    #[test]
+    fn suppress_memory_rejects_other_users_memory() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let created = store
+            .add_user_memory("user-a", "A 的私有记忆")
+            .expect("写入失败");
+
+        let err = store
+            .suppress_memory("user-b", &created.id)
+            .expect_err("跨用户屏蔽应失败");
+        assert!(err.to_string().contains("未找到该记忆"));
+
+        let listed = store.list_user_memories("user-a", 10).expect("查询失败");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, created.id);
+    }
+
+    #[test]
+    fn suppress_memory_rejects_unknown_id() {
+        let db_path = temp_db_path();
+        let store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let err = store
+            .suppress_memory("user-a", "missing-memory-id")
+            .expect_err("不存在的 memory id 应失败");
+        assert!(err.to_string().contains("未找到该记忆"));
     }
 
     #[test]

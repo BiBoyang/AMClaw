@@ -278,7 +278,7 @@ impl Pipeline {
             Policy::none()
         } else {
             Policy::custom(|attempt| {
-                if should_reject_http_redirect_target(attempt.url().as_str()) {
+                if should_reject_http_redirect_target(attempt.url().as_str()).is_some() {
                     return attempt.stop();
                 }
                 if attempt.previous().len() >= 10 {
@@ -319,27 +319,39 @@ impl Pipeline {
         let final_url = response.url().to_string();
         let status = response.status();
         if status.is_redirection() {
-            if let Some(location) = response
+            let location = response
                 .headers()
                 .get(LOCATION)
                 .and_then(|v| v.to_str().ok())
-            {
-                detect_wechat_redirect(location)?;
-            }
+                .unwrap_or("");
+            detect_wechat_redirect(location)?;
+            let (error_kind, error_msg) =
+                if let Some(ssrf_kind) = should_reject_http_redirect_target(location) {
+                    (
+                        ssrf_kind.to_string(),
+                        format!(
+                            "安全拦截: redirect 指向私有/本地地址 (status={} target={})",
+                            status.as_u16(),
+                            location
+                        ),
+                    )
+                } else {
+                    (
+                        "http_redirect_rejected".to_string(),
+                        format!("抓取页面失败: HTTP {} {}", status.as_u16(), url),
+                    )
+                };
             log_pipeline_error(
                 "http_fetch_failed",
                 vec![
                     ("source", json!("http")),
                     ("url", json!(url)),
                     ("status", json!(status.as_u16())),
-                    ("error_kind", json!("http_redirect_rejected")),
+                    ("error_kind", json!(error_kind)),
+                    ("redirect_target", json!(location)),
                 ],
             );
-            return Err(PipelineTaskError::failed(format!(
-                "抓取页面失败: HTTP {} {}",
-                status.as_u16(),
-                url
-            )));
+            return Err(PipelineTaskError::failed(error_msg));
         }
         if !status.is_success() {
             log_pipeline_error(
@@ -1306,8 +1318,12 @@ fn should_disable_http_redirects(url: &str) -> bool {
     is_wechat_mp_url(url)
 }
 
-fn should_reject_http_redirect_target(url: &str) -> bool {
-    crate::task_store::is_private_url(url)
+fn should_reject_http_redirect_target(url: &str) -> Option<&str> {
+    if crate::task_store::is_private_url(url) {
+        Some("ssrf_redirect_private_target")
+    } else {
+        None
+    }
 }
 
 fn validate_browser_capture_paths(
@@ -1585,14 +1601,19 @@ mod tests {
 
     #[test]
     fn http_redirect_to_private_target_is_rejected() {
-        assert!(should_reject_http_redirect_target(
-            "http://169.254.169.254/latest/meta-data/"
-        ));
-        assert!(should_reject_http_redirect_target("http://127.0.0.1/admin"));
-        assert!(should_reject_http_redirect_target("http://[::1]/secret"));
-        assert!(!should_reject_http_redirect_target(
-            "https://example.com/article"
-        ));
+        let result = should_reject_http_redirect_target("http://169.254.169.254/latest/meta-data/");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "ssrf_redirect_private_target");
+
+        let result = should_reject_http_redirect_target("http://127.0.0.1/admin");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "ssrf_redirect_private_target");
+
+        let result = should_reject_http_redirect_target("http://[::1]/secret");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "ssrf_redirect_private_target");
+
+        assert!(should_reject_http_redirect_target("https://example.com/article").is_none());
     }
 
     #[test]

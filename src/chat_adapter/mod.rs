@@ -562,6 +562,9 @@ impl WeChatBot {
             command_router::RouteIntent::UserMemoryWrite { content } => {
                 self.handle_user_memory_write(from_user_id, &content);
             }
+            command_router::RouteIntent::UserMemorySuppress { memory_id } => {
+                self.handle_user_memory_suppress(from_user_id, &memory_id);
+            }
             command_router::RouteIntent::DailyReportQuery { day } => {
                 self.handle_daily_report_query(from_user_id, day.as_deref());
             }
@@ -780,6 +783,14 @@ impl WeChatBot {
         let reply = match self.task_store.add_user_memory(user_id, content) {
             Ok(_) => format!("已记住\n- {}", content.trim()),
             Err(err) => format!("写入记忆失败: {err}"),
+        };
+        self.send_reply_text(user_id, &reply);
+    }
+
+    fn handle_user_memory_suppress(&self, user_id: &str, memory_id: &str) {
+        let reply = match self.task_store.suppress_memory(user_id, memory_id) {
+            Ok(()) => format!("已屏蔽记忆: {memory_id}"),
+            Err(err) => format!("屏蔽记忆失败: {err}"),
         };
         self.send_reply_text(user_id, &reply);
     }
@@ -1450,7 +1461,7 @@ fn build_user_memories_reply(memories: &[crate::task_store::UserMemoryRecord]) -
 
     let mut lines = vec!["我的记忆:".to_string()];
     for memory in memories {
-        lines.push(format!("- {}", memory.content));
+        lines.push(format!("- id: {} | {}", memory.id, memory.content));
     }
     lines.join("\n")
 }
@@ -2249,6 +2260,85 @@ mod tests {
         let reply = super::build_user_memories_reply(&memories);
         assert!(reply.contains("我的记忆"));
         assert!(reply.contains("我喜欢短摘要"));
+        assert!(reply.contains("id:"));
+        assert!(reply.contains(&memories[0].id));
+    }
+
+    #[test]
+    fn user_memory_suppress_command_removes_from_list() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+        bot.context_token_map
+            .insert("user-a".to_string(), "ctx-1".to_string());
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "记住 将被遗忘的记忆".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-suppress-1".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let memories = bot
+            .task_store
+            .list_user_memories("user-a", 10)
+            .expect("查询失败");
+        assert_eq!(memories.len(), 1);
+        let memory_id = memories[0].id.clone();
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: format!("忘记 {memory_id}"),
+            message_id: Some(super::FlexibleId::Str("msg-suppress-2".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let memories_after = bot
+            .task_store
+            .list_user_memories("user-a", 10)
+            .expect("查询失败");
+        assert!(memories_after.is_empty());
+    }
+
+    #[test]
+    fn user_memory_suppress_command_cannot_remove_other_users_memory() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+        bot.context_token_map
+            .insert("user-a".to_string(), "ctx-1".to_string());
+        bot.context_token_map
+            .insert("user-b".to_string(), "ctx-2".to_string());
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "记住 仅 user-a 可屏蔽".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-suppress-cross-1".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let memories = bot
+            .task_store
+            .list_user_memories("user-a", 10)
+            .expect("查询失败");
+        assert_eq!(memories.len(), 1);
+        let memory_id = memories[0].id.clone();
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-b".to_string(),
+            text: format!("忘记 {memory_id}"),
+            message_id: Some(super::FlexibleId::Str("msg-suppress-cross-2".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let memories_after = bot
+            .task_store
+            .list_user_memories("user-a", 10)
+            .expect("查询失败");
+        assert_eq!(memories_after.len(), 1);
+        assert_eq!(memories_after[0].id, memory_id);
     }
 
     #[test]

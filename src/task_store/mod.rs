@@ -119,6 +119,9 @@ pub struct UserMemoryRecord {
     pub priority: i64,
     pub last_used_at: Option<String>,
     pub use_count: i64,
+    pub retrieved_count: i64,
+    pub injected_count: i64,
+    pub useful: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -217,6 +220,72 @@ impl MemoryWriteState {
             } => self.skipped.push((content_preview, reason)),
             WriteDecision::Promoted { id, reason } => self.promoted.push((id, reason)),
         }
+    }
+}
+
+/// Feedback 事件类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackKind {
+    /// 从 DB 中被检索出来
+    Retrieved,
+    /// 被注入到 prompt
+    Injected,
+    /// 被确认有用
+    Useful,
+}
+
+/// 单次 run 的 feedback 状态（只记录，不直接改 store）
+#[derive(Debug, Clone, Default)]
+pub struct MemoryFeedbackState {
+    /// memory_id → (retrieved 次数, injected 次数, useful 次数)
+    feedback: std::collections::HashMap<String, (usize, usize, usize)>,
+}
+
+impl MemoryFeedbackState {
+    pub fn record(&mut self, memory_id: &str, kind: FeedbackKind) {
+        let entry = self
+            .feedback
+            .entry(memory_id.to_string())
+            .or_insert((0, 0, 0));
+        match kind {
+            FeedbackKind::Retrieved => entry.0 += 1,
+            FeedbackKind::Injected => entry.1 += 1,
+            FeedbackKind::Useful => entry.2 += 1,
+        }
+    }
+
+    /// 所有产生 feedback 的 memory ID 列表
+    pub fn memory_ids(&self) -> Vec<String> {
+        self.feedback.keys().cloned().collect()
+    }
+
+    /// 检索次数
+    pub fn retrieved_count(&self, memory_id: &str) -> usize {
+        self.feedback
+            .get(memory_id)
+            .map(|(r, _, _)| *r)
+            .unwrap_or(0)
+    }
+
+    /// 注入次数
+    pub fn injected_count(&self, memory_id: &str) -> usize {
+        self.feedback
+            .get(memory_id)
+            .map(|(_, i, _)| *i)
+            .unwrap_or(0)
+    }
+
+    /// 有用次数
+    pub fn useful_count(&self, memory_id: &str) -> usize {
+        self.feedback
+            .get(memory_id)
+            .map(|(_, _, u)| *u)
+            .unwrap_or(0)
+    }
+
+    /// 是否有任何 feedback
+    pub fn has_feedback(&self) -> bool {
+        !self.feedback.is_empty()
     }
 }
 
@@ -420,8 +489,8 @@ impl TaskStore {
         self.conn
             .execute(
                 r#"
-                INSERT INTO user_memories (id, user_id, content, memory_type, status, priority, last_used_at, use_count, created_at, updated_at)
-                VALUES (?1, ?2, ?3, ?4, 'active', ?5, NULL, 0, ?6, ?7)
+                INSERT INTO user_memories (id, user_id, content, memory_type, status, priority, last_used_at, use_count, retrieved_count, injected_count, useful, created_at, updated_at)
+                VALUES (?1, ?2, ?3, ?4, 'active', ?5, NULL, 0, 0, 0, 0, ?6, ?7)
                 "#,
                 params![id, user_id, content, memory_type, priority, now.clone(), now.clone()],
             )
@@ -435,6 +504,9 @@ impl TaskStore {
             priority,
             last_used_at: None,
             use_count: 0,
+            retrieved_count: 0,
+            injected_count: 0,
+            useful: false,
             created_at: now.clone(),
             updated_at: now,
         })
@@ -594,10 +666,10 @@ impl TaskStore {
             .conn
             .prepare(
                 r#"
-                SELECT id, user_id, content, memory_type, status, priority, last_used_at, use_count, created_at, updated_at
+                SELECT id, user_id, content, memory_type, status, priority, last_used_at, use_count, retrieved_count, injected_count, useful, created_at, updated_at
                 FROM user_memories
                 WHERE user_id = ?1 AND status = 'active'
-                ORDER BY priority DESC, COALESCE(last_used_at, updated_at) DESC, use_count DESC
+                ORDER BY priority DESC, useful DESC, use_count DESC, COALESCE(last_used_at, updated_at) DESC, id ASC
                 LIMIT ?2
                 "#,
             )
@@ -613,8 +685,11 @@ impl TaskStore {
                     priority: row.get(5)?,
                     last_used_at: row.get(6)?,
                     use_count: row.get(7)?,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
+                    retrieved_count: row.get(8)?,
+                    injected_count: row.get(9)?,
+                    useful: row.get::<_, i64>(10)? != 0,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
                 })
             })
             .context("查询 user_memory 失败")?;
@@ -638,6 +713,7 @@ impl TaskStore {
     }
 
     /// 检索 active 记忆（排序后返回，不含裁剪逻辑）
+    /// 排序：priority DESC > useful DESC > use_count DESC > last_used_at DESC > id ASC
     /// 裁剪（去重 + 预算）由上层 SessionState 负责
     pub fn search_user_memories(
         &self,
@@ -649,10 +725,10 @@ impl TaskStore {
             .conn
             .prepare(
                 r#"
-                SELECT id, user_id, content, memory_type, status, priority, last_used_at, use_count, created_at, updated_at
+                SELECT id, user_id, content, memory_type, status, priority, last_used_at, use_count, retrieved_count, injected_count, useful, created_at, updated_at
                 FROM user_memories
                 WHERE user_id = ?1 AND status = 'active'
-                ORDER BY priority DESC, COALESCE(last_used_at, updated_at) DESC, use_count DESC
+                ORDER BY priority DESC, useful DESC, use_count DESC, COALESCE(last_used_at, updated_at) DESC, id ASC
                 LIMIT ?2
                 "#,
             )
@@ -668,8 +744,11 @@ impl TaskStore {
                     priority: row.get(5)?,
                     last_used_at: row.get(6)?,
                     use_count: row.get(7)?,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
+                    retrieved_count: row.get(8)?,
+                    injected_count: row.get(9)?,
+                    useful: row.get::<_, i64>(10)? != 0,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
                 })
             })
             .context("检索 user_memory 失败")?;
@@ -697,6 +776,41 @@ impl TaskStore {
     pub fn mark_memories_used(&self, memory_ids: &[String]) -> Result<()> {
         for id in memory_ids {
             self.mark_memory_used(id)?;
+        }
+        Ok(())
+    }
+
+    /// 统一 feedback 写回入口
+    ///
+    /// 将 MemoryFeedbackState 中记录的 feedback 一次性写回长期字段：
+    /// - Retrieved: retrieved_count += N
+    /// - Injected: injected_count += N
+    /// - Useful: use_count += N, useful = 1, last_used_at = now
+    pub fn apply_memory_feedback(&self, feedback_state: &MemoryFeedbackState) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        for memory_id in feedback_state.memory_ids() {
+            let retrieved = feedback_state.retrieved_count(&memory_id);
+            let injected = feedback_state.injected_count(&memory_id);
+            let useful = feedback_state.useful_count(&memory_id);
+
+            if retrieved > 0 {
+                self.conn.execute(
+                    "UPDATE user_memories SET retrieved_count = retrieved_count + ?1 WHERE id = ?2",
+                    params![retrieved as i64, memory_id],
+                ).context("更新 retrieved_count 失败")?;
+            }
+            if injected > 0 {
+                self.conn.execute(
+                    "UPDATE user_memories SET injected_count = injected_count + ?1 WHERE id = ?2",
+                    params![injected as i64, memory_id],
+                ).context("更新 injected_count 失败")?;
+            }
+            if useful > 0 {
+                self.conn.execute(
+                    "UPDATE user_memories SET use_count = use_count + ?1, useful = 1, last_used_at = ?2 WHERE id = ?3",
+                    params![useful as i64, now.clone(), memory_id],
+                ).context("更新 useful/use_count 失败")?;
+            }
         }
         Ok(())
     }
@@ -1360,6 +1474,24 @@ impl TaskStore {
             "use_count",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        ensure_column_exists(
+            &self.conn,
+            "user_memories",
+            "retrieved_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column_exists(
+            &self.conn,
+            "user_memories",
+            "injected_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column_exists(
+            &self.conn,
+            "user_memories",
+            "useful",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(())
     }
 }
@@ -1563,9 +1695,10 @@ fn source_domain(normalized_url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_task_store_log_payload, ArchivedTaskRecord, LinkTaskRecord, MarkTaskArchivedInput,
-        MemoryWriteState, PendingTaskRecord, PromoteReason, RecentTaskRecord, SkipReason,
-        StoredSessionRecord, TaskStatusRecord, TaskStore, UserMemoryRecord, WriteDecision,
+        build_task_store_log_payload, ArchivedTaskRecord, FeedbackKind, LinkTaskRecord,
+        MarkTaskArchivedInput, MemoryFeedbackState, MemoryWriteState, PendingTaskRecord,
+        PromoteReason, RecentTaskRecord, SkipReason, StoredSessionRecord, TaskStatusRecord,
+        TaskStore, UserMemoryRecord, WriteDecision,
     };
     use rusqlite::Connection;
     use serde_json::{json, Value};
@@ -2230,6 +2363,9 @@ mod tests {
                 priority: 100,
                 last_used_at: None,
                 use_count: 0,
+                retrieved_count: 0,
+                injected_count: 0,
+                useful: false,
                 created_at: created.created_at,
                 updated_at: created.updated_at,
             }]
@@ -2721,5 +2857,202 @@ mod tests {
         // 各自独立
         assert_eq!(ws_a.written_count(), 1);
         assert_eq!(ws_b.written_count(), 1);
+    }
+
+    // ——— Phase 4: Memory Feedback 测试 ———
+
+    #[test]
+    fn feedback_retrieved_updates_retrieved_count() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        let mut ws = MemoryWriteState::default();
+        let decision = store.govern_memory_write("user-a", "测试记忆", "explicit", 100, &mut ws);
+        let memory_id = match decision {
+            WriteDecision::Written(r) => r.id,
+            _ => panic!("应写入"),
+        };
+        let mut fb = MemoryFeedbackState::default();
+        fb.record(&memory_id, FeedbackKind::Retrieved);
+        store.apply_memory_feedback(&fb).expect("feedback 写回失败");
+        let memories = store.list_user_memories("user-a", 10).expect("查询失败");
+        assert_eq!(memories[0].retrieved_count, 1);
+    }
+
+    #[test]
+    fn feedback_injected_updates_injected_count() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        let mut ws = MemoryWriteState::default();
+        let decision = store.govern_memory_write("user-a", "测试记忆", "explicit", 100, &mut ws);
+        let memory_id = match decision {
+            WriteDecision::Written(r) => r.id,
+            _ => panic!("应写入"),
+        };
+        let mut fb = MemoryFeedbackState::default();
+        fb.record(&memory_id, FeedbackKind::Injected);
+        store.apply_memory_feedback(&fb).expect("feedback 写回失败");
+        let memories = store.list_user_memories("user-a", 10).expect("查询失败");
+        assert_eq!(memories[0].injected_count, 1);
+    }
+
+    #[test]
+    fn feedback_useful_updates_use_count_and_useful_and_last_used_at() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        let mut ws = MemoryWriteState::default();
+        let decision = store.govern_memory_write("user-a", "测试记忆", "explicit", 100, &mut ws);
+        let memory_id = match decision {
+            WriteDecision::Written(r) => r.id,
+            _ => panic!("应写入"),
+        };
+        assert!(store.list_user_memories("user-a", 10).expect("查询失败")[0]
+            .last_used_at
+            .is_none());
+        let mut fb = MemoryFeedbackState::default();
+        fb.record(&memory_id, FeedbackKind::Useful);
+        store.apply_memory_feedback(&fb).expect("feedback 写回失败");
+        let mem = &store.list_user_memories("user-a", 10).expect("查询失败")[0];
+        assert_eq!(mem.use_count, 1);
+        assert!(mem.useful);
+        assert!(mem.last_used_at.is_some());
+    }
+
+    #[test]
+    fn explicit_still_sorts_before_auto() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        // auto with high use_count
+        let mut ws = MemoryWriteState::default();
+        let auto_id = match store.govern_memory_write("user-a", "主题: Rust", "auto", 60, &mut ws)
+        {
+            WriteDecision::Written(r) => r.id,
+            _ => panic!("应写入"),
+        };
+        // 给 auto 大量 feedback
+        let mut fb = MemoryFeedbackState::default();
+        for _ in 0..10 {
+            fb.record(&auto_id, FeedbackKind::Useful);
+        }
+        store.apply_memory_feedback(&fb).expect("feedback 失败");
+        // 写入 explicit
+        let mut ws2 = MemoryWriteState::default();
+        let _ = store.govern_memory_write("user-a", "显式偏好", "explicit", 100, &mut ws2);
+        let results = store.search_user_memories("user-a", 15).expect("检索失败");
+        // explicit 仍然排第一
+        assert_eq!(results[0].memory_type, "explicit");
+        assert_eq!(results[0].priority, 100);
+        assert_eq!(results[1].memory_type, "auto");
+    }
+
+    #[test]
+    fn useful_auto_sorts_before_non_useful_auto() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        let mut ws = MemoryWriteState::default();
+        let useful_id = match store.govern_memory_write("user-a", "主题: Rust", "auto", 60, &mut ws)
+        {
+            WriteDecision::Written(r) => r.id,
+            _ => panic!("应写入"),
+        };
+        let mut ws2 = MemoryWriteState::default();
+        let _ = store.govern_memory_write("user-a", "主题: Python", "auto", 60, &mut ws2);
+        // 给第一个 useful feedback
+        let mut fb = MemoryFeedbackState::default();
+        fb.record(&useful_id, FeedbackKind::Useful);
+        store.apply_memory_feedback(&fb).expect("feedback 失败");
+        let results = store.search_user_memories("user-a", 15).expect("检索失败");
+        assert!(results[0].useful);
+        assert!(!results[1].useful);
+        assert_eq!(results[0].content, "主题: Rust");
+    }
+
+    #[test]
+    fn higher_use_count_sorts_first() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        let mut ws1 = MemoryWriteState::default();
+        let id_high = match store.govern_memory_write("user-a", "主题: Rust", "auto", 60, &mut ws1)
+        {
+            WriteDecision::Written(r) => r.id,
+            _ => panic!("应写入"),
+        };
+        let mut ws2 = MemoryWriteState::default();
+        let _ = store.govern_memory_write("user-a", "主题: Go", "auto", 60, &mut ws2);
+        // 给 Rust 5 次 useful
+        let mut fb = MemoryFeedbackState::default();
+        for _ in 0..5 {
+            fb.record(&id_high, FeedbackKind::Useful);
+        }
+        store.apply_memory_feedback(&fb).expect("feedback 失败");
+        let results = store.search_user_memories("user-a", 15).expect("检索失败");
+        assert_eq!(results[0].content, "主题: Rust");
+        assert!(results[0].use_count > results[1].use_count);
+    }
+
+    #[test]
+    fn last_used_at_affects_sorting() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        let mut ws1 = MemoryWriteState::default();
+        let id_old = match store.govern_memory_write("user-a", "旧记忆", "auto", 60, &mut ws1) {
+            WriteDecision::Written(r) => r.id,
+            _ => panic!("应写入"),
+        };
+        let mut ws2 = MemoryWriteState::default();
+        let id_new = match store.govern_memory_write("user-a", "新记忆", "auto", 60, &mut ws2) {
+            WriteDecision::Written(r) => r.id,
+            _ => panic!("应写入"),
+        };
+        // 只给"新记忆" useful feedback → 更新 last_used_at
+        let mut fb = MemoryFeedbackState::default();
+        fb.record(&id_new, FeedbackKind::Useful);
+        store.apply_memory_feedback(&fb).expect("feedback 失败");
+        let results = store.search_user_memories("user-a", 15).expect("检索失败");
+        // 新记忆（useful=true, use_count=1）排在旧记忆（useful=false）前面
+        assert_eq!(results[0].content, "新记忆");
+        // 旧记忆没有 last_used_at
+        assert!(store
+            .list_user_memories("user-a", 10)
+            .expect("查询失败")
+            .iter()
+            .find(|m| m.id == id_old)
+            .unwrap()
+            .last_used_at
+            .is_none());
+    }
+
+    #[test]
+    fn sorting_is_deterministic() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        // 写 5 条相同 type/priority 的 auto 记忆
+        for i in 0..5 {
+            let mut ws = MemoryWriteState::default();
+            let _ =
+                store.govern_memory_write("user-a", &format!("记忆 {}", i), "auto", 60, &mut ws);
+        }
+        // 多次检索，结果必须一致
+        let r1 = store.search_user_memories("user-a", 15).expect("检索失败");
+        let r2 = store.search_user_memories("user-a", 15).expect("检索失败");
+        assert_eq!(r1.len(), r2.len());
+        for (a, b) in r1.iter().zip(r2.iter()) {
+            assert_eq!(a.id, b.id);
+        }
+    }
+
+    #[test]
+    fn feedback_state_is_single_source() {
+        // 验证 feedback 统计来自 MemoryFeedbackState，不各自重复计算
+        let mut fb = MemoryFeedbackState::default();
+        fb.record("m1", FeedbackKind::Retrieved);
+        fb.record("m1", FeedbackKind::Injected);
+        fb.record("m1", FeedbackKind::Useful);
+        fb.record("m2", FeedbackKind::Retrieved);
+        assert_eq!(fb.retrieved_count("m1"), 1);
+        assert_eq!(fb.injected_count("m1"), 1);
+        assert_eq!(fb.useful_count("m1"), 1);
+        assert_eq!(fb.retrieved_count("m2"), 1);
+        assert_eq!(fb.injected_count("m2"), 0);
+        assert_eq!(fb.has_feedback(), true);
     }
 }

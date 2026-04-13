@@ -123,6 +123,106 @@ pub struct UserMemoryRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// 内容为空或仅 whitespace
+    Empty,
+    /// 内容超过单条长度限制
+    TooLong,
+    /// 自动记忆置信度不足
+    TooWeak,
+    /// 与已有记忆规范化后重复
+    Duplicate,
+    /// auto 记忆与已有 explicit 冲突，不允许降级
+    AutoWouldDowngradeExplicit,
+    /// user_id 或内容格式无效
+    Invalid,
+    /// 存储写入失败
+    StorageError,
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "empty_content"),
+            Self::TooLong => write!(f, "too_long"),
+            Self::TooWeak => write!(f, "too_weak"),
+            Self::Duplicate => write!(f, "duplicate"),
+            Self::AutoWouldDowngradeExplicit => write!(f, "auto_would_downgrade_explicit"),
+            Self::Invalid => write!(f, "invalid"),
+            Self::StorageError => write!(f, "storage_error"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromoteReason {
+    /// 新 explicit 提升了已有 auto 记忆
+    ExplicitPromotesAuto,
+}
+
+impl std::fmt::Display for PromoteReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExplicitPromotesAuto => write!(f, "explicit_promotes_auto"),
+        }
+    }
+}
+
+/// 写入决策结果
+#[derive(Debug, Clone)]
+pub enum WriteDecision {
+    /// 新写入成功
+    Written(UserMemoryRecord),
+    /// 跳过写入
+    Skipped {
+        content_preview: String,
+        reason: SkipReason,
+    },
+    /// 提升已有 auto 为 explicit（更新已有记录的 type 和 priority）
+    Promoted { id: String, reason: PromoteReason },
+}
+
+/// 单次 run 的写侧状态
+#[derive(Debug, Clone, Default)]
+pub struct MemoryWriteState {
+    /// 候选数量
+    pub candidate_count: usize,
+    /// 写入成功
+    pub written: Vec<UserMemoryRecord>,
+    /// 被跳过
+    pub skipped: Vec<(String, SkipReason)>,
+    /// 被提升
+    pub promoted: Vec<(String, PromoteReason)>,
+}
+
+impl MemoryWriteState {
+    pub fn written_count(&self) -> usize {
+        self.written.len()
+    }
+    pub fn skipped_count(&self) -> usize {
+        self.skipped.len()
+    }
+    pub fn promoted_count(&self) -> usize {
+        self.promoted.len()
+    }
+
+    /// 记录一次写入决策
+    fn record(&mut self, decision: WriteDecision) {
+        match decision {
+            WriteDecision::Written(record) => self.written.push(record),
+            WriteDecision::Skipped {
+                content_preview,
+                reason,
+            } => self.skipped.push((content_preview, reason)),
+            WriteDecision::Promoted { id, reason } => self.promoted.push((id, reason)),
+        }
+    }
+}
+
+/// 最大单条内容长度（写入时校验）
+const MAX_MEMORY_WRITE_CHARS: usize = 500;
+
 #[derive(Debug)]
 pub struct TaskStore {
     conn: Connection,
@@ -338,6 +438,154 @@ impl TaskStore {
             created_at: now.clone(),
             updated_at: now,
         })
+    }
+
+    /// 统一写入治理入口
+    ///
+    /// 执行：validate → dedup → promote/skip → persist
+    /// 返回 WriteDecision，调用方不直接决定是否写入。
+    pub fn govern_memory_write(
+        &mut self,
+        user_id: &str,
+        content: &str,
+        memory_type: &str,
+        priority: i64,
+        write_state: &mut MemoryWriteState,
+    ) -> WriteDecision {
+        write_state.candidate_count += 1;
+        let content = content.trim();
+        let content_preview = if content.chars().count() > 20 {
+            let truncated: String = content.chars().take(20).collect();
+            format!("{}...", truncated)
+        } else {
+            content.to_string()
+        };
+
+        // 1. Validate: 空/whitespace
+        if content.is_empty() {
+            let decision = WriteDecision::Skipped {
+                content_preview,
+                reason: SkipReason::Empty,
+            };
+            write_state.record(decision.clone());
+            return decision;
+        }
+
+        // 2. Validate: 超长
+        if content.chars().count() > MAX_MEMORY_WRITE_CHARS {
+            let decision = WriteDecision::Skipped {
+                content_preview,
+                reason: SkipReason::TooLong,
+            };
+            write_state.record(decision.clone());
+            return decision;
+        }
+
+        // 3. Validate: user_id
+        if user_id.trim().is_empty() {
+            let decision = WriteDecision::Skipped {
+                content_preview,
+                reason: SkipReason::Invalid,
+            };
+            write_state.record(decision.clone());
+            return decision;
+        }
+
+        // 4. Dedup: 检查已有记忆（normalize 后比较）
+        let normalized: String = content.split_whitespace().collect::<Vec<_>>().join(" ");
+        let existing = self.search_user_memories(user_id, 50);
+
+        match existing {
+            Ok(memories) => {
+                for mem in &memories {
+                    let existing_normalized: String =
+                        mem.content.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if existing_normalized != normalized {
+                        continue;
+                    }
+                    // normalize 后相同
+                    if memory_type == "auto" && mem.memory_type == "explicit" {
+                        // auto 不允许降级 explicit
+                        let decision = WriteDecision::Skipped {
+                            content_preview,
+                            reason: SkipReason::AutoWouldDowngradeExplicit,
+                        };
+                        write_state.record(decision.clone());
+                        return decision;
+                    }
+                    if memory_type == "explicit" && mem.memory_type == "auto" {
+                        // explicit 提升 auto
+                        if let Err(e) = self.promote_memory_to_explicit(&mem.id) {
+                            let decision = WriteDecision::Skipped {
+                                content_preview,
+                                reason: SkipReason::StorageError,
+                            };
+                            write_state.record(decision.clone());
+                            log_task_store_warn(
+                                "memory_promote_failed",
+                                vec![
+                                    ("error_kind", json!("promote_failed")),
+                                    ("detail", json!(e.to_string())),
+                                ],
+                            );
+                            return decision;
+                        }
+                        let decision = WriteDecision::Promoted {
+                            id: mem.id.clone(),
+                            reason: PromoteReason::ExplicitPromotesAuto,
+                        };
+                        write_state.record(decision.clone());
+                        return decision;
+                    }
+                    // 同类型重复
+                    let decision = WriteDecision::Skipped {
+                        content_preview,
+                        reason: SkipReason::Duplicate,
+                    };
+                    write_state.record(decision.clone());
+                    return decision;
+                }
+            }
+            Err(err) => {
+                log_task_store_warn(
+                    "memory_govern_dedup_lookup_failed",
+                    vec![
+                        ("error_kind", json!("dedup_lookup_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
+                // 查询失败时 conservative：允许写入
+            }
+        }
+
+        // 5. 新写入
+        match self.add_user_memory_typed(user_id, content, memory_type, priority) {
+            Ok(record) => {
+                let decision = WriteDecision::Written(record);
+                write_state.record(decision.clone());
+                decision
+            }
+            Err(_) => {
+                let decision = WriteDecision::Skipped {
+                    content_preview,
+                    reason: SkipReason::StorageError,
+                };
+                write_state.record(decision.clone());
+                decision
+            }
+        }
+    }
+
+    /// 将已有 auto 记忆提升为 explicit（更新 type + priority）
+    fn promote_memory_to_explicit(&self, memory_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE user_memories SET memory_type = 'explicit', priority = 100, updated_at = ?1 WHERE id = ?2",
+                params![now, memory_id],
+            )
+            .context("提升 memory 为 explicit 失败")?;
+        Ok(())
     }
 
     pub fn list_user_memories(&self, user_id: &str, limit: usize) -> Result<Vec<UserMemoryRecord>> {
@@ -1316,8 +1564,8 @@ fn source_domain(normalized_url: &str) -> Option<String> {
 mod tests {
     use super::{
         build_task_store_log_payload, ArchivedTaskRecord, LinkTaskRecord, MarkTaskArchivedInput,
-        PendingTaskRecord, RecentTaskRecord, StoredSessionRecord, TaskStatusRecord, TaskStore,
-        UserMemoryRecord,
+        MemoryWriteState, PendingTaskRecord, PromoteReason, RecentTaskRecord, SkipReason,
+        StoredSessionRecord, TaskStatusRecord, TaskStore, UserMemoryRecord, WriteDecision,
     };
     use rusqlite::Connection;
     use serde_json::{json, Value};
@@ -2306,5 +2554,172 @@ mod tests {
 
         let archived = store.list_archived_tasks(10).expect("查询失败");
         assert_eq!(archived[0].summary, Some("更精确的LLM摘要".to_string()));
+    }
+
+    // ——— Phase 3: Memory Write Governance 测试 ———
+
+    #[test]
+    fn govern_writes_new_explicit_memory() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        let mut ws = MemoryWriteState::default();
+        let decision =
+            store.govern_memory_write("user-a", "我喜欢短摘要", "explicit", 100, &mut ws);
+        match decision {
+            WriteDecision::Written(r) => {
+                assert_eq!(r.memory_type, "explicit");
+                assert_eq!(r.priority, 100);
+            }
+            _ => panic!("应写入: {:?}", decision),
+        }
+        assert_eq!(ws.written_count(), 1);
+        assert_eq!(ws.skipped_count(), 0);
+        assert_eq!(ws.candidate_count, 1);
+    }
+
+    #[test]
+    fn govern_writes_new_auto_memory() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        let mut ws = MemoryWriteState::default();
+        let decision = store.govern_memory_write("user-a", "偏好: 短摘要", "auto", 60, &mut ws);
+        match decision {
+            WriteDecision::Written(r) => {
+                assert_eq!(r.memory_type, "auto");
+                assert_eq!(r.priority, 60);
+            }
+            _ => panic!("应写入: {:?}", decision),
+        }
+    }
+
+    #[test]
+    fn govern_skips_empty_content() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        let mut ws = MemoryWriteState::default();
+        let decision = store.govern_memory_write("user-a", "   ", "explicit", 100, &mut ws);
+        match decision {
+            WriteDecision::Skipped {
+                reason: SkipReason::Empty,
+                ..
+            } => {}
+            _ => panic!("应跳过空内容: {:?}", decision),
+        }
+        assert_eq!(ws.skipped_count(), 1);
+    }
+
+    #[test]
+    fn govern_skips_too_long_content() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        let long: String = "很".repeat(501);
+        let mut ws = MemoryWriteState::default();
+        let decision = store.govern_memory_write("user-a", &long, "explicit", 100, &mut ws);
+        match decision {
+            WriteDecision::Skipped {
+                reason: SkipReason::TooLong,
+                ..
+            } => {}
+            _ => panic!("应跳过超长: {:?}", decision),
+        }
+    }
+
+    #[test]
+    fn govern_skips_duplicate_same_type() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        let mut ws1 = MemoryWriteState::default();
+        let _ = store.govern_memory_write("user-a", "偏好: 短摘要", "auto", 60, &mut ws1);
+        let mut ws2 = MemoryWriteState::default();
+        let decision = store.govern_memory_write("user-a", "偏好: 短摘要", "auto", 60, &mut ws2);
+        match decision {
+            WriteDecision::Skipped {
+                reason: SkipReason::Duplicate,
+                ..
+            } => {}
+            _ => panic!("应跳过重复: {:?}", decision),
+        }
+    }
+
+    #[test]
+    fn govern_auto_does_not_downgrade_explicit() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        // 先写 explicit
+        let mut ws1 = MemoryWriteState::default();
+        let _ = store.govern_memory_write("user-a", "偏好: 短摘要", "explicit", 100, &mut ws1);
+        // 再尝试 auto 同内容
+        let mut ws2 = MemoryWriteState::default();
+        let decision = store.govern_memory_write("user-a", "偏好: 短摘要", "auto", 60, &mut ws2);
+        match decision {
+            WriteDecision::Skipped {
+                reason: SkipReason::AutoWouldDowngradeExplicit,
+                ..
+            } => {}
+            _ => panic!("auto 不应降级 explicit: {:?}", decision),
+        }
+        // 验证原有 explicit 未被改变
+        let memories = store.list_user_memories("user-a", 10).expect("查询失败");
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].memory_type, "explicit");
+    }
+
+    #[test]
+    fn govern_explicit_promotes_auto() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        // 先写 auto
+        let mut ws1 = MemoryWriteState::default();
+        let _ = store.govern_memory_write("user-a", "偏好: 短摘要", "auto", 60, &mut ws1);
+        // 再写 explicit 同内容
+        let mut ws2 = MemoryWriteState::default();
+        let decision =
+            store.govern_memory_write("user-a", "偏好: 短摘要", "explicit", 100, &mut ws2);
+        match decision {
+            WriteDecision::Promoted {
+                reason: PromoteReason::ExplicitPromotesAuto,
+                ..
+            } => {}
+            _ => panic!("explicit 应提升 auto: {:?}", decision),
+        }
+        // 验证已提升
+        let memories = store.list_user_memories("user-a", 10).expect("查询失败");
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].memory_type, "explicit");
+        assert_eq!(memories[0].priority, 100);
+    }
+
+    #[test]
+    fn govern_write_state_counters_accurate() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        let mut ws = MemoryWriteState::default();
+
+        // 3 个候选
+        let _ = store.govern_memory_write("user-a", "记忆一", "explicit", 100, &mut ws);
+        let _ = store.govern_memory_write("user-a", "", "explicit", 100, &mut ws); // empty → skip
+        let _ = store.govern_memory_write("user-a", "记忆一", "auto", 60, &mut ws); // dup → skip
+
+        assert_eq!(ws.candidate_count, 3);
+        assert_eq!(ws.written_count(), 1);
+        assert_eq!(ws.skipped_count(), 2);
+    }
+
+    #[test]
+    fn govern_write_state_no_cross_user_leak() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        let mut ws_a = MemoryWriteState::default();
+        let _ = store.govern_memory_write("user-a", "偏好: 红", "auto", 60, &mut ws_a);
+        // user-b 的相同内容不应受 user-a 影响
+        let mut ws_b = MemoryWriteState::default();
+        let decision = store.govern_memory_write("user-b", "偏好: 红", "auto", 60, &mut ws_b);
+        match decision {
+            WriteDecision::Written(_) => {}
+            _ => panic!("user-b 应能写入: {:?}", decision),
+        }
+        // 各自独立
+        assert_eq!(ws_a.written_count(), 1);
+        assert_eq!(ws_b.written_count(), 1);
     }
 }

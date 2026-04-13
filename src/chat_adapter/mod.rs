@@ -780,9 +780,50 @@ impl WeChatBot {
     }
 
     fn handle_user_memory_write(&mut self, user_id: &str, content: &str) {
-        let reply = match self.task_store.add_user_memory(user_id, content) {
-            Ok(_) => format!("已记住\n- {}", content.trim()),
-            Err(err) => format!("写入记忆失败: {err}"),
+        let mut write_state = crate::task_store::MemoryWriteState::default();
+        let decision = self.task_store.govern_memory_write(
+            user_id,
+            content,
+            "explicit",
+            100,
+            &mut write_state,
+        );
+        let reply = match &decision {
+            crate::task_store::WriteDecision::Written(record) => {
+                log_chat_info(
+                    "user_memory_explicit_written",
+                    vec![
+                        ("user_id", json!(user_id)),
+                        ("memory_id", json!(record.id)),
+                        (
+                            "content_preview",
+                            json!(summarize_text_for_log(content, 120)),
+                        ),
+                    ],
+                );
+                format!("已记住\n- {}", content.trim())
+            }
+            crate::task_store::WriteDecision::Skipped { reason, .. } => {
+                log_chat_info(
+                    "user_memory_explicit_skipped",
+                    vec![
+                        ("user_id", json!(user_id)),
+                        ("skip_reason", json!(reason.to_string())),
+                    ],
+                );
+                format!("未能记住: {}", reason)
+            }
+            crate::task_store::WriteDecision::Promoted { id, reason } => {
+                log_chat_info(
+                    "user_memory_explicit_promoted",
+                    vec![
+                        ("user_id", json!(user_id)),
+                        ("memory_id", json!(id)),
+                        ("promote_reason", json!(reason.to_string())),
+                    ],
+                );
+                format!("已提升已有记忆为显式记忆 (id: {})", &id[..8])
+            }
         };
         self.send_reply_text(user_id, &reply);
     }
@@ -844,44 +885,35 @@ impl WeChatBot {
         let Some(memory) = extract_auto_memory_candidate(text) else {
             return;
         };
-        match self.task_store.has_user_memory(user_id, &memory) {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(err) => {
-                log_chat_warn(
-                    "user_memory_auto_extract_failed",
+        let mut write_state = crate::task_store::MemoryWriteState::default();
+        let decision =
+            self.task_store
+                .govern_memory_write(user_id, &memory, "auto", 60, &mut write_state);
+        match &decision {
+            crate::task_store::WriteDecision::Written(_) => {
+                log_chat_info(
+                    "user_memory_auto_recorded",
                     vec![
                         ("user_id", json!(user_id)),
-                        ("error_kind", json!("user_memory_lookup_failed")),
-                        ("detail", json!(err.to_string())),
+                        (
+                            "memory_preview",
+                            json!(summarize_text_for_log(&memory, 120)),
+                        ),
                     ],
                 );
-                return;
             }
-        }
-        if let Err(err) = self
-            .task_store
-            .add_user_memory_typed(user_id, &memory, "auto", 60)
-        {
-            log_chat_warn(
-                "user_memory_auto_extract_failed",
-                vec![
-                    ("user_id", json!(user_id)),
-                    ("error_kind", json!("user_memory_store_failed")),
-                    ("detail", json!(err.to_string())),
-                ],
-            );
-        } else {
-            log_chat_info(
-                "user_memory_auto_recorded",
-                vec![
-                    ("user_id", json!(user_id)),
-                    (
-                        "memory_preview",
-                        json!(summarize_text_for_log(&memory, 120)),
-                    ),
-                ],
-            );
+            crate::task_store::WriteDecision::Skipped { reason, .. } => {
+                log_chat_info(
+                    "user_memory_auto_skipped",
+                    vec![
+                        ("user_id", json!(user_id)),
+                        ("skip_reason", json!(reason.to_string())),
+                    ],
+                );
+            }
+            crate::task_store::WriteDecision::Promoted { .. } => {
+                // auto 不会 promote（只有 explicit 能 promote auto）
+            }
         }
     }
 

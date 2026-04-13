@@ -78,9 +78,65 @@ ORDER BY priority DESC,
 | AgentRunTrace Markdown | `memory_total_chars (injected)` | 注入总字符数（标注语义） |
 | task_store 函数注释 | `use_count` | 被注入 prompt 次数 |
 | chat_adapter 日志 | `user_memory_auto_recorded` | 自动记忆写入成功事件 |
-| chat_adapter 日志 | `user_memory_auto_extract_failed` | 自动记忆写入失败事件 |
+| chat_adapter 日志 | `user_memory_auto_skipped` | 自动记忆写入跳过事件（含 skip_reason） |
+| chat_adapter 日志 | `user_memory_explicit_written` | 显式记忆写入成功 |
+| chat_adapter 日志 | `user_memory_explicit_skipped` | 显式记忆写入跳过 |
+| chat_adapter 日志 | `user_memory_explicit_promoted` | 显式记忆提升已有 auto |
 
-## 8. 后续扩展预留
+## 8. 写侧治理术语（Phase 3）
+
+### 写入管线
+
+```
+candidate → validate → dedup → promote/skip → persist → trace/log
+```
+
+### WriteDecision variants
+
+| 值 | 含义 |
+|---|---|
+| `Written(record)` | 新写入成功 |
+| `Skipped { reason }` | 跳过写入，reason 解释原因 |
+| `Promoted { id, reason }` | 提升已有记录（更新 type/priority） |
+
+### SkipReason variants
+
+| 值 | 含义 |
+|---|---|
+| `Empty` | 内容为空或仅 whitespace |
+| `TooLong` | 内容超过 500 字符 |
+| `TooWeak` | 自动记忆置信度不足（预留） |
+| `Duplicate` | 与已有同类型记忆规范化后重复 |
+| `AutoWouldDowngradeExplicit` | auto 不允许降级已有 explicit |
+| `Invalid` | user_id 或内容格式无效 |
+| `StorageError` | 持久化写入失败 |
+
+### PromoteReason variants
+
+| 值 | 含义 |
+|---|---|
+| `ExplicitPromotesAuto` | 新 explicit 提升了已有 auto 为 explicit |
+
+### 写入规则
+
+1. 空/whitespace → Skip(Empty)
+2. 超过 500 字符 → Skip(TooLong)
+3. normalize 后与已有相同：
+   - auto + 已有 explicit → Skip(AutoWouldDowngradeExplicit)
+   - explicit + 已有 auto → Promote(ExplicitPromotesAuto)
+   - 同类型 → Skip(Duplicate)
+4. 确实不同 → WriteNew
+
+### MemoryWriteState 字段
+
+| 字段 | 含义 |
+|---|---|
+| `candidate_count` | 本轮候选写入数量 |
+| `written` | 成功写入的记录列表 |
+| `skipped` | 跳过列表（content_preview + SkipReason） |
+| `promoted` | 提升列表（id + PromoteReason） |
+
+## 9. 后续扩展预留
 
 以下统计在 Phase 1 不自动判定，但语义定义预留：
 

@@ -1,6 +1,4 @@
-use crate::task_store::{
-    MemorySearchResult, RecentTaskRecord, TaskStatusRecord, TaskStore, UserMemoryRecord,
-};
+use crate::task_store::{RecentTaskRecord, TaskStatusRecord, TaskStore, UserMemoryRecord};
 use crate::tool_registry::{ToolAction, ToolRegistry};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
@@ -392,22 +390,140 @@ struct BusinessContextSnapshot {
     user_memories: Vec<UserMemoryRecord>,
 }
 
-/// Memory 注入统计（语义：检索后经预算裁剪实际注入 prompt 的记忆）
+/// Memory 预算配置
+#[derive(Debug, Clone, Copy)]
+struct MemoryBudget {
+    max_items: usize,
+    max_total_chars: usize,
+    max_single_chars: usize,
+}
+
+impl Default for MemoryBudget {
+    fn default() -> Self {
+        Self {
+            max_items: 5,
+            max_total_chars: 500,
+            max_single_chars: 160,
+        }
+    }
+}
+
+/// 被裁剪掉的记忆及其原因
+#[derive(Debug, Clone)]
+struct DroppedMemory {
+    id: String,
+    content_preview: String,
+    reason: DropReason,
+}
+
+/// 裁剪原因
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropReason {
+    /// 规范化后与更高优先级的记忆重复
+    Deduplicated,
+    /// 单条字符数超过 max_single_chars
+    SingleItemTooLong,
+    /// 总字符数或条数超过预算
+    BudgetExceeded,
+}
+
+/// 单次 agent run 的 memory 生命周期状态
 ///
-/// 语义定义：
-/// - retrieved: 从 DB 中取出的候选数量
-/// - injected: 经去重 + 单条长度 + 总预算裁剪后实际注入 prompt 的数量（即 hit_count）
-/// - useful: 真正帮助本轮决策的数量（当前不自动判定，字段预留）
+/// 设计原则：
+/// - 只管"本次请求生命周期"，不管长期存储
+/// - retrieved → injected / dropped 的完整链路
+/// - trace / log / markdown 都从这里投影，不各自维护
 #[derive(Debug, Clone, Default)]
-struct MemoryStats {
-    /// 从 DB 取出的候选记忆条数
-    retrieved_count: usize,
+struct SessionState {
+    /// 注入预算
+    budget: MemoryBudget,
+    /// 从 DB 检索出的候选记忆（已排序、未裁剪）
+    retrieved: Vec<UserMemoryRecord>,
+    /// 经裁剪后实际注入 prompt 的记忆
+    injected: Vec<UserMemoryRecord>,
+    /// 被裁剪掉的记忆及原因
+    dropped: Vec<DroppedMemory>,
+}
+
+impl SessionState {
+    /// 从检索结果构建 SessionState，执行去重 + 预算裁剪
+    ///
+    /// 裁剪逻辑（从 task_store 上移到此处）：
+    /// 1. 规范化去重（trim + 多空格压缩）
+    /// 2. 单条超长跳过
+    /// 3. 总预算检查
+    fn from_retrieved(retrieved: Vec<UserMemoryRecord>, budget: MemoryBudget) -> Self {
+        let mut seen_normalized = std::collections::HashSet::new();
+        let mut injected = Vec::new();
+        let mut dropped = Vec::new();
+        let mut total_chars = 0;
+
+        for mem in &retrieved {
+            let normalized: String = mem.content.split_whitespace().collect::<Vec<_>>().join(" ");
+            if seen_normalized.contains(&normalized) {
+                dropped.push(DroppedMemory {
+                    id: mem.id.clone(),
+                    content_preview: summarize_for_markdown(&mem.content, 40),
+                    reason: DropReason::Deduplicated,
+                });
+                continue;
+            }
+            if mem.content.chars().count() > budget.max_single_chars {
+                dropped.push(DroppedMemory {
+                    id: mem.id.clone(),
+                    content_preview: summarize_for_markdown(&mem.content, 40),
+                    reason: DropReason::SingleItemTooLong,
+                });
+                continue;
+            }
+            total_chars += mem.content.chars().count();
+            if injected.len() >= budget.max_items || total_chars > budget.max_total_chars {
+                dropped.push(DroppedMemory {
+                    id: mem.id.clone(),
+                    content_preview: summarize_for_markdown(&mem.content, 40),
+                    reason: DropReason::BudgetExceeded,
+                });
+                continue;
+            }
+            seen_normalized.insert(normalized);
+            injected.push(mem.clone());
+        }
+
+        Self {
+            budget,
+            retrieved,
+            injected,
+            dropped,
+        }
+    }
+
+    /// 检索到的候选记忆条数
+    fn retrieved_count(&self) -> usize {
+        self.retrieved.len()
+    }
+
     /// 实际注入 prompt 的记忆条数
-    hit_count: usize,
+    fn injected_count(&self) -> usize {
+        self.injected.len()
+    }
+
     /// 注入记忆的总字符数
-    total_chars: usize,
-    /// 注入记忆的 ID 列表（同时用于 mark_memories_used 回写）
-    ids: Vec<String>,
+    fn injected_total_chars(&self) -> usize {
+        self.injected
+            .iter()
+            .map(|m| m.content.chars().count())
+            .sum()
+    }
+
+    /// 注入记忆的 ID 列表（用于 mark_memories_used 回写）
+    fn injected_ids(&self) -> Vec<String> {
+        self.injected.iter().map(|m| m.id.clone()).collect()
+    }
+
+    /// 是否有任何记忆活动（检索到或注入）
+    fn has_memory_activity(&self) -> bool {
+        !self.retrieved.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -930,7 +1046,7 @@ impl AgentCore {
         step: usize,
         trace: &mut AgentRunTrace,
     ) -> Result<PlannedDecision> {
-        let (business_context, memory_stats) =
+        let (business_context, session_state) =
             match load_business_context_snapshot(self.task_store_db_path.as_deref(), trace) {
                 Ok(result) => result,
                 Err(err) => {
@@ -942,14 +1058,16 @@ impl AgentCore {
                             ("detail", json!(err.to_string())),
                         ],
                     );
-                    (None, MemoryStats::default())
+                    (None, SessionState::default())
                 }
             };
-        if step == 0 && memory_stats.hit_count > 0 {
-            trace.memory_hit_count = memory_stats.hit_count;
-            trace.memory_retrieved_count = memory_stats.retrieved_count;
-            trace.memory_total_chars = memory_stats.total_chars;
-            trace.memory_ids = memory_stats.ids;
+        // 从 SessionState 投影到 trace（仅在 step 0 写入，后续 step 不重复）
+        if step == 0 && session_state.has_memory_activity() {
+            trace.memory_hit_count = session_state.injected_count();
+            trace.memory_retrieved_count = session_state.retrieved_count();
+            trace.memory_total_chars = session_state.injected_total_chars();
+            trace.memory_dropped_count = session_state.dropped.len();
+            trace.memory_ids = session_state.injected_ids();
         }
         let planner_input = ContextAssembler.assemble(
             trace,
@@ -1401,6 +1519,7 @@ struct AgentRunTrace {
     memory_hit_count: usize,       // 实际注入 prompt 的记忆条数
     memory_retrieved_count: usize, // 从 DB 取出的候选记忆条数
     memory_total_chars: usize,     // 注入记忆的总字符数
+    memory_dropped_count: usize,   // 被裁剪掉的记忆条数
     memory_ids: Vec<String>,       // 注入记忆的 ID 列表
     #[serde(skip_serializing)]
     trace_dir_root: PathBuf,
@@ -1514,6 +1633,7 @@ struct AgentTraceIndexEntry {
     memory_hit_count: usize,
     memory_retrieved_count: usize,
     memory_total_chars: usize,
+    memory_dropped_count: usize,
     json_file: String,
     markdown_file: String,
 }
@@ -1565,6 +1685,7 @@ impl AgentRunTrace {
             memory_hit_count: 0,
             memory_retrieved_count: 0,
             memory_total_chars: 0,
+            memory_dropped_count: 0,
             memory_ids: Vec::new(),
         }
     }
@@ -1980,6 +2101,7 @@ impl AgentRunTrace {
             memory_hit_count: self.memory_hit_count,
             memory_retrieved_count: self.memory_retrieved_count,
             memory_total_chars: self.memory_total_chars,
+            memory_dropped_count: self.memory_dropped_count,
             json_file: json_path
                 .file_name()
                 .and_then(|v| v.to_str())
@@ -2070,6 +2192,7 @@ impl AgentRunTrace {
             format!("- ask_user_count: {}", self.controller_state.ask_user_count),
             format!("- memory_hit_count: {} (injected)", self.memory_hit_count),
             format!("- memory_retrieved_count: {}", self.memory_retrieved_count),
+            format!("- memory_dropped_count: {}", self.memory_dropped_count),
             format!(
                 "- memory_total_chars: {} (injected)",
                 self.memory_total_chars
@@ -2561,9 +2684,9 @@ fn normalize_optional_text(input: String) -> Option<String> {
 fn load_business_context_snapshot(
     task_store_db_path: Option<&std::path::Path>,
     trace: &AgentRunTrace,
-) -> Result<(Option<BusinessContextSnapshot>, MemoryStats)> {
+) -> Result<(Option<BusinessContextSnapshot>, SessionState)> {
     let Some(db_path) = task_store_db_path else {
-        return Ok((None, MemoryStats::default()));
+        return Ok((None, SessionState::default()));
     };
 
     let store = TaskStore::open(db_path)?;
@@ -2577,32 +2700,36 @@ fn load_business_context_snapshot(
     if let Some(current_task) = &current_task {
         recent_tasks.retain(|task| task.task_id != current_task.task_id);
     }
-    let mut memory_stats = MemoryStats::default();
+
+    let mut session_state = SessionState::default();
     let user_memories = if let Some(user_id) = &trace.user_id {
-        match store.search_user_memories(user_id, 5, 500, 160) {
-            Ok(MemorySearchResult {
-                retrieved_count,
-                memories,
-            }) => {
-                memory_stats.retrieved_count = retrieved_count;
-                memory_stats.hit_count = memories.len();
-                memory_stats.total_chars = memories.iter().map(|m| m.content.chars().count()).sum();
-                memory_stats.ids = memories.iter().map(|m| m.id.clone()).collect();
+        match store.search_user_memories(user_id, 15) {
+            Ok(retrieved) => {
+                let budget = MemoryBudget::default();
+                session_state = SessionState::from_retrieved(retrieved, budget);
+                // 日志投影
                 log_agent_info(
-                    "agent_memory_injected",
+                    "agent_memory_lifecycle",
                     vec![
                         ("user_id", json!(user_id)),
                         (
                             "memory_retrieved_count",
-                            json!(memory_stats.retrieved_count),
+                            json!(session_state.retrieved_count()),
                         ),
-                        ("memory_hit_count", json!(memory_stats.hit_count)),
-                        ("memory_total_chars", json!(memory_stats.total_chars)),
-                        ("memory_ids", json!(memory_stats.ids)),
+                        (
+                            "memory_injected_count",
+                            json!(session_state.injected_count()),
+                        ),
+                        ("memory_dropped_count", json!(session_state.dropped.len())),
+                        (
+                            "memory_total_chars",
+                            json!(session_state.injected_total_chars()),
+                        ),
+                        ("memory_ids", json!(session_state.injected_ids())),
                     ],
                 );
                 // mark_memories_used: use_count += 1 表示"被注入次数"
-                if let Err(err) = store.mark_memories_used(&memory_stats.ids) {
+                if let Err(err) = store.mark_memories_used(&session_state.injected_ids()) {
                     log_agent_warn(
                         "agent_memory_mark_used_failed",
                         vec![
@@ -2611,7 +2738,7 @@ fn load_business_context_snapshot(
                         ],
                     );
                 }
-                memories
+                session_state.injected.clone()
             }
             Err(err) => {
                 log_agent_warn(
@@ -2634,7 +2761,7 @@ fn load_business_context_snapshot(
             recent_tasks,
             user_memories,
         }),
-        memory_stats,
+        session_state,
     ))
 }
 
@@ -3494,7 +3621,7 @@ mod tests {
         detect_stalled_trajectory_failure, load_business_context_snapshot, map_llm_plan,
         parse_llm_plan, validate_expected_observation, AgentCore, AgentObservation,
         AgentRunContext, AgentRunTrace, BusinessContextSnapshot, ContextAssembler, DoneRule,
-        ExecutionPlan, ExpectedObservation, FailureAction, FailureDecision, LlmPlan,
+        DropReason, ExecutionPlan, ExpectedObservation, FailureAction, FailureDecision, LlmPlan,
         MinimumNovelty, ObservationKind, PlannedDecision, ReplanScope, StepFailureKind,
     };
     use crate::task_store::TaskStore;
@@ -4507,20 +4634,20 @@ mod tests {
             AgentRunContext::wechat_chat("user-memory", "commit", vec![]),
         );
 
-        let (business, memory_stats) =
+        let (business, session_state) =
             load_business_context_snapshot(Some(db_path.as_path()), &trace)
                 .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
 
         assert_eq!(business.user_memories.len(), 1);
         assert_eq!(business.user_memories[0].content, "我喜欢短摘要");
-        assert_eq!(memory_stats.hit_count, 1);
-        assert_eq!(memory_stats.ids.len(), 1);
+        assert_eq!(session_state.injected_count(), 1);
+        assert_eq!(session_state.injected_ids().len(), 1);
         // 验证命中回写：use_count 应该 > 0
         let after = store
-            .search_user_memories("user-memory", 5, 500, 160)
+            .search_user_memories("user-memory", 15)
             .expect("再次检索失败");
-        assert_eq!(after.memories[0].use_count, 1);
+        assert_eq!(after[0].use_count, 1);
     }
 
     #[test]
@@ -4540,13 +4667,13 @@ mod tests {
             "帮我总结",
             AgentRunContext::wechat_chat("user-b", "commit", vec![]),
         );
-        let (business, memory_stats) =
+        let (business, session_state) =
             load_business_context_snapshot(Some(db_path.as_path()), &trace)
                 .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
         assert_eq!(business.user_memories.len(), 1);
         assert_eq!(business.user_memories[0].content, "用户B的偏好");
-        assert_eq!(memory_stats.hit_count, 1);
+        assert_eq!(session_state.injected_count(), 1);
     }
 
     #[test]
@@ -4554,7 +4681,7 @@ mod tests {
         let workspace = temp_workspace();
         let db_path = temp_db_path();
         let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
-        // 写 6 条记忆，预算 max_items=5 应只返回 5 条
+        // 写 6 条记忆，预算 max_items=5 应只注入 5 条
         for i in 0..6 {
             store
                 .add_user_memory_typed("user-budget", &format!("记忆内容 {}", i), "explicit", 100)
@@ -4565,10 +4692,15 @@ mod tests {
             "帮我总结",
             AgentRunContext::wechat_chat("user-budget", "commit", vec![]),
         );
-        let (business, _) = load_business_context_snapshot(Some(db_path.as_path()), &trace)
-            .expect("读取业务上下文失败");
+        let (business, session_state) =
+            load_business_context_snapshot(Some(db_path.as_path()), &trace)
+                .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
+        // injected = 5（max_items），retrieved = 6
         assert_eq!(business.user_memories.len(), 5);
+        assert_eq!(session_state.retrieved_count(), 6);
+        assert_eq!(session_state.injected_count(), 5);
+        assert_eq!(session_state.dropped.len(), 1);
     }
 
     #[test]
@@ -4581,12 +4713,121 @@ mod tests {
             .expect("写入 memory 失败");
         // 没有 user_id 的 trace（agent_demo）
         let trace = AgentRunTrace::new(&workspace, "帮我总结", AgentRunContext::agent_demo());
-        let (business, memory_stats) =
+        let (business, session_state) =
             load_business_context_snapshot(Some(db_path.as_path()), &trace)
                 .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
         assert!(business.user_memories.is_empty());
-        assert_eq!(memory_stats.hit_count, 0);
+        assert_eq!(session_state.injected_count(), 0);
+    }
+
+    #[test]
+    fn session_state_dedup_marks_dropped() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        store
+            .add_user_memory("user-dedup", "偏好 短摘要")
+            .expect("写入失败");
+        store
+            .add_user_memory("user-dedup", "偏好  短摘要") // 多空格
+            .expect("写入失败");
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "帮我总结",
+            AgentRunContext::wechat_chat("user-dedup", "commit", vec![]),
+        );
+        let (_, session_state) = load_business_context_snapshot(Some(db_path.as_path()), &trace)
+            .expect("读取业务上下文失败");
+        // 1 injected, 1 dropped (dedup)
+        assert_eq!(session_state.injected_count(), 1);
+        assert_eq!(session_state.dropped.len(), 1);
+        assert_eq!(session_state.dropped[0].reason, DropReason::Deduplicated);
+    }
+
+    #[test]
+    fn session_state_trim_marks_budget_exceeded() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        for i in 0..7 {
+            store
+                .add_user_memory("user-trim", &format!("记忆内容 {}", i))
+                .expect("写入失败");
+        }
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "帮我总结",
+            AgentRunContext::wechat_chat("user-trim", "commit", vec![]),
+        );
+        let (_, session_state) = load_business_context_snapshot(Some(db_path.as_path()), &trace)
+            .expect("读取业务上下文失败");
+        // max_items=5, 7 条 → 5 injected, 2 dropped (budget exceeded)
+        assert_eq!(session_state.injected_count(), 5);
+        assert_eq!(session_state.dropped.len(), 2);
+        assert_eq!(session_state.dropped[0].reason, DropReason::BudgetExceeded);
+        assert_eq!(session_state.dropped[1].reason, DropReason::BudgetExceeded);
+    }
+
+    #[test]
+    fn session_state_single_item_too_long_marks_dropped() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        let long_content: String = "很".repeat(200);
+        store
+            .add_user_memory("user-long", &long_content)
+            .expect("写入失败");
+        store
+            .add_user_memory("user-long", "短记忆")
+            .expect("写入失败");
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "帮我总结",
+            AgentRunContext::wechat_chat("user-long", "commit", vec![]),
+        );
+        let (_, session_state) = load_business_context_snapshot(Some(db_path.as_path()), &trace)
+            .expect("读取业务上下文失败");
+        // 1 injected (短记忆), 1 dropped (too long)
+        assert_eq!(session_state.injected_count(), 1);
+        assert_eq!(session_state.dropped.len(), 1);
+        assert_eq!(
+            session_state.dropped[0].reason,
+            DropReason::SingleItemTooLong
+        );
+    }
+
+    #[test]
+    fn session_state_multi_turn_isolation() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        store
+            .add_user_memory("user-iso", "用户偏好")
+            .expect("写入失败");
+        // 第一轮
+        let trace1 = AgentRunTrace::new(
+            &workspace,
+            "帮我总结",
+            AgentRunContext::wechat_chat("user-iso", "commit", vec![]),
+        );
+        let (_, ss1) = load_business_context_snapshot(Some(db_path.as_path()), &trace1)
+            .expect("读取业务上下文失败");
+        // 第二轮（同一用户，不同 run）
+        let trace2 = AgentRunTrace::new(
+            &workspace,
+            "再帮我总结",
+            AgentRunContext::wechat_chat("user-iso", "commit", vec![]),
+        );
+        let (_, ss2) = load_business_context_snapshot(Some(db_path.as_path()), &trace2)
+            .expect("读取业务上下文失败");
+        // 两轮独立，互不泄漏
+        assert_eq!(ss1.injected_count(), 1);
+        assert_eq!(ss2.injected_count(), 1);
+        assert!(ss1.dropped.is_empty());
+        assert!(ss2.dropped.is_empty());
+        // SessionState 不持有可变共享状态
+        assert_ne!(ss1.injected_ids()[0], ""); // 只是验证非空
     }
 
     #[test]

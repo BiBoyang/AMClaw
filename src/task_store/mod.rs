@@ -760,26 +760,6 @@ impl TaskStore {
         Ok(results)
     }
 
-    /// 命中回写：use_count += 1（被注入 prompt 次数），last_used_at = now
-    pub fn mark_memory_used(&self, memory_id: &str) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        self.conn
-            .execute(
-                "UPDATE user_memories SET use_count = use_count + 1, last_used_at = ?1 WHERE id = ?2",
-                params![now, memory_id],
-            )
-            .context("更新 memory 命中计数失败")?;
-        Ok(())
-    }
-
-    /// 批量命中回写
-    pub fn mark_memories_used(&self, memory_ids: &[String]) -> Result<()> {
-        for id in memory_ids {
-            self.mark_memory_used(id)?;
-        }
-        Ok(())
-    }
-
     /// 统一 feedback 写回入口
     ///
     /// 将 MemoryFeedbackState 中记录的 feedback 一次性写回长期字段：
@@ -2526,24 +2506,6 @@ mod tests {
         let results = store.search_user_memories("user-a", 15).expect("检索失败");
         assert_eq!(results.len(), 2);
         // 两条都返回，trim 由 SessionState 负责
-    }
-
-    #[test]
-    fn mark_memory_used_updates_count_and_time() {
-        let db_path = temp_db_path();
-        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
-
-        let created = store
-            .add_user_memory("user-a", "测试命中")
-            .expect("写入失败");
-        assert_eq!(created.use_count, 0);
-        assert!(created.last_used_at.is_none());
-
-        store.mark_memory_used(&created.id).expect("命中回写失败");
-
-        let memories = store.list_user_memories("user-a", 10).expect("查询失败");
-        assert_eq!(memories[0].use_count, 1);
-        assert!(memories[0].last_used_at.is_some());
     }
 
     #[test]

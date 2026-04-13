@@ -20,7 +20,7 @@
 |---|---|---|
 | `retrieved` | 从 DB 中按条件取出的候选记忆 | 是（= `memory_retrieved_count`） |
 | `injected` | 经去重 + 单条长度 + 总预算裁剪后，实际注入 prompt 的记忆 | 是（= `memory_hit_count`） |
-| `useful` | 真正帮助本轮决策的记忆 | 否（不自动判定，字段预留） |
+| `useful` | 真正帮助本轮决策、被反馈确认为有用的记忆 | 部分是（有字段与写回能力，但尚无自动判定链路） |
 
 ### 当前 `memory_hit_count` 的精确含义
 
@@ -30,11 +30,11 @@
 
 ## 3. `use_count` 字段语义
 
-**`use_count` = 被注入 prompt 的次数**（方案 B）。
+**`use_count` = 被确认 useful 的次数**。
 
-- 每次 `mark_memories_used` 被调用时 `use_count += 1`。
-- 调用时机：记忆经 `search_user_memories` 检索并注入 prompt 后。
-- 它不代表"被检索次数"，也不代表"真正有用次数"。
+- 每次 `apply_memory_feedback(...)` 收到 `Useful` feedback 时 `use_count += 1`。
+- 同时会把 `useful = true`，并更新 `last_used_at`。
+- 它不代表"被检索次数"，也不代表"被注入次数"。
 
 ## 4. 记忆状态（status）
 
@@ -47,13 +47,17 @@
 
 ```sql
 ORDER BY priority DESC,
+         useful DESC,
+         use_count DESC,
          COALESCE(last_used_at, updated_at) DESC,
-         use_count DESC
+         id ASC
 ```
 
 1. 显式记忆（priority=100）优先于自动记忆（priority=60）
-2. 最近使用/更新的优先
-3. 高频使用的优先
+2. 被标记 `useful` 的优先
+3. `use_count` 更高的优先
+4. 最近 useful/更新的优先
+5. `id ASC` 作为最终稳定 tie-breaker
 
 ## 6. 注入预算
 
@@ -76,7 +80,7 @@ ORDER BY priority DESC,
 | AgentRunTrace Markdown | `memory_hit_count (injected)` | 注入条数（标注语义） |
 | AgentRunTrace Markdown | `memory_retrieved_count` | DB 取出条数 |
 | AgentRunTrace Markdown | `memory_total_chars (injected)` | 注入总字符数（标注语义） |
-| task_store 函数注释 | `use_count` | 被注入 prompt 次数 |
+| task_store 函数注释 | `use_count` | 被确认 useful 的次数 |
 | chat_adapter 日志 | `user_memory_auto_recorded` | 自动记忆写入成功事件 |
 | chat_adapter 日志 | `user_memory_auto_skipped` | 自动记忆写入跳过事件（含 skip_reason） |
 | chat_adapter 日志 | `user_memory_explicit_written` | 显式记忆写入成功 |

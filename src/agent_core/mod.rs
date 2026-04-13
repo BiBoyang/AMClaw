@@ -1,4 +1,7 @@
-use crate::task_store::{RecentTaskRecord, TaskStatusRecord, TaskStore, UserMemoryRecord};
+use crate::task_store::{
+    FeedbackKind, MemoryFeedbackState, RecentTaskRecord, TaskStatusRecord, TaskStore,
+    UserMemoryRecord,
+};
 use crate::tool_registry::{ToolAction, ToolRegistry};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
@@ -515,7 +518,7 @@ impl SessionState {
             .sum()
     }
 
-    /// 注入记忆的 ID 列表（用于 mark_memories_used 回写）
+    /// 注入记忆的 ID 列表
     fn injected_ids(&self) -> Vec<String> {
         self.injected.iter().map(|m| m.id.clone()).collect()
     }
@@ -2707,6 +2710,13 @@ fn load_business_context_snapshot(
             Ok(retrieved) => {
                 let budget = MemoryBudget::default();
                 session_state = SessionState::from_retrieved(retrieved, budget);
+                let mut feedback_state = MemoryFeedbackState::default();
+                for memory in &session_state.retrieved {
+                    feedback_state.record(&memory.id, FeedbackKind::Retrieved);
+                }
+                for memory in &session_state.injected {
+                    feedback_state.record(&memory.id, FeedbackKind::Injected);
+                }
                 // 日志投影
                 log_agent_info(
                     "agent_memory_lifecycle",
@@ -2728,10 +2738,9 @@ fn load_business_context_snapshot(
                         ("memory_ids", json!(session_state.injected_ids())),
                     ],
                 );
-                // mark_memories_used: use_count += 1 表示"被注入次数"
-                if let Err(err) = store.mark_memories_used(&session_state.injected_ids()) {
+                if let Err(err) = store.apply_memory_feedback(&feedback_state) {
                     log_agent_warn(
-                        "agent_memory_mark_used_failed",
+                        "agent_memory_feedback_apply_failed",
                         vec![
                             ("user_id", json!(user_id)),
                             ("detail", json!(err.to_string())),
@@ -4643,11 +4652,13 @@ mod tests {
         assert_eq!(business.user_memories[0].content, "我喜欢短摘要");
         assert_eq!(session_state.injected_count(), 1);
         assert_eq!(session_state.injected_ids().len(), 1);
-        // 验证命中回写：use_count 应该 > 0
+        // 验证 feedback 写回：retrieved/injected 增长，use_count 不受注入影响
         let after = store
             .search_user_memories("user-memory", 15)
             .expect("再次检索失败");
-        assert_eq!(after[0].use_count, 1);
+        assert_eq!(after[0].retrieved_count, 1);
+        assert_eq!(after[0].injected_count, 1);
+        assert_eq!(after[0].use_count, 0);
     }
 
     #[test]

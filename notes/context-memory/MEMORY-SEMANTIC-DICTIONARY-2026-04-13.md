@@ -20,7 +20,7 @@
 |---|---|---|
 | `retrieved` | 从 DB 中按条件取出的候选记忆 | 是（= `memory_retrieved_count`） |
 | `injected` | 经去重 + 单条长度 + 总预算裁剪后，实际注入 prompt 的记忆 | 是（= `memory_hit_count`） |
-| `useful` | 真正帮助本轮决策、被反馈确认为有用的记忆 | 部分是（有字段与写回能力，但尚无自动判定链路） |
+| `useful` | 真正帮助本轮决策、被反馈确认为有用的记忆 | 部分是（支持显式确认命令，尚无自动判定链路） |
 
 ### 当前 `memory_hit_count` 的精确含义
 
@@ -35,6 +35,7 @@
 - 每次 `apply_memory_feedback(...)` 收到 `Useful` feedback 时 `use_count += 1`。
 - 同时会把 `useful = true`，并更新 `last_used_at`。
 - 它不代表"被检索次数"，也不代表"被注入次数"。
+- 当前真实产品触发点：用户显式执行 `有用 <memory_id>` / `标记有用 <memory_id>` / `useful <memory_id>`。
 
 ## 4. 记忆状态（status）
 

@@ -7,6 +7,7 @@ pub enum RouteIntent {
     ManualTasksQuery,
     RecentTasksQuery,
     UserMemoryWrite { content: String },
+    UserMemoryUseful { memory_id: String },
     UserMemorySuppress { memory_id: String },
     UserMemoriesQuery,
     DailyReportQuery { day: Option<String> },
@@ -38,6 +39,10 @@ pub fn route_text(input: &str) -> RouteIntent {
 
     if is_user_memories_query(text) {
         return RouteIntent::UserMemoriesQuery;
+    }
+
+    if let Some(memory_id) = parse_user_memory_useful(text) {
+        return RouteIntent::UserMemoryUseful { memory_id };
     }
 
     if let Some(memory_id) = parse_user_memory_suppress(text) {
@@ -160,6 +165,18 @@ fn parse_user_memory_suppress(input: &str) -> Option<String> {
         .strip_prefix("忘记 ")
         .or_else(|| input.strip_prefix("屏蔽记忆 "))
         .or_else(|| input.strip_prefix("forget "))?;
+    let memory_id = rest.trim();
+    if memory_id.is_empty() {
+        return None;
+    }
+    Some(memory_id.to_string())
+}
+
+fn parse_user_memory_useful(input: &str) -> Option<String> {
+    let rest = input
+        .strip_prefix("有用 ")
+        .or_else(|| input.strip_prefix("标记有用 "))
+        .or_else(|| input.strip_prefix("useful "))?;
     let memory_id = rest.trim();
     if memory_id.is_empty() {
         return None;
@@ -344,6 +361,12 @@ mod tests {
             route_text("记住 我更喜欢短摘要"),
             RouteIntent::UserMemoryWrite {
                 content: "我更喜欢短摘要".to_string()
+            }
+        );
+        assert_eq!(
+            route_text("有用 abc-123"),
+            RouteIntent::UserMemoryUseful {
+                memory_id: "abc-123".to_string()
             }
         );
     }

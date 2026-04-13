@@ -795,6 +795,27 @@ impl TaskStore {
         Ok(())
     }
 
+    /// 用户显式确认某条记忆“有用”
+    ///
+    /// - 校验该记忆归属于当前用户且仍为 active
+    /// - 统一走 apply_memory_feedback 写回 Useful
+    pub fn confirm_memory_useful(&self, user_id: &str, memory_id: &str) -> Result<()> {
+        let exists: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM user_memories WHERE id = ?1 AND user_id = ?2 AND status = 'active'",
+                params![memory_id, user_id],
+                |row| row.get(0),
+            )
+            .context("校验 useful memory 归属失败")?;
+        if exists == 0 {
+            bail!("未找到该记忆，或无权标记有用: {memory_id}");
+        }
+        let mut feedback_state = MemoryFeedbackState::default();
+        feedback_state.record(memory_id, FeedbackKind::Useful);
+        self.apply_memory_feedback(&feedback_state)
+    }
+
     /// 软删除：将 status 设为 'suppressed'
     pub fn suppress_memory(&self, user_id: &str, memory_id: &str) -> Result<()> {
         let affected = self
@@ -2877,6 +2898,30 @@ mod tests {
         assert_eq!(mem.use_count, 1);
         assert!(mem.useful);
         assert!(mem.last_used_at.is_some());
+    }
+
+    #[test]
+    fn confirm_memory_useful_enforces_user_ownership() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        let mut ws = MemoryWriteState::default();
+        let decision = store.govern_memory_write("user-a", "测试记忆", "explicit", 100, &mut ws);
+        let memory_id = match decision {
+            WriteDecision::Written(r) => r.id,
+            _ => panic!("应写入"),
+        };
+
+        let err = store
+            .confirm_memory_useful("user-b", &memory_id)
+            .expect_err("应拒绝其他用户标记有用");
+        assert!(err.to_string().contains("无权标记有用"));
+
+        store
+            .confirm_memory_useful("user-a", &memory_id)
+            .expect("同用户应可标记有用");
+        let mem = &store.list_user_memories("user-a", 10).expect("查询失败")[0];
+        assert!(mem.useful);
+        assert_eq!(mem.use_count, 1);
     }
 
     #[test]

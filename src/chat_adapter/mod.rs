@@ -562,6 +562,9 @@ impl WeChatBot {
             command_router::RouteIntent::UserMemoryWrite { content } => {
                 self.handle_user_memory_write(from_user_id, &content);
             }
+            command_router::RouteIntent::UserMemoryUseful { memory_id } => {
+                self.handle_user_memory_useful(from_user_id, &memory_id);
+            }
             command_router::RouteIntent::UserMemorySuppress { memory_id } => {
                 self.handle_user_memory_suppress(from_user_id, &memory_id);
             }
@@ -736,7 +739,7 @@ impl WeChatBot {
             return format!("现在是 {}", now.format("%Y-%m-%d %H:%M:%S"));
         }
         if user_text == "帮助" || user_text == "help" {
-            return "可用命令:\n- hello / 你好\n- 时间\n- 帮助 / help\n- 发送链接或 收藏 <url>\n- 状态 <task_id>\n- 最近任务\n- 日报 [YYYY-MM-DD] / 今日整理\n- 记住 <content>\n- 我的记忆\n- 重试 <task_id>\n- 其他文字我会 echo 回复"
+            return "可用命令:\n- hello / 你好\n- 时间\n- 帮助 / help\n- 发送链接或 收藏 <url>\n- 状态 <task_id>\n- 最近任务\n- 日报 [YYYY-MM-DD] / 今日整理\n- 记住 <content>\n- 我的记忆\n- 有用 <memory_id>\n- 重试 <task_id>\n- 其他文字我会 echo 回复"
                 .to_string();
         }
         format!("Echo: {user_text}")
@@ -832,6 +835,14 @@ impl WeChatBot {
         let reply = match self.task_store.suppress_memory(user_id, memory_id) {
             Ok(()) => format!("已屏蔽记忆: {memory_id}"),
             Err(err) => format!("屏蔽记忆失败: {err}"),
+        };
+        self.send_reply_text(user_id, &reply);
+    }
+
+    fn handle_user_memory_useful(&self, user_id: &str, memory_id: &str) {
+        let reply = match self.task_store.confirm_memory_useful(user_id, memory_id) {
+            Ok(()) => format!("已标记记忆有用: {memory_id}"),
+            Err(err) => format!("标记记忆有用失败: {err}"),
         };
         self.send_reply_text(user_id, &reply);
     }
@@ -2374,6 +2385,86 @@ mod tests {
             .expect("查询失败");
         assert_eq!(memories_after.len(), 1);
         assert_eq!(memories_after[0].id, memory_id);
+    }
+
+    #[test]
+    fn user_memory_useful_command_marks_memory_useful() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+        bot.context_token_map
+            .insert("user-a".to_string(), "ctx-1".to_string());
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "记住 我喜欢短摘要".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-memory-useful-1".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let memories = bot
+            .task_store
+            .list_user_memories("user-a", 10)
+            .expect("查询失败");
+        let memory_id = memories[0].id.clone();
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: format!("有用 {memory_id}"),
+            message_id: Some(super::FlexibleId::Str("msg-memory-useful-2".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let after = bot
+            .task_store
+            .list_user_memories("user-a", 10)
+            .expect("查询失败");
+        assert!(after[0].useful);
+        assert_eq!(after[0].use_count, 1);
+    }
+
+    #[test]
+    fn user_memory_useful_command_cannot_mark_other_users_memory() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+        bot.context_token_map
+            .insert("user-a".to_string(), "ctx-1".to_string());
+        bot.context_token_map
+            .insert("user-b".to_string(), "ctx-2".to_string());
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "记住 仅 user-a 可标记有用".to_string(),
+            message_id: Some(super::FlexibleId::Str(
+                "msg-memory-useful-cross-1".to_string(),
+            )),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let memories = bot
+            .task_store
+            .list_user_memories("user-a", 10)
+            .expect("查询失败");
+        let memory_id = memories[0].id.clone();
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-b".to_string(),
+            text: format!("有用 {memory_id}"),
+            message_id: Some(super::FlexibleId::Str(
+                "msg-memory-useful-cross-2".to_string(),
+            )),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let after = bot
+            .task_store
+            .list_user_memories("user-a", 10)
+            .expect("查询失败");
+        assert!(!after[0].useful);
+        assert_eq!(after[0].use_count, 0);
     }
 
     #[test]

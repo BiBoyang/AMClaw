@@ -559,6 +559,9 @@ impl WeChatBot {
             command_router::RouteIntent::UserMemoriesQuery => {
                 self.handle_user_memories_query(from_user_id);
             }
+            command_router::RouteIntent::ContextDebugQuery { text } => {
+                self.handle_context_debug_query(from_user_id, text.as_deref());
+            }
             command_router::RouteIntent::UserMemoryWrite { content } => {
                 self.handle_user_memory_write(from_user_id, &content);
             }
@@ -739,7 +742,7 @@ impl WeChatBot {
             return format!("现在是 {}", now.format("%Y-%m-%d %H:%M:%S"));
         }
         if user_text == "帮助" || user_text == "help" {
-            return "可用命令:\n- hello / 你好\n- 时间\n- 帮助 / help\n- 发送链接或 收藏 <url>\n- 状态 <task_id>\n- 最近任务\n- 日报 [YYYY-MM-DD] / 今日整理\n- 记住 <content>\n- 我的记忆\n- 有用 <memory_id>\n- 重试 <task_id>\n- 其他文字我会 echo 回复"
+            return "可用命令:\n- hello / 你好\n- 时间\n- 帮助 / help\n- 发送链接或 收藏 <url>\n- 状态 <task_id>\n- 最近任务\n- 日报 [YYYY-MM-DD] / 今日整理\n- 记住 <content>\n- 我的记忆\n- 有用 <memory_id>\n- 重试 <task_id>\n- /context [text]\n- 其他文字我会 echo 回复"
                 .to_string();
         }
         format!("Echo: {user_text}")
@@ -773,6 +776,41 @@ impl WeChatBot {
         let reply = match self.task_store.list_recent_tasks(5) {
             Ok(tasks) => build_recent_tasks_reply(&tasks),
             Err(err) => format!("查询最近任务失败: {err}"),
+        };
+        self.send_reply_text(user_id, &reply);
+    }
+
+    fn handle_context_debug_query(&self, user_id: &str, extra_text: Option<&str>) {
+        let pending = self.session_router.snapshot(user_id);
+        let mut parts = Vec::new();
+        let mut message_ids = Vec::new();
+        if let Some(snapshot) = &pending {
+            if !snapshot.merged_text.trim().is_empty() {
+                parts.push(snapshot.merged_text.trim().to_string());
+            }
+            message_ids = snapshot.message_ids.clone();
+        }
+        if let Some(extra_text) = extra_text.filter(|value| !value.trim().is_empty()) {
+            parts.push(extra_text.trim().to_string());
+        }
+
+        if parts.is_empty() {
+            self.send_reply_text(
+                user_id,
+                "当前没有待提交会话。可直接发送 `/context 你的问题` 预览一次上下文装配。",
+            );
+            return;
+        }
+
+        let merged_text = parts.join("\n");
+        let reply = match self.agent_core.preview_context_with_context(
+            &merged_text,
+            AgentRunContext::wechat_chat(user_id, "context_debug", message_ids)
+                .with_session_text(&merged_text)
+                .with_context_token_present(self.context_token_map.contains_key(user_id)),
+        ) {
+            Ok(reply) => reply,
+            Err(err) => format!("生成 context preview 失败: {err}"),
         };
         self.send_reply_text(user_id, &reply);
     }
@@ -2258,6 +2296,39 @@ mod tests {
         assert_eq!(sessions[0].user_id, "user-a");
         assert_eq!(sessions[0].merged_text, "先记一条会话");
         assert_eq!(sessions[0].message_ids, vec!["msg-session-1".to_string()]);
+    }
+
+    #[test]
+    fn context_debug_query_keeps_pending_session_intact() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "先记一条会话".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-context-1".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "/context 再补一条".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-context-2".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        assert_eq!(article_count(&db_path), 0);
+        assert_eq!(task_count(&db_path), 0);
+        assert_eq!(
+            bot.session_router.snapshot("user-a"),
+            Some(SessionSnapshot {
+                user_id: "user-a".to_string(),
+                merged_text: "先记一条会话".to_string(),
+                message_ids: vec!["msg-context-1".to_string()],
+            })
+        );
     }
 
     #[test]

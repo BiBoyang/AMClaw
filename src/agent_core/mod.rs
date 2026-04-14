@@ -125,10 +125,104 @@ impl AgentObservation {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ContextSectionSnapshot {
+    kind: String,
+    priority: u8,
+    max_chars: usize,
+    original_char_count: usize,
+    line_count: usize,
+    item_count: usize,
+    char_count: usize,
+    included: bool,
+    trimmed: bool,
+    trim_reason: Option<ContextSectionChangeReason>,
+    drop_reason: Option<ContextSectionChangeReason>,
+    content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ContextSectionChangeReason {
+    SectionBudgetExceeded,
+    TotalBudgetExceeded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ContextBudgetSummary {
+    max_total_chars: usize,
+    final_total_chars: usize,
+    trimmed_section_count: usize,
+    dropped_section_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+struct RuntimeSessionStateSnapshot {
+    goal: Option<String>,
+    current_subtask: Option<String>,
+    constraints: Vec<String>,
+    confirmed_facts: Vec<String>,
+    done_items: Vec<String>,
+    next_step: Option<String>,
+    open_questions: Vec<String>,
+}
+
+impl RuntimeSessionStateSnapshot {
+    fn is_empty(&self) -> bool {
+        self.goal.is_none()
+            && self.current_subtask.is_none()
+            && self.constraints.is_empty()
+            && self.confirmed_facts.is_empty()
+            && self.done_items.is_empty()
+            && self.next_step.is_none()
+            && self.open_questions.is_empty()
+    }
+
+    fn to_lines(&self) -> Vec<String> {
+        let mut lines = vec![String::new(), "## Session State".to_string()];
+        if let Some(goal) = &self.goal {
+            lines.push(format!("- goal: {}", goal));
+        }
+        if let Some(current_subtask) = &self.current_subtask {
+            lines.push(format!("- current_subtask: {}", current_subtask));
+        }
+        if !self.constraints.is_empty() {
+            lines.push("- constraints:".to_string());
+            for item in &self.constraints {
+                lines.push(format!("  - {}", item));
+            }
+        }
+        if !self.confirmed_facts.is_empty() {
+            lines.push("- confirmed_facts:".to_string());
+            for item in &self.confirmed_facts {
+                lines.push(format!("  - {}", item));
+            }
+        }
+        if !self.done_items.is_empty() {
+            lines.push("- done_items:".to_string());
+            for item in &self.done_items {
+                lines.push(format!("  - {}", item));
+            }
+        }
+        if let Some(next_step) = &self.next_step {
+            lines.push(format!("- next_step: {}", next_step));
+        }
+        if !self.open_questions.is_empty() {
+            lines.push("- open_questions:".to_string());
+            for item in &self.open_questions {
+                lines.push(format!("  - {}", item));
+            }
+        }
+        lines
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PlannerInput {
     raw_user_input: String,
     assembled_user_prompt: String,
+    context_sections: Vec<ContextSectionSnapshot>,
+    context_budget_summary: ContextBudgetSummary,
     context_summary: String,
 }
 
@@ -545,20 +639,403 @@ impl PlanningPolicy {
 #[derive(Debug, Default)]
 struct ContextAssembler;
 
+const DEFAULT_CONTEXT_MAX_TOTAL_CHARS: usize = 2600;
+
+#[derive(Debug, Clone, Copy)]
+struct ContextSectionPolicy {
+    priority: u8,
+    max_chars: usize,
+    pinned_lines: usize,
+    required: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextSectionKind {
+    Preamble,
+    CurrentIntent,
+    RuntimeContext,
+    SessionState,
+    SessionText,
+    PreviousObservations,
+    LatestObservation,
+    RuntimePlan,
+    CurrentTask,
+    RecentTasks,
+    UserMemories,
+    ToolDescriptions,
+    ResponseContract,
+}
+
+impl ContextSectionKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Preamble => "preamble",
+            Self::CurrentIntent => "current_intent",
+            Self::RuntimeContext => "runtime_context",
+            Self::SessionState => "session_state",
+            Self::SessionText => "session_text",
+            Self::PreviousObservations => "previous_observations",
+            Self::LatestObservation => "latest_observation",
+            Self::RuntimePlan => "runtime_plan",
+            Self::CurrentTask => "current_task",
+            Self::RecentTasks => "recent_tasks",
+            Self::UserMemories => "user_memories",
+            Self::ToolDescriptions => "tool_descriptions",
+            Self::ResponseContract => "response_contract",
+        }
+    }
+
+    fn policy(&self) -> ContextSectionPolicy {
+        match self {
+            Self::Preamble => ContextSectionPolicy {
+                priority: 100,
+                max_chars: 120,
+                pinned_lines: 1,
+                required: true,
+            },
+            Self::CurrentIntent => ContextSectionPolicy {
+                priority: 100,
+                max_chars: 360,
+                pinned_lines: 3,
+                required: true,
+            },
+            Self::RuntimeContext => ContextSectionPolicy {
+                priority: 95,
+                max_chars: 520,
+                pinned_lines: 10,
+                required: true,
+            },
+            Self::SessionState => ContextSectionPolicy {
+                priority: 94,
+                max_chars: 560,
+                pinned_lines: 4,
+                required: false,
+            },
+            Self::SessionText => ContextSectionPolicy {
+                priority: 55,
+                max_chars: 320,
+                pinned_lines: 2,
+                required: false,
+            },
+            Self::PreviousObservations => ContextSectionPolicy {
+                priority: 70,
+                max_chars: 360,
+                pinned_lines: 2,
+                required: false,
+            },
+            Self::LatestObservation => ContextSectionPolicy {
+                priority: 92,
+                max_chars: 560,
+                pinned_lines: 4,
+                required: false,
+            },
+            Self::RuntimePlan => ContextSectionPolicy {
+                priority: 93,
+                max_chars: 520,
+                pinned_lines: 4,
+                required: false,
+            },
+            Self::CurrentTask => ContextSectionPolicy {
+                priority: 94,
+                max_chars: 420,
+                pinned_lines: 5,
+                required: false,
+            },
+            Self::RecentTasks => ContextSectionPolicy {
+                priority: 50,
+                max_chars: 300,
+                pinned_lines: 2,
+                required: false,
+            },
+            Self::UserMemories => ContextSectionPolicy {
+                priority: 75,
+                max_chars: 420,
+                pinned_lines: 2,
+                required: false,
+            },
+            Self::ToolDescriptions => ContextSectionPolicy {
+                priority: 40,
+                max_chars: 360,
+                pinned_lines: 2,
+                required: true,
+            },
+            Self::ResponseContract => ContextSectionPolicy {
+                priority: 100,
+                max_chars: 260,
+                pinned_lines: 2,
+                required: true,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ContextSection {
+    kind: ContextSectionKind,
+    lines: Vec<String>,
+    policy: ContextSectionPolicy,
+    original_content: String,
+    trimmed: bool,
+    trim_reason: Option<ContextSectionChangeReason>,
+    included: bool,
+    drop_reason: Option<ContextSectionChangeReason>,
+}
+
+impl ContextSection {
+    fn new(kind: ContextSectionKind, lines: Vec<String>) -> Self {
+        let original_content = lines.join("\n");
+        let policy = kind.policy();
+        let mut section = Self {
+            kind,
+            lines,
+            policy,
+            original_content,
+            trimmed: false,
+            trim_reason: None,
+            included: true,
+            drop_reason: None,
+        };
+        section.apply_section_budget();
+        section
+    }
+
+    fn render(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    fn char_count(&self) -> usize {
+        if self.included {
+            self.render().chars().count()
+        } else {
+            0
+        }
+    }
+
+    fn original_char_count(&self) -> usize {
+        self.original_content.chars().count()
+    }
+
+    fn item_count(&self) -> usize {
+        if self.included {
+            self.lines.iter().filter(|line| !line.is_empty()).count()
+        } else {
+            0
+        }
+    }
+
+    fn line_count(&self) -> usize {
+        if self.included {
+            self.lines.len()
+        } else {
+            0
+        }
+    }
+
+    fn content_for_snapshot(&self) -> String {
+        if self.included {
+            self.render()
+        } else {
+            summarize_for_markdown(&self.original_content, 240)
+        }
+    }
+
+    fn drop_from_prompt(&mut self, reason: ContextSectionChangeReason) {
+        self.included = false;
+        self.drop_reason = Some(reason);
+    }
+
+    fn apply_section_budget(&mut self) {
+        if self.original_char_count() <= self.policy.max_chars {
+            return;
+        }
+        self.trimmed = true;
+        self.trim_reason = Some(ContextSectionChangeReason::SectionBudgetExceeded);
+        self.lines =
+            trim_section_lines(&self.lines, self.policy.max_chars, self.policy.pinned_lines);
+    }
+}
+
+fn trim_section_lines(lines: &[String], max_chars: usize, pinned_lines: usize) -> Vec<String> {
+    let rendered = lines.join("\n");
+    if rendered.chars().count() <= max_chars {
+        return lines.to_vec();
+    }
+    if max_chars < 48 {
+        return vec![summarize_for_markdown(&rendered, max_chars)];
+    }
+
+    let pinned = pinned_lines.min(lines.len());
+    let prefix = lines[..pinned].to_vec();
+    let prefix_rendered = prefix.join("\n");
+    let prefix_chars = prefix_rendered.chars().count();
+    if prefix.is_empty() || prefix_chars + 48 >= max_chars {
+        return vec![summarize_for_markdown(&rendered, max_chars)];
+    }
+
+    let body = lines[pinned..].join("\n");
+    let available_for_body = max_chars.saturating_sub(prefix_chars + 16);
+    let body_summary = summarize_for_markdown(&body, available_for_body.max(24));
+    let mut trimmed = prefix;
+    trimmed.push(format!("- trimmed: {}", body_summary));
+    trimmed
+}
+
+#[derive(Debug, Clone)]
+struct ContextPack {
+    sections: Vec<ContextSection>,
+    max_total_chars: usize,
+}
+
+impl ContextPack {
+    fn default() -> Self {
+        Self {
+            sections: Vec::new(),
+            max_total_chars: DEFAULT_CONTEXT_MAX_TOTAL_CHARS,
+        }
+    }
+
+    fn push(&mut self, section: ContextSection) {
+        self.sections.push(section);
+    }
+
+    #[cfg(test)]
+    fn section(&self, kind: ContextSectionKind) -> Option<&ContextSection> {
+        self.sections.iter().find(|section| section.kind == kind)
+    }
+
+    fn render(&self) -> String {
+        let mut rendered = Vec::new();
+        for section in &self.sections {
+            if section.included {
+                rendered.extend(section.lines.iter().cloned());
+            }
+        }
+        rendered.join("\n")
+    }
+
+    fn total_chars(&self) -> usize {
+        self.sections.iter().map(ContextSection::char_count).sum()
+    }
+
+    fn apply_total_budget(&mut self) {
+        while self.total_chars() > self.max_total_chars {
+            let drop_idx = self
+                .sections
+                .iter()
+                .enumerate()
+                .filter(|(_, section)| section.included && !section.policy.required)
+                .min_by(|(_, left), (_, right)| {
+                    left.policy
+                        .priority
+                        .cmp(&right.policy.priority)
+                        .then_with(|| right.char_count().cmp(&left.char_count()))
+                })
+                .map(|(idx, _)| idx);
+
+            let Some(drop_idx) = drop_idx else {
+                break;
+            };
+            self.sections[drop_idx]
+                .drop_from_prompt(ContextSectionChangeReason::TotalBudgetExceeded);
+        }
+    }
+
+    fn budget_summary(&self) -> ContextBudgetSummary {
+        ContextBudgetSummary {
+            max_total_chars: self.max_total_chars,
+            final_total_chars: self.total_chars(),
+            trimmed_section_count: self
+                .sections
+                .iter()
+                .filter(|section| section.trimmed)
+                .count(),
+            dropped_section_count: self
+                .sections
+                .iter()
+                .filter(|section| !section.included)
+                .count(),
+        }
+    }
+
+    fn snapshot(&self) -> Vec<ContextSectionSnapshot> {
+        self.sections
+            .iter()
+            .map(|section| ContextSectionSnapshot {
+                kind: section.kind.as_str().to_string(),
+                priority: section.policy.priority,
+                max_chars: section.policy.max_chars,
+                original_char_count: section.original_char_count(),
+                line_count: section.line_count(),
+                item_count: section.item_count(),
+                char_count: section.char_count(),
+                included: section.included,
+                trimmed: section.trimmed,
+                trim_reason: section.trim_reason.clone(),
+                drop_reason: section.drop_reason.clone(),
+                content: section.content_for_snapshot(),
+            })
+            .collect()
+    }
+}
+
 impl ContextAssembler {
     fn assemble(
         &self,
         trace: &AgentRunTrace,
         user_input: &str,
         observation: Option<&AgentObservation>,
+        runtime_session_state: Option<&RuntimeSessionStateSnapshot>,
         available_tools: &[String],
         business_context: Option<&BusinessContextSnapshot>,
     ) -> PlannerInput {
-        let mut sections = vec![
-            "你正在处理一次 AMClaw agent 运行。请基于下面上下文决定下一步。".to_string(),
-            String::new(),
-            "## User Input".to_string(),
-            user_input.trim().to_string(),
+        let context_pack = self.build_pack(
+            trace,
+            user_input,
+            observation,
+            runtime_session_state,
+            available_tools,
+            business_context,
+        );
+        let assembled_user_prompt = context_pack.render();
+        let context_sections = context_pack.snapshot();
+        let context_budget_summary = context_pack.budget_summary();
+        let context_summary = build_context_summary(trace, observation);
+
+        PlannerInput {
+            raw_user_input: user_input.to_string(),
+            assembled_user_prompt,
+            context_sections,
+            context_budget_summary,
+            context_summary,
+        }
+    }
+
+    fn build_pack(
+        &self,
+        trace: &AgentRunTrace,
+        user_input: &str,
+        observation: Option<&AgentObservation>,
+        runtime_session_state: Option<&RuntimeSessionStateSnapshot>,
+        available_tools: &[String],
+        business_context: Option<&BusinessContextSnapshot>,
+    ) -> ContextPack {
+        let mut pack = ContextPack::default();
+
+        pack.push(ContextSection::new(
+            ContextSectionKind::Preamble,
+            vec!["你正在处理一次 AMClaw agent 运行。请基于下面上下文决定下一步。".to_string()],
+        ));
+
+        pack.push(ContextSection::new(
+            ContextSectionKind::CurrentIntent,
+            vec![
+                String::new(),
+                "## User Input".to_string(),
+                user_input.trim().to_string(),
+            ],
+        ));
+
+        let mut runtime_lines = vec![
             String::new(),
             "## Runtime Context".to_string(),
             format!("- source_type: {}", trace.source_type),
@@ -595,42 +1072,85 @@ impl ContextAssembler {
         ];
 
         if !trace.message_ids.is_empty() {
-            sections.push("- message_ids:".to_string());
+            runtime_lines.push("- message_ids:".to_string());
             for message_id in &trace.message_ids {
-                sections.push(format!("  - {}", message_id));
+                runtime_lines.push(format!("  - {}", message_id));
             }
+        }
+        pack.push(ContextSection::new(
+            ContextSectionKind::RuntimeContext,
+            runtime_lines,
+        ));
+
+        if let Some(runtime_session_state) = runtime_session_state.filter(|state| !state.is_empty())
+        {
+            pack.push(ContextSection::new(
+                ContextSectionKind::SessionState,
+                runtime_session_state.to_lines(),
+            ));
         }
 
         if let Some(session_text) = &trace.session_text {
-            sections.push(String::new());
-            sections.push("## Session Text".to_string());
-            sections.push(summarize_for_markdown(session_text, 600));
+            pack.push(ContextSection::new(
+                ContextSectionKind::SessionText,
+                vec![
+                    String::new(),
+                    "## Session Text".to_string(),
+                    summarize_for_markdown(session_text, 600),
+                ],
+            ));
+        }
+
+        let previous_observations = if observation.is_some() && !trace.observations.is_empty() {
+            &trace.observations[..trace.observations.len() - 1]
+        } else {
+            &trace.observations[..]
+        };
+        if !previous_observations.is_empty() {
+            let mut lines = vec![String::new(), "## Previous Observations".to_string()];
+            for item in previous_observations.iter().rev().take(3).rev() {
+                lines.push(format!(
+                    "- step={} source={} chars={} summary={}",
+                    item.step, item.source, item.content_chars, item.summary
+                ));
+            }
+            pack.push(ContextSection::new(
+                ContextSectionKind::PreviousObservations,
+                lines,
+            ));
         }
 
         if let Some(observation) = observation {
-            sections.push(String::new());
-            sections.push("## Latest Observation".to_string());
-            sections.push(format!("- step: {}", observation.step));
-            sections.push(format!("- source: {}", observation.source));
-            sections.push("```text".to_string());
-            sections.push(summarize_for_markdown(&observation.content, 800));
-            sections.push("```".to_string());
+            pack.push(ContextSection::new(
+                ContextSectionKind::LatestObservation,
+                vec![
+                    String::new(),
+                    "## Latest Observation".to_string(),
+                    format!("- step: {}", observation.step),
+                    format!("- source: {}", observation.source),
+                    "```text".to_string(),
+                    summarize_for_markdown(&observation.content, 800),
+                    "```".to_string(),
+                ],
+            ));
         }
 
         if !trace.active_plan_steps.is_empty() {
-            sections.push(String::new());
-            sections.push("## Active Plan".to_string());
-            sections.push(format!(
-                "- current_step_index: {}",
-                trace
-                    .current_step_index
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "(none)".to_string())
-            ));
-            sections.push(format!(
-                "- replan_budget_remaining: {}",
-                trace.controller_state.remaining_replans()
-            ));
+            let mut plan_lines = vec![
+                String::new(),
+                "## Active Plan".to_string(),
+                format!(
+                    "- current_step_index: {}",
+                    trace
+                        .current_step_index
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "(none)".to_string())
+                ),
+                format!(
+                    "- replan_budget_remaining: {}",
+                    trace.controller_state.remaining_replans()
+                ),
+            ];
             for (idx, step) in trace.active_plan_steps.iter().enumerate() {
                 let mut line = format!(
                     "{}. [{}] {} (retry_count={})",
@@ -642,41 +1162,50 @@ impl ContextAssembler {
                 if let Some(expected) = &step.expected_observation {
                     line.push_str(&format!(" | expect: {}", expected.summary()));
                 }
-                sections.push(line);
+                plan_lines.push(line);
             }
             if let Some(progress_note) = &trace.last_progress_note {
-                sections.push(format!("- progress_note: {}", progress_note));
+                plan_lines.push(format!("- progress_note: {}", progress_note));
             }
+            pack.push(ContextSection::new(
+                ContextSectionKind::RuntimePlan,
+                plan_lines,
+            ));
         }
 
         if let Some(business_context) = business_context {
             if let Some(task) = &business_context.current_task {
-                sections.push(String::new());
-                sections.push("## Current Task".to_string());
-                sections.push(format!("- task_id: {}", task.task_id));
-                sections.push(format!("- status: {}", task.status));
-                sections.push(format!("- article_id: {}", task.article_id));
-                sections.push(format!("- url: {}", task.normalized_url));
-                sections.push(format!("- retry_count: {}", task.retry_count));
+                let mut task_lines = vec![
+                    String::new(),
+                    "## Current Task".to_string(),
+                    format!("- task_id: {}", task.task_id),
+                    format!("- status: {}", task.status),
+                    format!("- article_id: {}", task.article_id),
+                    format!("- url: {}", task.normalized_url),
+                    format!("- retry_count: {}", task.retry_count),
+                ];
                 if let Some(page_kind) = &task.page_kind {
-                    sections.push(format!("- page_kind: {}", page_kind));
+                    task_lines.push(format!("- page_kind: {}", page_kind));
                 }
                 if let Some(content_source) = &task.content_source {
-                    sections.push(format!("- content_source: {}", content_source));
+                    task_lines.push(format!("- content_source: {}", content_source));
                 }
                 if let Some(last_error) = &task.last_error {
-                    sections.push(format!(
+                    task_lines.push(format!(
                         "- last_error: {}",
                         summarize_for_markdown(last_error, 200)
                     ));
                 }
+                pack.push(ContextSection::new(
+                    ContextSectionKind::CurrentTask,
+                    task_lines,
+                ));
             }
 
             if !business_context.recent_tasks.is_empty() {
-                sections.push(String::new());
-                sections.push("## Recent Tasks".to_string());
+                let mut recent_lines = vec![String::new(), "## Recent Tasks".to_string()];
                 for task in &business_context.recent_tasks {
-                    sections.push(format!(
+                    recent_lines.push(format!(
                         "- task_id={} status={} page_kind={} url={}",
                         task.task_id,
                         task.status,
@@ -684,44 +1213,177 @@ impl ContextAssembler {
                         task.normalized_url
                     ));
                 }
+                pack.push(ContextSection::new(
+                    ContextSectionKind::RecentTasks,
+                    recent_lines,
+                ));
             }
 
             if !business_context.user_memories.is_empty() {
-                sections.push(String::new());
-                sections.push("## User Memories".to_string());
+                let mut memory_lines = vec![String::new(), "## User Memories".to_string()];
                 for memory in &business_context.user_memories {
                     let type_tag = if memory.memory_type == "explicit" {
                         "[explicit]"
                     } else {
                         "[auto]"
                     };
-                    sections.push(format!(
+                    memory_lines.push(format!(
                         "- {} (priority={}) {}",
                         type_tag,
                         memory.priority,
                         sanitize_for_prompt(&memory.content)
                     ));
                 }
+                pack.push(ContextSection::new(
+                    ContextSectionKind::UserMemories,
+                    memory_lines,
+                ));
             }
         }
 
-        sections.push(String::new());
-        sections.push("## Available Tools".to_string());
-        sections.extend(available_tools.iter().cloned());
+        let mut tool_lines = vec![String::new(), "## Available Tools".to_string()];
+        tool_lines.extend(available_tools.iter().cloned());
+        pack.push(ContextSection::new(
+            ContextSectionKind::ToolDescriptions,
+            tool_lines,
+        ));
 
-        sections.push(String::new());
-        sections.push(
-            "你必须采用最小 ReAct 风格：根据当前上下文决定“继续调一个工具”或“直接结束”。请只输出 JSON，格式为 {\"action\":\"read|write|create|get_task_status|list_recent_tasks|list_manual_tasks|read_article_archive|final\",...,\"expected_fields\":[\"field_a\"],\"minimum_novelty\":\"different_from_last\"}。".to_string(),
-        );
+        pack.push(ContextSection::new(
+            ContextSectionKind::ResponseContract,
+            vec![
+                String::new(),
+                "你必须采用最小 ReAct 风格：根据当前上下文决定“继续调一个工具”或“直接结束”。请只输出 JSON，格式为 {\"action\":\"read|write|create|get_task_status|list_recent_tasks|list_manual_tasks|read_article_archive|final\",...,\"expected_fields\":[\"field_a\"],\"minimum_novelty\":\"different_from_last\"}。".to_string(),
+            ],
+        ));
 
-        let assembled_user_prompt = sections.join("\n");
-        let context_summary = build_context_summary(trace, observation);
+        pack.apply_total_budget();
+        pack
+    }
+}
 
-        PlannerInput {
-            raw_user_input: user_input.to_string(),
-            assembled_user_prompt,
-            context_summary,
+fn derive_runtime_session_state(
+    trace: &AgentRunTrace,
+    user_input: &str,
+    observation: Option<&AgentObservation>,
+    business_context: Option<&BusinessContextSnapshot>,
+) -> RuntimeSessionStateSnapshot {
+    let current_step = trace.active_plan_steps.iter().find(|step| {
+        matches!(
+            step.status,
+            PlanStepStatus::Running | PlanStepStatus::Pending | PlanStepStatus::Failed
+        )
+    });
+    let done_items = trace
+        .active_plan_steps
+        .iter()
+        .filter(|step| step.status == PlanStepStatus::Done)
+        .map(|step| step.description.clone())
+        .take(3)
+        .collect::<Vec<_>>();
+
+    let goal = if let Some(task) = business_context.and_then(|ctx| ctx.current_task.as_ref()) {
+        Some(format!("推进任务 {} 到下一可收敛状态", task.task_id))
+    } else if let Some(current_step) = current_step {
+        Some(format!("完成当前计划：{}", current_step.description))
+    } else {
+        Some(format!(
+            "响应当前用户请求：{}",
+            summarize_for_markdown(user_input.trim(), 120)
+        ))
+    };
+
+    let current_subtask = current_step
+        .map(|step| step.description.clone())
+        .or_else(|| {
+            business_context
+                .and_then(|ctx| ctx.current_task.as_ref())
+                .map(|task| format!("处理当前任务状态 {}", task.status))
+        });
+
+    let mut constraints = Vec::new();
+    if trace.controller_state.remaining_replans() == 0 {
+        constraints.push("replan budget 已耗尽，应优先收敛或 ask_user".to_string());
+    }
+    if trace.controller_state.failure_count > 0 {
+        constraints.push(format!(
+            "已有 {} 次失败，避免重复低价值动作",
+            trace.controller_state.failure_count
+        ));
+    }
+    if let Some(task) = business_context.and_then(|ctx| ctx.current_task.as_ref()) {
+        if task.status == "awaiting_manual_input" {
+            constraints.push("当前任务等待人工补录，不能假装正文已可用".to_string());
         }
+    }
+
+    let mut confirmed_facts = Vec::new();
+    if let Some(task) = business_context.and_then(|ctx| ctx.current_task.as_ref()) {
+        confirmed_facts.push(format!(
+            "current_task={} status={}",
+            task.task_id, task.status
+        ));
+        if let Some(page_kind) = &task.page_kind {
+            confirmed_facts.push(format!("page_kind={}", page_kind));
+        }
+    }
+    if let Some(observation) = observation {
+        confirmed_facts.push(format!(
+            "latest_observation={} {}",
+            observation.source,
+            truncate_for_trace(&observation.content, 80)
+        ));
+    }
+    if trace.memory_hit_count > 0 {
+        confirmed_facts.push(format!("memory_injected={}", trace.memory_hit_count));
+    }
+
+    let next_step = current_step
+        .map(|step| step.description.clone())
+        .or_else(|| {
+            if observation.is_some() {
+                Some("基于 latest observation 判断是继续调工具还是直接结束".to_string())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            business_context
+                .and_then(|ctx| ctx.current_task.as_ref())
+                .and_then(|task| {
+                    if task.status == "awaiting_manual_input" {
+                        Some("向用户请求补录内容或引导 retry".to_string())
+                    } else {
+                        None
+                    }
+                })
+        });
+
+    let mut open_questions = Vec::new();
+    if let Some(task) = business_context.and_then(|ctx| ctx.current_task.as_ref()) {
+        if let Some(last_error) = &task.last_error {
+            open_questions.push(format!(
+                "是否需要处理最近错误：{}",
+                summarize_for_markdown(last_error, 120)
+            ));
+        }
+    }
+    if let Some(current_step) = current_step {
+        if let Some(expected) = &current_step.expected_observation {
+            open_questions.push(format!(
+                "当前 step 期待的 observation 是否已满足：{}",
+                expected.summary()
+            ));
+        }
+    }
+
+    RuntimeSessionStateSnapshot {
+        goal,
+        current_subtask,
+        constraints,
+        confirmed_facts,
+        done_items,
+        next_step,
+        open_questions,
     }
 }
 
@@ -872,6 +1534,42 @@ impl AgentCore {
         }
 
         result
+    }
+
+    pub fn preview_context_with_context(
+        &self,
+        user_input: &str,
+        context: AgentRunContext,
+    ) -> Result<String> {
+        let mut trace = AgentRunTrace::new(&self.workspace_root, user_input, context);
+        trace.configure_controller_limits(self.max_steps, self.max_replans);
+
+        let (business_context, session_state) =
+            load_business_context_snapshot(self.task_store_db_path.as_deref(), &trace)?;
+        if session_state.has_memory_activity() {
+            trace.memory_hit_count = session_state.injected_count();
+            trace.memory_retrieved_count = session_state.retrieved_count();
+            trace.memory_total_chars = session_state.injected_total_chars();
+            trace.memory_dropped_count = session_state.dropped.len();
+            trace.memory_ids = session_state.injected_ids();
+        }
+        let runtime_session_state =
+            derive_runtime_session_state(&trace, user_input, None, business_context.as_ref());
+        let planner_input = ContextAssembler.assemble(
+            &trace,
+            user_input,
+            None,
+            Some(&runtime_session_state),
+            &self.tool_registry.available_tool_descriptions(),
+            business_context.as_ref(),
+        );
+
+        Ok(render_context_preview(
+            &trace,
+            &planner_input,
+            &runtime_session_state,
+            &session_state,
+        ))
     }
 
     fn watchdog_review(
@@ -1072,10 +1770,16 @@ impl AgentCore {
             trace.memory_dropped_count = session_state.dropped.len();
             trace.memory_ids = session_state.injected_ids();
         }
+        let runtime_session_state =
+            derive_runtime_session_state(trace, user_input, observation, business_context.as_ref());
+        if step == 0 && !runtime_session_state.is_empty() {
+            trace.record_session_state_snapshot(runtime_session_state.clone());
+        }
         let planner_input = ContextAssembler.assemble(
             trace,
             user_input,
             observation,
+            Some(&runtime_session_state),
             &self.tool_registry.available_tool_descriptions(),
             business_context.as_ref(),
         );
@@ -1367,6 +2071,8 @@ impl LlmClient {
             system_prompt,
             &planner_input.raw_user_input,
             &planner_input.assembled_user_prompt,
+            &planner_input.context_sections,
+            &planner_input.context_budget_summary,
             &planner_input.context_summary,
             &body,
         );
@@ -1519,6 +2225,7 @@ struct AgentRunTrace {
     last_progress_note: Option<String>,
     llm_calls: Vec<LlmCallTrace>,
     tool_calls: Vec<ToolCallTrace>,
+    session_state_snapshot: Option<RuntimeSessionStateSnapshot>,
     memory_hit_count: usize,       // 实际注入 prompt 的记忆条数
     memory_retrieved_count: usize, // 从 DB 取出的候选记忆条数
     memory_total_chars: usize,     // 注入记忆的总字符数
@@ -1545,6 +2252,8 @@ struct PromptSnapshot {
     system_prompt: String,
     raw_user_input: String,
     user_prompt: String,
+    context_sections: Vec<ContextSectionSnapshot>,
+    context_budget_summary: ContextBudgetSummary,
     context_summary: String,
     request_body: String,
     system_prompt_chars: usize,
@@ -1684,6 +2393,7 @@ impl AgentRunTrace {
             last_progress_note: None,
             llm_calls: Vec::new(),
             tool_calls: Vec::new(),
+            session_state_snapshot: None,
             trace_dir_root: workspace_root.join("data").join("agent_traces"),
             memory_hit_count: 0,
             memory_retrieved_count: 0,
@@ -1804,6 +2514,10 @@ impl AgentRunTrace {
         self.rule_parse_error = Some(error.to_string());
     }
 
+    fn record_session_state_snapshot(&mut self, snapshot: RuntimeSessionStateSnapshot) {
+        self.session_state_snapshot = Some(snapshot);
+    }
+
     fn record_observation(&mut self, observation: &AgentObservation) {
         self.observations.push(ObservationTrace {
             step: observation.step,
@@ -1919,6 +2633,8 @@ impl AgentRunTrace {
         system_prompt: &str,
         raw_user_input: &str,
         user_prompt: &str,
+        context_sections: &[ContextSectionSnapshot],
+        context_budget_summary: &ContextBudgetSummary,
         context_summary: &str,
         body: &serde_json::Value,
     ) -> usize {
@@ -1931,6 +2647,8 @@ impl AgentRunTrace {
                 system_prompt: system_prompt.to_string(),
                 raw_user_input: raw_user_input.to_string(),
                 user_prompt: user_prompt.to_string(),
+                context_sections: context_sections.to_vec(),
+                context_budget_summary: context_budget_summary.clone(),
                 context_summary: context_summary.to_string(),
                 system_prompt_chars: system_prompt.chars().count(),
                 raw_user_input_chars: raw_user_input.chars().count(),
@@ -2228,6 +2946,15 @@ impl AgentRunTrace {
             lines.push("```".to_string());
         }
 
+        if let Some(session_state_snapshot) = &self.session_state_snapshot {
+            lines.push(String::new());
+            lines.push("## Session State".to_string());
+            lines.push(String::new());
+            for line in session_state_snapshot.to_lines().into_iter().skip(2) {
+                lines.push(line);
+            }
+        }
+
         if let Some(reason) = &self.llm_fallback_reason {
             lines.push(String::new());
             lines.push("## LLM Fallback".to_string());
@@ -2345,6 +3072,26 @@ impl AgentRunTrace {
                     call.prompt.context_summary_chars
                 ));
                 lines.push(format!(
+                    "- context_max_chars: {}",
+                    call.prompt.context_budget_summary.max_total_chars
+                ));
+                lines.push(format!(
+                    "- context_final_chars: {}",
+                    call.prompt.context_budget_summary.final_total_chars
+                ));
+                lines.push(format!(
+                    "- trimmed_section_count: {}",
+                    call.prompt.context_budget_summary.trimmed_section_count
+                ));
+                lines.push(format!(
+                    "- dropped_section_count: {}",
+                    call.prompt.context_budget_summary.dropped_section_count
+                ));
+                lines.push(format!(
+                    "- context_section_count: {}",
+                    call.prompt.context_sections.len()
+                ));
+                lines.push(format!(
                     "- request_body_chars: {}",
                     call.prompt.request_body_chars
                 ));
@@ -2384,6 +3131,35 @@ impl AgentRunTrace {
                 lines.push("```text".to_string());
                 lines.push(summarize_for_markdown(&call.prompt.context_summary, 800));
                 lines.push("```".to_string());
+                lines.push(String::new());
+                lines.push("#### Context Sections".to_string());
+                lines.push(String::new());
+                if call.prompt.context_sections.is_empty() {
+                    lines.push("- (none)".to_string());
+                } else {
+                    for section in &call.prompt.context_sections {
+                        lines.push(format!(
+                        "- kind={} priority={} included={} trimmed={} lines={} items={} chars={}/{}",
+                        section.kind,
+                        section.priority,
+                        section.included,
+                        section.trimmed,
+                        section.line_count,
+                        section.item_count,
+                        section.char_count,
+                        section.original_char_count
+                    ));
+                        if let Some(reason) = &section.trim_reason {
+                            lines.push(format!("  - trim_reason: {:?}", reason));
+                        }
+                        if let Some(reason) = &section.drop_reason {
+                            lines.push(format!("  - drop_reason: {:?}", reason));
+                        }
+                        lines.push("```text".to_string());
+                        lines.push(summarize_for_markdown(&section.content, 400));
+                        lines.push("```".to_string());
+                    }
+                }
                 if let Some(content) = &call.message_content {
                     lines.push(String::new());
                     lines.push("#### Message Content Summary".to_string());
@@ -2815,6 +3591,84 @@ fn build_context_summary(trace: &AgentRunTrace, observation: Option<&AgentObserv
     }
 
     parts.join(", ")
+}
+
+fn render_context_preview(
+    trace: &AgentRunTrace,
+    planner_input: &PlannerInput,
+    runtime_session_state: &RuntimeSessionStateSnapshot,
+    memory_session_state: &SessionState,
+) -> String {
+    let mut lines = vec![
+        "# Context Preview".to_string(),
+        String::new(),
+        format!("- source_type: {}", trace.source_type),
+        format!(
+            "- trigger_type: {}",
+            trace.trigger_type.as_deref().unwrap_or("(none)")
+        ),
+        format!(
+            "- user_id: {}",
+            trace.user_id.as_deref().unwrap_or("(none)")
+        ),
+        format!("- message_count: {}", trace.message_count),
+        format!("- session_text_chars: {}", trace.session_text_chars),
+        format!(
+            "- memory: retrieved={} injected={} dropped={}",
+            memory_session_state.retrieved_count(),
+            memory_session_state.injected_count(),
+            memory_session_state.dropped.len()
+        ),
+        format!(
+            "- context_budget: final={}/{} trimmed={} dropped={}",
+            planner_input.context_budget_summary.final_total_chars,
+            planner_input.context_budget_summary.max_total_chars,
+            planner_input.context_budget_summary.trimmed_section_count,
+            planner_input.context_budget_summary.dropped_section_count
+        ),
+        String::new(),
+        "## Session State".to_string(),
+    ];
+
+    if runtime_session_state.is_empty() {
+        lines.push("- (empty)".to_string());
+    } else {
+        for line in runtime_session_state.to_lines().into_iter().skip(2) {
+            lines.push(line);
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("## Sections".to_string());
+    for section in &planner_input.context_sections {
+        lines.push(format!(
+            "- kind={} priority={} included={} trimmed={} chars={}/{} orig={}",
+            section.kind,
+            section.priority,
+            section.included,
+            section.trimmed,
+            section.char_count,
+            section.max_chars,
+            section.original_char_count
+        ));
+        if let Some(reason) = &section.trim_reason {
+            lines.push(format!("  trim_reason: {:?}", reason));
+        }
+        if let Some(reason) = &section.drop_reason {
+            lines.push(format!("  drop_reason: {:?}", reason));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("## Prompt Preview".to_string());
+    lines.push("```text".to_string());
+    lines.push(summarize_for_markdown(
+        &planner_input.assembled_user_prompt,
+        1200,
+    ));
+    lines.push("```".to_string());
+
+    lines.join("\n")
 }
 
 fn default_expected_observation_for_decision(
@@ -3627,11 +4481,13 @@ fn split_path_and_content(raw: &str) -> Result<(String, String)> {
 mod tests {
     use super::{
         build_agent_log_payload, build_context_summary, classify_tool_execution_failure,
-        detect_stalled_trajectory_failure, load_business_context_snapshot, map_llm_plan,
-        parse_llm_plan, validate_expected_observation, AgentCore, AgentObservation,
-        AgentRunContext, AgentRunTrace, BusinessContextSnapshot, ContextAssembler, DoneRule,
-        DropReason, ExecutionPlan, ExpectedObservation, FailureAction, FailureDecision, LlmPlan,
-        MinimumNovelty, ObservationKind, PlannedDecision, ReplanScope, StepFailureKind,
+        derive_runtime_session_state, detect_stalled_trajectory_failure,
+        load_business_context_snapshot, map_llm_plan, parse_llm_plan,
+        validate_expected_observation, AgentCore, AgentObservation, AgentRunContext, AgentRunTrace,
+        BusinessContextSnapshot, ContextAssembler, ContextSectionChangeReason, ContextSectionKind,
+        DoneRule, DropReason, ExecutionPlan, ExpectedObservation, FailureAction, FailureDecision,
+        LlmPlan, MinimumNovelty, ObservationKind, PlannedDecision, ReplanScope,
+        RuntimeSessionStateSnapshot, StepFailureKind,
     };
     use crate::task_store::TaskStore;
     use serde_json::{json, Value};
@@ -4517,10 +5373,13 @@ mod tests {
             recent_tasks: Vec::new(),
             user_memories: Vec::new(),
         };
+        let runtime_session_state =
+            derive_runtime_session_state(&trace, "读文件 demo.txt", Some(&observation), None);
         let planner_input = ContextAssembler.assemble(
             &trace,
             "读文件 demo.txt",
             Some(&observation),
+            Some(&runtime_session_state),
             &[
                 "read: 读取工作区内文件，参数: path".to_string(),
                 "get_task_status: 查询单个任务状态，参数: task_id".to_string(),
@@ -4551,10 +5410,140 @@ mod tests {
             .contains("current_step_index: 1"));
         assert!(planner_input
             .assembled_user_prompt
+            .contains("## Session State"));
+        assert!(planner_input
+            .assembled_user_prompt
             .contains("## Latest Observation"));
         assert!(planner_input
             .assembled_user_prompt
             .contains("hello from tool"));
+        assert!(planner_input.context_budget_summary.final_total_chars > 0);
+        let latest_section = planner_input
+            .context_sections
+            .iter()
+            .find(|section| section.kind == "latest_observation")
+            .expect("应包含 latest_observation section");
+        assert!(latest_section.line_count >= 6);
+        assert!(latest_section.item_count >= 5);
+        assert!(latest_section.char_count > 0);
+        assert!(latest_section.content.contains("read_file"));
+    }
+
+    #[test]
+    fn context_pack_exposes_section_metadata() {
+        let workspace = temp_workspace();
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "读文件 demo.txt",
+            AgentRunContext::wechat_chat("user-context", "commit", vec![])
+                .with_session_text("session merged text"),
+        );
+        let observation = AgentObservation::tool_result(1, "read_file", "hello from tool");
+        let runtime_session_state =
+            derive_runtime_session_state(&trace, "读文件 demo.txt", Some(&observation), None);
+        let pack = ContextAssembler.build_pack(
+            &trace,
+            "读文件 demo.txt",
+            Some(&observation),
+            Some(&runtime_session_state),
+            &["read: 读取工作区内文件，参数: path".to_string()],
+            None,
+        );
+
+        let latest = pack
+            .section(ContextSectionKind::LatestObservation)
+            .expect("应包含 latest observation section");
+        assert_eq!(latest.kind.as_str(), "latest_observation");
+        assert!(latest.item_count() >= 5);
+        assert!(latest.char_count() > 0);
+        assert!(latest.lines.iter().any(|line| line.contains("read_file")));
+
+        let rendered = pack.render();
+        assert!(rendered.contains("## User Input"));
+        assert!(rendered.contains("## Session State"));
+        assert!(rendered.contains("## Session Text"));
+        assert!(rendered.contains("## Available Tools"));
+    }
+
+    #[test]
+    fn context_pack_records_trim_and_drop_reasons() {
+        let workspace = temp_workspace();
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "请帮我处理一个很长的上下文请求",
+            AgentRunContext::wechat_chat("user-budget", "commit", vec![])
+                .with_session_text(&"session ".repeat(240)),
+        );
+        let observation =
+            AgentObservation::tool_result(1, "read_file", &"observation ".repeat(240));
+        let runtime_session_state = RuntimeSessionStateSnapshot {
+            goal: Some("推进一个需要大量上下文的信息整理任务".to_string()),
+            current_subtask: Some("先整理线索，再决定是否继续调工具".to_string()),
+            constraints: vec!["避免重复无效动作".to_string(); 4],
+            confirmed_facts: vec![
+                "已有较长 session_text 和 latest_observation".to_string();
+                4
+            ],
+            done_items: vec!["已完成初步读取".to_string(); 3],
+            next_step: Some("优先收敛上下文而不是继续膨胀 prompt".to_string()),
+            open_questions: vec!["哪些 section 可以先被丢弃".to_string(); 3],
+        };
+        let mut pack = ContextAssembler.build_pack(
+            &trace,
+            "请帮我处理一个很长的上下文请求",
+            Some(&observation),
+            Some(&runtime_session_state),
+            &[
+                format!("read: {}", "tool ".repeat(120)),
+                format!("write: {}", "tool ".repeat(120)),
+            ],
+            None,
+        );
+        pack.max_total_chars = 1500;
+        pack.apply_total_budget();
+
+        let snapshot = pack.snapshot();
+        assert!(snapshot.iter().any(|section| {
+            section.trimmed
+                && section.trim_reason == Some(ContextSectionChangeReason::SectionBudgetExceeded)
+        }));
+        assert!(snapshot.iter().any(|section| {
+            !section.included
+                && section.drop_reason == Some(ContextSectionChangeReason::TotalBudgetExceeded)
+        }));
+        assert!(pack.budget_summary().final_total_chars <= 1500);
+    }
+
+    #[test]
+    fn context_pack_includes_previous_observation_summaries() {
+        let workspace = temp_workspace();
+        let mut trace = AgentRunTrace::new(
+            &workspace,
+            "继续处理",
+            AgentRunContext::wechat_chat("user-obs", "commit", vec![]),
+        );
+        let older = AgentObservation::tool_result(0, "read_file", "older observation payload");
+        let latest = AgentObservation::tool_result(1, "write_file", "latest observation payload");
+        trace.record_observation(&older);
+        trace.record_observation(&latest);
+
+        let runtime_session_state =
+            derive_runtime_session_state(&trace, "继续处理", Some(&latest), None);
+        let pack = ContextAssembler.build_pack(
+            &trace,
+            "继续处理",
+            Some(&latest),
+            Some(&runtime_session_state),
+            &["read: 读取工作区内文件，参数: path".to_string()],
+            None,
+        );
+
+        let previous = pack
+            .section(ContextSectionKind::PreviousObservations)
+            .expect("应包含 previous_observations section");
+        let rendered = previous.render();
+        assert!(rendered.contains("older observation payload"));
+        assert!(!rendered.contains("latest observation payload"));
     }
 
     #[test]
@@ -4609,11 +5598,14 @@ mod tests {
         let (business, _) = load_business_context_snapshot(Some(db_path.as_path()), &trace)
             .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
+        let runtime_session_state =
+            derive_runtime_session_state(&trace, "帮我看任务", None, Some(&business));
 
         let planner_input = ContextAssembler.assemble(
             &trace,
             "帮我看任务",
             None,
+            Some(&runtime_session_state),
             &["get_task_status: 查询单个任务状态，参数: task_id".to_string()],
             Some(&business),
         );
@@ -4627,6 +5619,40 @@ mod tests {
         assert!(planner_input
             .assembled_user_prompt
             .contains("## Recent Tasks"));
+        assert!(planner_input
+            .context_sections
+            .iter()
+            .any(|section| section.kind == "current_task"));
+        assert!(planner_input
+            .context_sections
+            .iter()
+            .any(|section| section.kind == "recent_tasks"));
+    }
+
+    #[test]
+    fn preview_context_renders_budget_and_sections() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        store
+            .add_user_memory("user-preview", "我喜欢短摘要")
+            .expect("写入 memory 失败");
+        let agent = AgentCore::with_task_store_db_path(workspace, &db_path).expect("初始化失败");
+
+        let preview = agent
+            .preview_context_with_context(
+                "帮我总结一下当前上下文",
+                AgentRunContext::wechat_chat("user-preview", "context_debug", vec![])
+                    .with_session_text("帮我总结一下当前上下文"),
+            )
+            .expect("应成功生成 preview");
+
+        assert!(preview.contains("# Context Preview"));
+        assert!(preview.contains("## Session State"));
+        assert!(preview.contains("## Sections"));
+        assert!(preview.contains("context_budget: final="));
+        assert!(preview.contains("kind=user_memories"));
+        assert!(preview.contains("## Prompt Preview"));
     }
 
     #[test]

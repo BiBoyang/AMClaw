@@ -10,6 +10,7 @@ pub enum RouteIntent {
     UserMemoryUseful { memory_id: String },
     UserMemorySuppress { memory_id: String },
     UserMemoriesQuery,
+    ContextDebugQuery { text: Option<String> },
     DailyReportQuery { day: Option<String> },
     TaskStatusQuery { task_id: String },
     LinkSubmission { urls: Vec<String> },
@@ -39,6 +40,10 @@ pub fn route_text(input: &str) -> RouteIntent {
 
     if is_user_memories_query(text) {
         return RouteIntent::UserMemoriesQuery;
+    }
+
+    if let Some(text) = parse_context_debug_query(text) {
+        return RouteIntent::ContextDebugQuery { text };
     }
 
     if let Some(memory_id) = parse_user_memory_useful(text) {
@@ -158,6 +163,21 @@ fn is_recent_tasks_query(input: &str) -> bool {
 
 fn is_user_memories_query(input: &str) -> bool {
     matches!(input, "我的记忆" | "我的偏好" | "memories" | "my memories")
+}
+
+fn parse_context_debug_query(input: &str) -> Option<Option<String>> {
+    if matches!(input, "/context" | "上下文" | "context") {
+        return Some(None);
+    }
+    let rest = input
+        .strip_prefix("/context ")
+        .or_else(|| input.strip_prefix("上下文 "))
+        .or_else(|| input.strip_prefix("context "))?;
+    let text = rest.trim();
+    if text.is_empty() {
+        return Some(None);
+    }
+    Some(Some(text.to_string()))
 }
 
 fn parse_user_memory_suppress(input: &str) -> Option<String> {
@@ -357,6 +377,16 @@ mod tests {
     #[test]
     fn user_memory_commands_are_supported() {
         assert_eq!(route_text("我的记忆"), RouteIntent::UserMemoriesQuery);
+        assert_eq!(
+            route_text("/context"),
+            RouteIntent::ContextDebugQuery { text: None }
+        );
+        assert_eq!(
+            route_text("/context 帮我总结一下"),
+            RouteIntent::ContextDebugQuery {
+                text: Some("帮我总结一下".to_string())
+            }
+        );
         assert_eq!(
             route_text("记住 我更喜欢短摘要"),
             RouteIntent::UserMemoryWrite {

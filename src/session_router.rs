@@ -89,6 +89,7 @@ impl SessionRouter {
             | RouteIntent::UserMemoryUseful { .. }
             | RouteIntent::UserMemorySuppress { .. }
             | RouteIntent::UserMemoriesQuery
+            | RouteIntent::ContextDebugQuery { .. }
             | RouteIntent::DailyReportQuery { .. }
             | RouteIntent::TaskStatusQuery { .. }
             | RouteIntent::TaskRetryRequest { .. }

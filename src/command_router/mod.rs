@@ -10,7 +10,7 @@ pub enum RouteIntent {
     UserMemoryUseful { memory_id: String },
     UserMemorySuppress { memory_id: String },
     UserMemoriesQuery,
-    ContextDebugQuery { text: Option<String> },
+    ContextDebugQuery { text: Option<String>, verbose: bool },
     DailyReportQuery { day: Option<String> },
     TaskStatusQuery { task_id: String },
     LinkSubmission { urls: Vec<String> },
@@ -42,8 +42,8 @@ pub fn route_text(input: &str) -> RouteIntent {
         return RouteIntent::UserMemoriesQuery;
     }
 
-    if let Some(text) = parse_context_debug_query(text) {
-        return RouteIntent::ContextDebugQuery { text };
+    if let Some((text, verbose)) = parse_context_debug_query(text) {
+        return RouteIntent::ContextDebugQuery { text, verbose };
     }
 
     if let Some(memory_id) = parse_user_memory_useful(text) {
@@ -165,19 +165,32 @@ fn is_user_memories_query(input: &str) -> bool {
     matches!(input, "我的记忆" | "我的偏好" | "memories" | "my memories")
 }
 
-fn parse_context_debug_query(input: &str) -> Option<Option<String>> {
+fn parse_context_debug_query(input: &str) -> Option<(Option<String>, bool)> {
     if matches!(input, "/context" | "上下文" | "context") {
-        return Some(None);
+        return Some((None, false));
+    }
+    if matches!(
+        input,
+        "/context verbose" | "/context 详细" | "上下文 详细" | "context verbose"
+    ) {
+        return Some((None, true));
     }
     let rest = input
         .strip_prefix("/context ")
         .or_else(|| input.strip_prefix("上下文 "))
         .or_else(|| input.strip_prefix("context "))?;
-    let text = rest.trim();
+    let rest = rest.trim();
+    let (verbose, text) = if let Some(text) = rest.strip_prefix("verbose ") {
+        (true, text.trim())
+    } else if let Some(text) = rest.strip_prefix("详细 ") {
+        (true, text.trim())
+    } else {
+        (false, rest)
+    };
     if text.is_empty() {
-        return Some(None);
+        return Some((None, verbose));
     }
-    Some(Some(text.to_string()))
+    Some((Some(text.to_string()), verbose))
 }
 
 fn parse_user_memory_suppress(input: &str) -> Option<String> {
@@ -379,12 +392,30 @@ mod tests {
         assert_eq!(route_text("我的记忆"), RouteIntent::UserMemoriesQuery);
         assert_eq!(
             route_text("/context"),
-            RouteIntent::ContextDebugQuery { text: None }
+            RouteIntent::ContextDebugQuery {
+                text: None,
+                verbose: false
+            }
+        );
+        assert_eq!(
+            route_text("/context verbose"),
+            RouteIntent::ContextDebugQuery {
+                text: None,
+                verbose: true
+            }
         );
         assert_eq!(
             route_text("/context 帮我总结一下"),
             RouteIntent::ContextDebugQuery {
-                text: Some("帮我总结一下".to_string())
+                text: Some("帮我总结一下".to_string()),
+                verbose: false
+            }
+        );
+        assert_eq!(
+            route_text("/context verbose 帮我总结一下"),
+            RouteIntent::ContextDebugQuery {
+                text: Some("帮我总结一下".to_string()),
+                verbose: true
             }
         );
         assert_eq!(

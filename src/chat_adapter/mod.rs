@@ -559,8 +559,8 @@ impl WeChatBot {
             command_router::RouteIntent::UserMemoriesQuery => {
                 self.handle_user_memories_query(from_user_id);
             }
-            command_router::RouteIntent::ContextDebugQuery { text } => {
-                self.handle_context_debug_query(from_user_id, text.as_deref());
+            command_router::RouteIntent::ContextDebugQuery { text, verbose } => {
+                self.handle_context_debug_query(from_user_id, text.as_deref(), verbose);
             }
             command_router::RouteIntent::UserMemoryWrite { content } => {
                 self.handle_user_memory_write(from_user_id, &content);
@@ -742,7 +742,7 @@ impl WeChatBot {
             return format!("现在是 {}", now.format("%Y-%m-%d %H:%M:%S"));
         }
         if user_text == "帮助" || user_text == "help" {
-            return "可用命令:\n- hello / 你好\n- 时间\n- 帮助 / help\n- 发送链接或 收藏 <url>\n- 状态 <task_id>\n- 最近任务\n- 日报 [YYYY-MM-DD] / 今日整理\n- 记住 <content>\n- 我的记忆\n- 有用 <memory_id>\n- 重试 <task_id>\n- /context [text]\n- 其他文字我会 echo 回复"
+            return "可用命令:\n- hello / 你好\n- 时间\n- 帮助 / help\n- 发送链接或 收藏 <url>\n- 状态 <task_id>\n- 最近任务\n- 日报 [YYYY-MM-DD] / 今日整理\n- 记住 <content>\n- 我的记忆\n- 有用 <memory_id>\n- 重试 <task_id>\n- /context [text]\n- /context verbose [text]\n- 其他文字我会 echo 回复"
                 .to_string();
         }
         format!("Echo: {user_text}")
@@ -780,7 +780,7 @@ impl WeChatBot {
         self.send_reply_text(user_id, &reply);
     }
 
-    fn handle_context_debug_query(&self, user_id: &str, extra_text: Option<&str>) {
+    fn handle_context_debug_query(&self, user_id: &str, extra_text: Option<&str>, verbose: bool) {
         let pending = self.session_router.snapshot(user_id);
         let mut parts = Vec::new();
         let mut message_ids = Vec::new();
@@ -803,12 +803,21 @@ impl WeChatBot {
         }
 
         let merged_text = parts.join("\n");
-        let reply = match self.agent_core.preview_context_with_context(
-            &merged_text,
-            AgentRunContext::wechat_chat(user_id, "context_debug", message_ids)
-                .with_session_text(&merged_text)
-                .with_context_token_present(self.context_token_map.contains_key(user_id)),
-        ) {
+        let mode = if verbose {
+            crate::agent_core::ContextPreviewMode::Verbose
+        } else {
+            crate::agent_core::ContextPreviewMode::Summary
+        };
+        let context = AgentRunContext::wechat_chat(user_id, "context_debug", message_ids)
+            .with_session_text(&merged_text)
+            .with_context_token_present(self.context_token_map.contains_key(user_id));
+        let reply = match if matches!(mode, crate::agent_core::ContextPreviewMode::Summary) {
+            self.agent_core
+                .preview_context_with_context(&merged_text, context)
+        } else {
+            self.agent_core
+                .preview_context_with_context_mode(&merged_text, context, mode)
+        } {
             Ok(reply) => reply,
             Err(err) => format!("生成 context preview 失败: {err}"),
         };

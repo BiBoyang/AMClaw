@@ -148,6 +148,15 @@ enum ContextSectionChangeReason {
     TotalBudgetExceeded,
 }
 
+impl ContextSectionChangeReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::SectionBudgetExceeded => "section_budget_exceeded",
+            Self::TotalBudgetExceeded => "total_budget_exceeded",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct ContextBudgetSummary {
     max_total_chars: usize,
@@ -165,6 +174,12 @@ struct RuntimeSessionStateSnapshot {
     done_items: Vec<String>,
     next_step: Option<String>,
     open_questions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ContextPreviewMode {
+    Summary,
+    Verbose,
 }
 
 impl RuntimeSessionStateSnapshot {
@@ -522,6 +537,16 @@ enum DropReason {
     SingleItemTooLong,
     /// 总字符数或条数超过预算
     BudgetExceeded,
+}
+
+impl DropReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Deduplicated => "deduplicated",
+            Self::SingleItemTooLong => "single_item_too_long",
+            Self::BudgetExceeded => "budget_exceeded",
+        }
+    }
 }
 
 /// 单次 agent run 的 memory 生命周期状态
@@ -1101,14 +1126,10 @@ impl ContextAssembler {
             ));
         }
 
-        let previous_observations = if observation.is_some() && !trace.observations.is_empty() {
-            &trace.observations[..trace.observations.len() - 1]
-        } else {
-            &trace.observations[..]
-        };
+        let previous_observations = select_previous_observations(trace, observation);
         if !previous_observations.is_empty() {
             let mut lines = vec![String::new(), "## Previous Observations".to_string()];
-            for item in previous_observations.iter().rev().take(3).rev() {
+            for item in previous_observations {
                 lines.push(format!(
                     "- step={} source={} chars={} summary={}",
                     item.step, item.source, item.content_chars, item.summary
@@ -1541,6 +1562,15 @@ impl AgentCore {
         user_input: &str,
         context: AgentRunContext,
     ) -> Result<String> {
+        self.preview_context_with_context_mode(user_input, context, ContextPreviewMode::Summary)
+    }
+
+    pub fn preview_context_with_context_mode(
+        &self,
+        user_input: &str,
+        context: AgentRunContext,
+        mode: ContextPreviewMode,
+    ) -> Result<String> {
         let mut trace = AgentRunTrace::new(&self.workspace_root, user_input, context);
         trace.configure_controller_limits(self.max_steps, self.max_replans);
 
@@ -1569,6 +1599,7 @@ impl AgentCore {
             &planner_input,
             &runtime_session_state,
             &session_state,
+            mode,
         ))
     }
 
@@ -2066,16 +2097,7 @@ impl LlmClient {
         } else {
             body["temperature"] = json!(0.0);
         }
-        let llm_call = trace.start_llm_call(
-            config,
-            system_prompt,
-            &planner_input.raw_user_input,
-            &planner_input.assembled_user_prompt,
-            &planner_input.context_sections,
-            &planner_input.context_budget_summary,
-            &planner_input.context_summary,
-            &body,
-        );
+        let llm_call = trace.start_llm_call(config, system_prompt, planner_input, &body);
         let mut last_status = 0u16;
         let mut last_text = String::new();
         let mut payload_text: Option<String> = None;
@@ -2631,11 +2653,7 @@ impl AgentRunTrace {
         &mut self,
         config: &LlmConfig,
         system_prompt: &str,
-        raw_user_input: &str,
-        user_prompt: &str,
-        context_sections: &[ContextSectionSnapshot],
-        context_budget_summary: &ContextBudgetSummary,
-        context_summary: &str,
+        planner_input: &PlannerInput,
         body: &serde_json::Value,
     ) -> usize {
         let request_body = serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
@@ -2645,18 +2663,18 @@ impl AgentRunTrace {
             base_url: config.base_url.clone(),
             prompt: PromptSnapshot {
                 system_prompt: system_prompt.to_string(),
-                raw_user_input: raw_user_input.to_string(),
-                user_prompt: user_prompt.to_string(),
-                context_sections: context_sections.to_vec(),
-                context_budget_summary: context_budget_summary.clone(),
-                context_summary: context_summary.to_string(),
+                raw_user_input: planner_input.raw_user_input.clone(),
+                user_prompt: planner_input.assembled_user_prompt.clone(),
+                context_sections: planner_input.context_sections.clone(),
+                context_budget_summary: planner_input.context_budget_summary.clone(),
+                context_summary: planner_input.context_summary.clone(),
                 system_prompt_chars: system_prompt.chars().count(),
-                raw_user_input_chars: raw_user_input.chars().count(),
-                user_prompt_chars: user_prompt.chars().count(),
-                context_summary_chars: context_summary.chars().count(),
+                raw_user_input_chars: planner_input.raw_user_input.chars().count(),
+                user_prompt_chars: planner_input.assembled_user_prompt.chars().count(),
+                context_summary_chars: planner_input.context_summary.chars().count(),
                 request_body_chars: request_body.chars().count(),
                 estimated_prompt_chars: system_prompt.chars().count()
-                    + user_prompt.chars().count()
+                    + planner_input.assembled_user_prompt.chars().count()
                     + request_body.chars().count(),
                 request_body,
             },
@@ -2947,12 +2965,7 @@ impl AgentRunTrace {
         }
 
         if let Some(session_state_snapshot) = &self.session_state_snapshot {
-            lines.push(String::new());
-            lines.push("## Session State".to_string());
-            lines.push(String::new());
-            for line in session_state_snapshot.to_lines().into_iter().skip(2) {
-                lines.push(line);
-            }
+            append_session_state_lines(&mut lines, session_state_snapshot);
         }
 
         if let Some(reason) = &self.llm_fallback_reason {
@@ -3150,10 +3163,10 @@ impl AgentRunTrace {
                         section.original_char_count
                     ));
                         if let Some(reason) = &section.trim_reason {
-                            lines.push(format!("  - trim_reason: {:?}", reason));
+                            lines.push(format!("  - trim_reason: {}", reason.as_str()));
                         }
                         if let Some(reason) = &section.drop_reason {
-                            lines.push(format!("  - drop_reason: {:?}", reason));
+                            lines.push(format!("  - drop_reason: {}", reason.as_str()));
                         }
                         lines.push("```text".to_string());
                         lines.push(summarize_for_markdown(&section.content, 400));
@@ -3593,11 +3606,81 @@ fn build_context_summary(trace: &AgentRunTrace, observation: Option<&AgentObserv
     parts.join(", ")
 }
 
+fn select_previous_observations<'a>(
+    trace: &'a AgentRunTrace,
+    observation: Option<&AgentObservation>,
+) -> Vec<&'a ObservationTrace> {
+    let candidate_len = if observation.is_some() && !trace.observations.is_empty() {
+        trace.observations.len().saturating_sub(1)
+    } else {
+        trace.observations.len()
+    };
+    let candidates = &trace.observations[..candidate_len];
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut selected = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in candidates.iter().rev() {
+        let key = format!("{}::{}", item.source, item.summary);
+        if seen.insert(key) {
+            selected.push(item);
+        }
+        if selected.len() >= 3 {
+            break;
+        }
+    }
+    selected.reverse();
+    selected
+}
+
+fn append_session_state_lines(
+    lines: &mut Vec<String>,
+    runtime_session_state: &RuntimeSessionStateSnapshot,
+) {
+    lines.push(String::new());
+    lines.push("## Session State".to_string());
+    if runtime_session_state.is_empty() {
+        lines.push("- (empty)".to_string());
+    } else {
+        lines.extend(runtime_session_state.to_lines().into_iter().skip(2));
+    }
+}
+
+fn append_context_section_overview(lines: &mut Vec<String>, sections: &[ContextSectionSnapshot]) {
+    lines.push(String::new());
+    lines.push("## Sections".to_string());
+    if sections.is_empty() {
+        lines.push("- (none)".to_string());
+        return;
+    }
+    for section in sections {
+        lines.push(format!(
+            "- kind={} priority={} included={} trimmed={} chars={}/{} orig={}",
+            section.kind,
+            section.priority,
+            section.included,
+            section.trimmed,
+            section.char_count,
+            section.max_chars,
+            section.original_char_count
+        ));
+        if let Some(reason) = &section.trim_reason {
+            lines.push(format!("  - trim_reason: {}", reason.as_str()));
+        }
+        if let Some(reason) = &section.drop_reason {
+            lines.push(format!("  - drop_reason: {}", reason.as_str()));
+        }
+    }
+}
+
 fn render_context_preview(
     trace: &AgentRunTrace,
     planner_input: &PlannerInput,
     runtime_session_state: &RuntimeSessionStateSnapshot,
     memory_session_state: &SessionState,
+    mode: ContextPreviewMode,
 ) -> String {
     let mut lines = vec![
         "# Context Preview".to_string(),
@@ -3614,10 +3697,13 @@ fn render_context_preview(
         format!("- message_count: {}", trace.message_count),
         format!("- session_text_chars: {}", trace.session_text_chars),
         format!(
-            "- memory: retrieved={} injected={} dropped={}",
+            "- memory: retrieved={} injected={} dropped={} budget={}/{}/{}",
             memory_session_state.retrieved_count(),
             memory_session_state.injected_count(),
-            memory_session_state.dropped.len()
+            memory_session_state.dropped.len(),
+            memory_session_state.budget.max_items,
+            memory_session_state.budget.max_total_chars,
+            memory_session_state.budget.max_single_chars
         ),
         format!(
             "- context_budget: final={}/{} trimmed={} dropped={}",
@@ -3626,36 +3712,39 @@ fn render_context_preview(
             planner_input.context_budget_summary.trimmed_section_count,
             planner_input.context_budget_summary.dropped_section_count
         ),
-        String::new(),
-        "## Session State".to_string(),
     ];
 
-    if runtime_session_state.is_empty() {
-        lines.push("- (empty)".to_string());
-    } else {
-        for line in runtime_session_state.to_lines().into_iter().skip(2) {
-            lines.push(line);
-        }
-    }
+    append_session_state_lines(&mut lines, runtime_session_state);
+    append_context_section_overview(&mut lines, &planner_input.context_sections);
 
-    lines.push(String::new());
-    lines.push("## Sections".to_string());
-    for section in &planner_input.context_sections {
-        lines.push(format!(
-            "- kind={} priority={} included={} trimmed={} chars={}/{} orig={}",
-            section.kind,
-            section.priority,
-            section.included,
-            section.trimmed,
-            section.char_count,
-            section.max_chars,
-            section.original_char_count
-        ));
-        if let Some(reason) = &section.trim_reason {
-            lines.push(format!("  trim_reason: {:?}", reason));
+    if matches!(mode, ContextPreviewMode::Verbose) {
+        lines.push(String::new());
+        lines.push("## Memory Dropped".to_string());
+        if memory_session_state.dropped.is_empty() {
+            lines.push("- (none)".to_string());
+        } else {
+            for dropped in &memory_session_state.dropped {
+                lines.push(format!(
+                    "- id={} reason={} preview={}",
+                    dropped.id,
+                    dropped.reason.as_str(),
+                    dropped.content_preview
+                ));
+            }
         }
-        if let Some(reason) = &section.drop_reason {
-            lines.push(format!("  drop_reason: {:?}", reason));
+
+        lines.push(String::new());
+        lines.push("## Section Content Preview".to_string());
+        for section in &planner_input.context_sections {
+            lines.push(String::new());
+            lines.push(format!(
+                "### {}{}",
+                section.kind,
+                if section.included { "" } else { " (dropped)" }
+            ));
+            lines.push("```text".to_string());
+            lines.push(summarize_for_markdown(&section.content, 500));
+            lines.push("```".to_string());
         }
     }
 
@@ -4482,12 +4571,12 @@ mod tests {
     use super::{
         build_agent_log_payload, build_context_summary, classify_tool_execution_failure,
         derive_runtime_session_state, detect_stalled_trajectory_failure,
-        load_business_context_snapshot, map_llm_plan, parse_llm_plan,
+        load_business_context_snapshot, map_llm_plan, parse_llm_plan, select_previous_observations,
         validate_expected_observation, AgentCore, AgentObservation, AgentRunContext, AgentRunTrace,
-        BusinessContextSnapshot, ContextAssembler, ContextSectionChangeReason, ContextSectionKind,
-        DoneRule, DropReason, ExecutionPlan, ExpectedObservation, FailureAction, FailureDecision,
-        LlmPlan, MinimumNovelty, ObservationKind, PlannedDecision, ReplanScope,
-        RuntimeSessionStateSnapshot, StepFailureKind,
+        BusinessContextSnapshot, ContextAssembler, ContextPreviewMode, ContextSectionChangeReason,
+        ContextSectionKind, DoneRule, DropReason, ExecutionPlan, ExpectedObservation,
+        FailureAction, FailureDecision, LlmPlan, MinimumNovelty, ObservationKind, PlannedDecision,
+        ReplanScope, RuntimeSessionStateSnapshot, StepFailureKind,
     };
     use crate::task_store::TaskStore;
     use serde_json::{json, Value};
@@ -5472,7 +5561,7 @@ mod tests {
             &workspace,
             "请帮我处理一个很长的上下文请求",
             AgentRunContext::wechat_chat("user-budget", "commit", vec![])
-                .with_session_text(&"session ".repeat(240)),
+                .with_session_text("session ".repeat(240)),
         );
         let observation =
             AgentObservation::tool_result(1, "read_file", &"observation ".repeat(240));
@@ -5544,6 +5633,26 @@ mod tests {
         let rendered = previous.render();
         assert!(rendered.contains("older observation payload"));
         assert!(!rendered.contains("latest observation payload"));
+    }
+
+    #[test]
+    fn previous_observations_skip_duplicate_summaries() {
+        let workspace = temp_workspace();
+        let mut trace = AgentRunTrace::new(
+            &workspace,
+            "继续处理",
+            AgentRunContext::wechat_chat("user-obs", "commit", vec![]),
+        );
+        let repeated = AgentObservation::tool_result(0, "read_file", "same payload");
+        let repeated_again = AgentObservation::tool_result(1, "read_file", "same payload");
+        let latest = AgentObservation::tool_result(2, "write_file", "different payload");
+        trace.record_observation(&repeated);
+        trace.record_observation(&repeated_again);
+        trace.record_observation(&latest);
+
+        let selected = select_previous_observations(&trace, Some(&latest));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].summary, "same payload");
     }
 
     #[test]
@@ -5653,6 +5762,31 @@ mod tests {
         assert!(preview.contains("context_budget: final="));
         assert!(preview.contains("kind=user_memories"));
         assert!(preview.contains("## Prompt Preview"));
+    }
+
+    #[test]
+    fn preview_context_verbose_includes_section_content_and_memory_drop_details() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        store
+            .add_user_memory("user-preview", "这是一条很长的记忆 ".repeat(40).as_str())
+            .expect("写入 memory 失败");
+        let agent = AgentCore::with_task_store_db_path(workspace, &db_path).expect("初始化失败");
+
+        let preview = agent
+            .preview_context_with_context_mode(
+                "帮我总结一下当前上下文",
+                AgentRunContext::wechat_chat("user-preview", "context_debug", vec![])
+                    .with_session_text("帮我总结一下当前上下文"),
+                ContextPreviewMode::Verbose,
+            )
+            .expect("应成功生成 preview");
+
+        assert!(preview.contains("## Memory Dropped"));
+        assert!(preview.contains("single_item_too_long"));
+        assert!(preview.contains("## Section Content Preview"));
+        assert!(preview.contains("### session_state"));
     }
 
     #[test]

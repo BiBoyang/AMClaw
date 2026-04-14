@@ -132,8 +132,6 @@ pub enum SkipReason {
     Empty,
     /// 内容超过单条长度限制
     TooLong,
-    /// 自动记忆置信度不足
-    TooWeak,
     /// 与已有记忆规范化后重复
     Duplicate,
     /// auto 记忆与已有 explicit 冲突，不允许降级
@@ -149,7 +147,6 @@ impl std::fmt::Display for SkipReason {
         match self {
             Self::Empty => write!(f, "empty_content"),
             Self::TooLong => write!(f, "too_long"),
-            Self::TooWeak => write!(f, "too_weak"),
             Self::Duplicate => write!(f, "duplicate"),
             Self::AutoWouldDowngradeExplicit => write!(f, "auto_would_downgrade_explicit"),
             Self::Invalid => write!(f, "invalid"),
@@ -176,7 +173,7 @@ impl std::fmt::Display for PromoteReason {
 #[derive(Debug, Clone)]
 pub enum WriteDecision {
     /// 新写入成功
-    Written(UserMemoryRecord),
+    Written(Box<UserMemoryRecord>),
     /// 跳过写入
     Skipped {
         content_preview: String,
@@ -200,20 +197,20 @@ pub struct MemoryWriteState {
 }
 
 impl MemoryWriteState {
+    #[cfg(test)]
     pub fn written_count(&self) -> usize {
         self.written.len()
     }
+
+    #[cfg(test)]
     pub fn skipped_count(&self) -> usize {
         self.skipped.len()
-    }
-    pub fn promoted_count(&self) -> usize {
-        self.promoted.len()
     }
 
     /// 记录一次写入决策
     fn record(&mut self, decision: WriteDecision) {
         match decision {
-            WriteDecision::Written(record) => self.written.push(record),
+            WriteDecision::Written(record) => self.written.push(*record),
             WriteDecision::Skipped {
                 content_preview,
                 reason,
@@ -284,6 +281,7 @@ impl MemoryFeedbackState {
     }
 
     /// 是否有任何 feedback
+    #[cfg(test)]
     pub fn has_feedback(&self) -> bool {
         !self.feedback.is_empty()
     }
@@ -465,6 +463,7 @@ impl TaskStore {
 
     /// 写入显式用户记忆（用户明确要求"记住"）
     /// memory_type="explicit", priority=100
+    #[cfg(test)]
     pub fn add_user_memory(&mut self, user_id: &str, content: &str) -> Result<UserMemoryRecord> {
         self.add_user_memory_typed(user_id, content, "explicit", 100)
     }
@@ -633,7 +632,7 @@ impl TaskStore {
         // 5. 新写入
         match self.add_user_memory_typed(user_id, content, memory_type, priority) {
             Ok(record) => {
-                let decision = WriteDecision::Written(record);
+                let decision = WriteDecision::Written(Box::new(record));
                 write_state.record(decision.clone());
                 decision
             }
@@ -700,6 +699,7 @@ impl TaskStore {
         Ok(memories)
     }
 
+    #[cfg(test)]
     pub fn has_user_memory(&self, user_id: &str, content: &str) -> Result<bool> {
         let count: i64 = self
             .conn
@@ -3060,6 +3060,6 @@ mod tests {
         assert_eq!(fb.useful_count("m1"), 1);
         assert_eq!(fb.retrieved_count("m2"), 1);
         assert_eq!(fb.injected_count("m2"), 0);
-        assert_eq!(fb.has_feedback(), true);
+        assert!(fb.has_feedback());
     }
 }

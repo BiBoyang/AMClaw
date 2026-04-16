@@ -162,6 +162,7 @@ cp .env.moonshot.example .env.moonshot
 
 - SQLite 数据库写到 `./data/amclaw.db`
 - 会话合并窗口为 5 秒
+- `agent.session_summary_strategy` 默认 `semantic`（可选 `truncate`）
 - 微信 channel version 为 `1.0.0`
 - 浏览器抓取默认关闭，需要显式在 `[browser]` 下启用
 - `.env*.example` 是可提交模板；真实 `.env` 文件仅用于本地开发，不应提交

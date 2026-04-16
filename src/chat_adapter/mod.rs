@@ -416,7 +416,11 @@ impl WeChatBot {
         let db_path = config.db_path();
         let root_dir = config.resolved_root_dir();
         let mut bot = Self {
-            agent_core: AgentCore::with_task_store_db_path(workspace_root, db_path.clone())?,
+            agent_core: AgentCore::with_task_store_db_path_and_agent_config(
+                workspace_root,
+                db_path.clone(),
+                &config.agent,
+            )?,
             client: ILinkClient::new(config.wechat.channel_version.clone())?,
             pipeline: Pipeline::new(root_dir, browser),
             reporter: DailyReporter::from_config(&config)?,

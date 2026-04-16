@@ -24,6 +24,7 @@ pub struct AppConfig {
 pub struct AgentConfig {
     pub mode: String,
     pub timezone: String,
+    pub session_summary_strategy: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +101,7 @@ impl Default for AgentConfig {
         Self {
             mode: "restricted".to_string(),
             timezone: "Asia/Shanghai".to_string(),
+            session_summary_strategy: "semantic".to_string(),
         }
     }
 }
@@ -248,6 +250,7 @@ mod tests {
 
         assert!(config_path.exists());
         assert_eq!(config.wechat.channel_version, "1.0.0");
+        assert_eq!(config.agent.session_summary_strategy, "semantic");
         assert_eq!(config.db_path(), root.join("data").join("amclaw.db"));
         assert_eq!(config.resolved_browser(), None);
     }
@@ -262,6 +265,9 @@ mod tests {
 [storage]
 root_dir = "./custom-data"
 
+[agent]
+session_summary_strategy = "truncate"
+
 [browser]
 enabled = true
 worker_script = "./tools/browser_worker/worker.mjs"
@@ -275,6 +281,7 @@ merge_timeout_secs = 9
         let config = AppConfig::load_or_create(&config_path).expect("加载配置失败");
 
         assert_eq!(config.db_path(), root.join("custom-data").join("amclaw.db"));
+        assert_eq!(config.agent.session_summary_strategy, "truncate");
         assert_eq!(config.session_merge_timeout(), Duration::from_secs(9));
         assert_eq!(
             config

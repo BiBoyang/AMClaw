@@ -41,8 +41,11 @@ fn main() -> Result<()> {
     }
 
     if let Ok(command) = std::env::var("AMCLAW_AGENT_DEMO_COMMAND") {
-        let agent =
-            agent_core::AgentCore::with_task_store_db_path(workspace_root, app_config.db_path())?;
+        let agent = agent_core::AgentCore::with_task_store_db_path_and_agent_config(
+            workspace_root,
+            app_config.db_path(),
+            &app_config.agent,
+        )?;
         let output = agent.run(&command)?;
         log_startup_info(
             "agent_demo_finished",

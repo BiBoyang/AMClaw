@@ -1,3 +1,4 @@
+use crate::config::AgentConfig;
 use crate::task_store::{
     FeedbackKind, MemoryFeedbackState, RecentTaskRecord, TaskStatusRecord, TaskStore,
     UserMemoryRecord,
@@ -25,6 +26,51 @@ const DEFAULT_MAX_REPLANS: usize = 3;
 const DEFAULT_OPENAI_MODEL: &str = "deepseek-chat";
 const DEFAULT_MOONSHOT_MODEL: &str = "kimi-k2.5";
 const LLM_PROVIDER_PRIORITY: [&str; 3] = ["DEEPSEEK", "MOONSHOT", "OPENAI"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionSummaryStrategy {
+    Semantic,
+    Truncate,
+}
+
+impl SessionSummaryStrategy {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic",
+            Self::Truncate => "truncate",
+        }
+    }
+
+    fn from_config_text(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "truncate" => Self::Truncate,
+            _ => Self::Semantic,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ContextCompactionConfig {
+    session_summary_strategy: SessionSummaryStrategy,
+}
+
+impl Default for ContextCompactionConfig {
+    fn default() -> Self {
+        Self {
+            session_summary_strategy: SessionSummaryStrategy::Semantic,
+        }
+    }
+}
+
+impl ContextCompactionConfig {
+    fn from_agent_config(agent_config: &AgentConfig) -> Self {
+        Self {
+            session_summary_strategy: SessionSummaryStrategy::from_config_text(
+                &agent_config.session_summary_strategy,
+            ),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentRunContext {
@@ -1007,6 +1053,7 @@ impl ContextPack {
 }
 
 impl ContextAssembler {
+    #[cfg(test)]
     fn assemble(
         &self,
         trace: &AgentRunTrace,
@@ -1016,13 +1063,36 @@ impl ContextAssembler {
         available_tools: &[String],
         business_context: Option<&BusinessContextSnapshot>,
     ) -> PlannerInput {
-        let context_pack = self.build_pack(
+        self.assemble_with_summary_strategy(
             trace,
             user_input,
             observation,
             runtime_session_state,
             available_tools,
             business_context,
+            SessionSummaryStrategy::Semantic,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_with_summary_strategy(
+        &self,
+        trace: &AgentRunTrace,
+        user_input: &str,
+        observation: Option<&AgentObservation>,
+        runtime_session_state: Option<&RuntimeSessionStateSnapshot>,
+        available_tools: &[String],
+        business_context: Option<&BusinessContextSnapshot>,
+        session_summary_strategy: SessionSummaryStrategy,
+    ) -> PlannerInput {
+        let context_pack = self.build_pack_with_summary_strategy(
+            trace,
+            user_input,
+            observation,
+            runtime_session_state,
+            available_tools,
+            business_context,
+            session_summary_strategy,
         );
         let assembled_user_prompt = context_pack.render();
         let context_sections = context_pack.snapshot();
@@ -1038,6 +1108,7 @@ impl ContextAssembler {
         }
     }
 
+    #[cfg(test)]
     fn build_pack(
         &self,
         trace: &AgentRunTrace,
@@ -1046,6 +1117,28 @@ impl ContextAssembler {
         runtime_session_state: Option<&RuntimeSessionStateSnapshot>,
         available_tools: &[String],
         business_context: Option<&BusinessContextSnapshot>,
+    ) -> ContextPack {
+        self.build_pack_with_summary_strategy(
+            trace,
+            user_input,
+            observation,
+            runtime_session_state,
+            available_tools,
+            business_context,
+            SessionSummaryStrategy::Semantic,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_pack_with_summary_strategy(
+        &self,
+        trace: &AgentRunTrace,
+        user_input: &str,
+        observation: Option<&AgentObservation>,
+        runtime_session_state: Option<&RuntimeSessionStateSnapshot>,
+        available_tools: &[String],
+        business_context: Option<&BusinessContextSnapshot>,
+        session_summary_strategy: SessionSummaryStrategy,
     ) -> ContextPack {
         let mut pack = ContextPack::default();
 
@@ -1121,7 +1214,7 @@ impl ContextAssembler {
         if let Some(session_text) = &trace.session_text {
             pack.push(ContextSection::new(
                 ContextSectionKind::SessionText,
-                build_session_text_section_lines(session_text),
+                build_session_text_section_lines(session_text, session_summary_strategy),
             ));
         }
 
@@ -1413,6 +1506,7 @@ pub struct AgentCore {
     // 负责实际执行工具动作（读写文件等）
     tool_registry: ToolRegistry,
     task_store_db_path: Option<PathBuf>,
+    context_compaction: ContextCompactionConfig,
     llm_client: Option<LlmClient>,
     // 防止 Agent 无穷循环的安全阀
     max_steps: usize,
@@ -1430,33 +1524,69 @@ enum LoopControl {
 impl AgentCore {
     #[allow(dead_code)]
     pub fn new(workspace_root: impl Into<PathBuf>) -> Result<Self> {
-        Self::with_max_steps_and_task_store_db_path(
+        Self::with_max_steps_and_task_store_db_path_with_compaction(
             workspace_root,
             DEFAULT_MAX_STEPS,
             None::<PathBuf>,
+            ContextCompactionConfig::default(),
         )
     }
 
     #[allow(dead_code)]
     pub fn with_max_steps(workspace_root: impl Into<PathBuf>, max_steps: usize) -> Result<Self> {
-        Self::with_max_steps_and_task_store_db_path(workspace_root, max_steps, None::<PathBuf>)
+        Self::with_max_steps_and_task_store_db_path_with_compaction(
+            workspace_root,
+            max_steps,
+            None::<PathBuf>,
+            ContextCompactionConfig::default(),
+        )
     }
 
+    #[allow(dead_code)]
     pub fn with_task_store_db_path(
         workspace_root: impl Into<PathBuf>,
         task_store_db_path: impl Into<PathBuf>,
     ) -> Result<Self> {
-        Self::with_max_steps_and_task_store_db_path(
+        Self::with_max_steps_and_task_store_db_path_with_compaction(
             workspace_root,
             DEFAULT_MAX_STEPS,
             Some(task_store_db_path),
+            ContextCompactionConfig::default(),
         )
     }
 
+    pub fn with_task_store_db_path_and_agent_config(
+        workspace_root: impl Into<PathBuf>,
+        task_store_db_path: impl Into<PathBuf>,
+        agent_config: &AgentConfig,
+    ) -> Result<Self> {
+        Self::with_max_steps_and_task_store_db_path_with_compaction(
+            workspace_root,
+            DEFAULT_MAX_STEPS,
+            Some(task_store_db_path),
+            ContextCompactionConfig::from_agent_config(agent_config),
+        )
+    }
+
+    #[allow(dead_code)]
     fn with_max_steps_and_task_store_db_path(
         workspace_root: impl Into<PathBuf>,
         max_steps: usize,
         task_store_db_path: Option<impl Into<PathBuf>>,
+    ) -> Result<Self> {
+        Self::with_max_steps_and_task_store_db_path_with_compaction(
+            workspace_root,
+            max_steps,
+            task_store_db_path,
+            ContextCompactionConfig::default(),
+        )
+    }
+
+    fn with_max_steps_and_task_store_db_path_with_compaction(
+        workspace_root: impl Into<PathBuf>,
+        max_steps: usize,
+        task_store_db_path: Option<impl Into<PathBuf>>,
+        context_compaction: ContextCompactionConfig,
     ) -> Result<Self> {
         if max_steps == 0 {
             bail!("max_steps 必须大于 0");
@@ -1471,6 +1601,7 @@ impl AgentCore {
             workspace_root: workspace_root.clone(),
             tool_registry,
             task_store_db_path,
+            context_compaction,
             llm_client: LlmClient::from_env()?,
             max_steps,
             max_replans: DEFAULT_MAX_REPLANS,
@@ -1584,13 +1715,14 @@ impl AgentCore {
         }
         let runtime_session_state =
             derive_runtime_session_state(&trace, user_input, None, business_context.as_ref());
-        let planner_input = ContextAssembler.assemble(
+        let planner_input = ContextAssembler.assemble_with_summary_strategy(
             &trace,
             user_input,
             None,
             Some(&runtime_session_state),
             &self.tool_registry.available_tool_descriptions(),
             business_context.as_ref(),
+            self.context_compaction.session_summary_strategy,
         );
 
         Ok(render_context_preview(
@@ -1805,13 +1937,14 @@ impl AgentCore {
         if step == 0 && !runtime_session_state.is_empty() {
             trace.record_session_state_snapshot(runtime_session_state.clone());
         }
-        let planner_input = ContextAssembler.assemble(
+        let planner_input = ContextAssembler.assemble_with_summary_strategy(
             trace,
             user_input,
             observation,
             Some(&runtime_session_state),
             &self.tool_registry.available_tool_descriptions(),
             business_context.as_ref(),
+            self.context_compaction.session_summary_strategy,
         );
 
         #[cfg(test)]
@@ -3634,7 +3767,10 @@ fn select_previous_observations<'a>(
     selected
 }
 
-fn build_session_text_section_lines(session_text: &str) -> Vec<String> {
+fn build_session_text_section_lines(
+    session_text: &str,
+    session_summary_strategy: SessionSummaryStrategy,
+) -> Vec<String> {
     let total_chars = session_text.chars().count();
     let mut lines = vec![
         String::new(),
@@ -3650,12 +3786,21 @@ fn build_session_text_section_lines(session_text: &str) -> Vec<String> {
     }
 
     lines.push("- mode: boundary_compaction".to_string());
+    lines.push(format!(
+        "- summary_strategy: {}",
+        session_summary_strategy.as_str()
+    ));
     lines.push("- summary_compact:".to_string());
     lines.push("```text".to_string());
-    lines.push(summarize_for_markdown(
-        session_text,
-        SESSION_TEXT_SUMMARY_MAX_CHARS,
-    ));
+    let summary_compact = match session_summary_strategy {
+        SessionSummaryStrategy::Semantic => {
+            summarize_session_text_semantic(session_text, SESSION_TEXT_SUMMARY_MAX_CHARS)
+        }
+        SessionSummaryStrategy::Truncate => {
+            summarize_for_markdown(session_text, SESSION_TEXT_SUMMARY_MAX_CHARS)
+        }
+    };
+    lines.push(summary_compact);
     lines.push("```".to_string());
     lines.push("- recent_tail:".to_string());
     lines.push("```text".to_string());
@@ -3675,6 +3820,132 @@ fn session_recent_tail_with_notice(input: &str, max_chars: usize) -> String {
     let omitted_chars = total_chars.saturating_sub(max_chars);
     let tail: String = input.chars().skip(omitted_chars).collect();
     format!("...[{omitted_chars} chars omitted]\n{tail}")
+}
+
+fn summarize_session_text_semantic(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    let segments = split_session_segments(input);
+    if segments.is_empty() {
+        return summarize_for_markdown(input, max_chars);
+    }
+
+    let mut ranked = segments
+        .iter()
+        .enumerate()
+        .map(|(idx, segment)| {
+            (
+                idx,
+                score_session_segment(segment, idx, segments.len()),
+                segment.chars().count(),
+            )
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.0.cmp(&left.0))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+
+    let mut selected = std::collections::BTreeSet::new();
+    let last_index = segments.len() - 1;
+    selected.insert(last_index);
+    let mut budget_used = segments[last_index].chars().count();
+    for (idx, _, seg_chars) in ranked {
+        if selected.contains(&idx) {
+            continue;
+        }
+        let join_cost = usize::from(!selected.is_empty());
+        if budget_used + join_cost + seg_chars > max_chars {
+            continue;
+        }
+        selected.insert(idx);
+        budget_used += join_cost + seg_chars;
+    }
+
+    let mut summary = selected
+        .iter()
+        .map(|idx| segments[*idx].clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if summary.chars().count() > max_chars {
+        summary = summarize_for_markdown(&summary, max_chars);
+    }
+    if summary.trim().is_empty() {
+        summarize_for_markdown(input, max_chars)
+    } else {
+        summary
+    }
+}
+
+fn split_session_segments(input: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    for ch in input.chars() {
+        current.push(ch);
+        if matches!(ch, '\n' | '。' | '！' | '？' | '!' | '?') {
+            let trimmed = current.trim();
+            if !trimmed.is_empty() {
+                segments.push(trimmed.to_string());
+            }
+            current.clear();
+        }
+    }
+    let tail = current.trim();
+    if !tail.is_empty() {
+        segments.push(tail.to_string());
+    }
+    segments
+}
+
+fn score_session_segment(segment: &str, idx: usize, total: usize) -> i32 {
+    let mut score = 1_i32;
+    let normalized = segment.to_ascii_lowercase();
+    let keyword_hits = [
+        "目标",
+        "下一步",
+        "todo",
+        "待办",
+        "问题",
+        "卡住",
+        "失败",
+        "错误",
+        "风险",
+        "结论",
+        "决定",
+        "计划",
+        "完成",
+        "next",
+        "issue",
+        "blocker",
+        "should",
+        "must",
+    ]
+    .iter()
+    .filter(|keyword| segment.contains(**keyword) || normalized.contains(**keyword))
+    .count() as i32;
+    score += keyword_hits * 3;
+
+    if segment.starts_with("- ")
+        || segment.starts_with("* ")
+        || segment
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+    {
+        score += 2;
+    }
+
+    let recency_bonus = if total <= 1 {
+        3
+    } else {
+        (idx as i32 * 3) / (total as i32 - 1)
+    };
+    score + recency_bonus
 }
 
 fn append_session_state_lines(
@@ -5653,9 +5924,69 @@ mod tests {
             .expect("应包含 session_text section");
         let rendered = session_section.render();
         assert!(rendered.contains("mode: boundary_compaction"));
+        assert!(rendered.contains("summary_strategy: semantic"));
         assert!(rendered.contains("summary_compact"));
         assert!(rendered.contains("recent_tail"));
         assert!(rendered.contains("tail-marker-xyz"));
+    }
+
+    #[test]
+    fn session_text_compaction_supports_truncate_strategy() {
+        let session_text = format!(
+            "{}\n{}\n下一步: 修复关键问题并输出结论。\n风险: 需要补充参数。",
+            "背景噪音内容".repeat(50),
+            "历史过程信息".repeat(50),
+        );
+        let semantic_summary = super::summarize_session_text_semantic(
+            &session_text,
+            super::SESSION_TEXT_SUMMARY_MAX_CHARS,
+        );
+        let truncate_summary =
+            super::summarize_for_markdown(&session_text, super::SESSION_TEXT_SUMMARY_MAX_CHARS);
+        let semantic = super::build_session_text_section_lines(
+            &session_text,
+            super::SessionSummaryStrategy::Semantic,
+        )
+        .join("\n");
+        let truncate = super::build_session_text_section_lines(
+            &session_text,
+            super::SessionSummaryStrategy::Truncate,
+        )
+        .join("\n");
+
+        assert!(semantic.contains("summary_strategy: semantic"));
+        assert!(truncate.contains("summary_strategy: truncate"));
+        assert!(semantic_summary.contains("下一步: 修复关键问题并输出结论。"));
+        assert!(!truncate_summary.contains("下一步: 修复关键问题并输出结论。"));
+    }
+
+    #[test]
+    fn preview_context_respects_agent_config_summary_strategy() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let config = crate::config::AgentConfig {
+            session_summary_strategy: "truncate".to_string(),
+            ..Default::default()
+        };
+        let agent =
+            AgentCore::with_task_store_db_path_and_agent_config(workspace, &db_path, &config)
+                .expect("初始化失败");
+
+        let session_text = format!(
+            "{}\n{}\n下一步: 修复关键问题并输出结论。\n风险: 需要补充参数。",
+            "背景噪音内容".repeat(50),
+            "历史过程信息".repeat(50),
+        );
+        let preview = agent
+            .preview_context_with_context_mode(
+                "帮我总结当前进展",
+                AgentRunContext::wechat_chat("user-summary-config", "context_debug", vec![])
+                    .with_session_text(session_text),
+                ContextPreviewMode::Verbose,
+            )
+            .expect("应成功生成 preview");
+
+        assert!(preview.contains("summary_strategy: truncate"));
     }
 
     #[test]

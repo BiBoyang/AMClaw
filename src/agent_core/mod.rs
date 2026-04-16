@@ -665,6 +665,9 @@ impl PlanningPolicy {
 struct ContextAssembler;
 
 const DEFAULT_CONTEXT_MAX_TOTAL_CHARS: usize = 2600;
+const SESSION_TEXT_FULL_MAX_CHARS: usize = 220;
+const SESSION_TEXT_SUMMARY_MAX_CHARS: usize = 140;
+const SESSION_TEXT_RECENT_TAIL_CHARS: usize = 120;
 
 #[derive(Debug, Clone, Copy)]
 struct ContextSectionPolicy {
@@ -738,8 +741,8 @@ impl ContextSectionKind {
             },
             Self::SessionText => ContextSectionPolicy {
                 priority: 55,
-                max_chars: 320,
-                pinned_lines: 2,
+                max_chars: 460,
+                pinned_lines: 6,
                 required: false,
             },
             Self::PreviousObservations => ContextSectionPolicy {
@@ -1118,11 +1121,7 @@ impl ContextAssembler {
         if let Some(session_text) = &trace.session_text {
             pack.push(ContextSection::new(
                 ContextSectionKind::SessionText,
-                vec![
-                    String::new(),
-                    "## Session Text".to_string(),
-                    summarize_for_markdown(session_text, 600),
-                ],
+                build_session_text_section_lines(session_text),
             ));
         }
 
@@ -3635,6 +3634,49 @@ fn select_previous_observations<'a>(
     selected
 }
 
+fn build_session_text_section_lines(session_text: &str) -> Vec<String> {
+    let total_chars = session_text.chars().count();
+    let mut lines = vec![
+        String::new(),
+        "## Session Text".to_string(),
+        format!("- total_chars: {total_chars}"),
+    ];
+    if total_chars <= SESSION_TEXT_FULL_MAX_CHARS {
+        lines.push("- mode: full".to_string());
+        lines.push("```text".to_string());
+        lines.push(session_text.to_string());
+        lines.push("```".to_string());
+        return lines;
+    }
+
+    lines.push("- mode: boundary_compaction".to_string());
+    lines.push("- summary_compact:".to_string());
+    lines.push("```text".to_string());
+    lines.push(summarize_for_markdown(
+        session_text,
+        SESSION_TEXT_SUMMARY_MAX_CHARS,
+    ));
+    lines.push("```".to_string());
+    lines.push("- recent_tail:".to_string());
+    lines.push("```text".to_string());
+    lines.push(session_recent_tail_with_notice(
+        session_text,
+        SESSION_TEXT_RECENT_TAIL_CHARS,
+    ));
+    lines.push("```".to_string());
+    lines
+}
+
+fn session_recent_tail_with_notice(input: &str, max_chars: usize) -> String {
+    let total_chars = input.chars().count();
+    if total_chars <= max_chars {
+        return input.to_string();
+    }
+    let omitted_chars = total_chars.saturating_sub(max_chars);
+    let tail: String = input.chars().skip(omitted_chars).collect();
+    format!("...[{omitted_chars} chars omitted]\n{tail}")
+}
+
 fn append_session_state_lines(
     lines: &mut Vec<String>,
     runtime_session_state: &RuntimeSessionStateSnapshot,
@@ -5552,6 +5594,68 @@ mod tests {
         assert!(rendered.contains("## Session State"));
         assert!(rendered.contains("## Session Text"));
         assert!(rendered.contains("## Available Tools"));
+    }
+
+    #[test]
+    fn session_text_section_keeps_full_text_for_short_input() {
+        let workspace = temp_workspace();
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "继续处理",
+            AgentRunContext::wechat_chat("user-session-short", "commit", vec![])
+                .with_session_text("短会话文本"),
+        );
+        let runtime_session_state = derive_runtime_session_state(&trace, "继续处理", None, None);
+        let pack = ContextAssembler.build_pack(
+            &trace,
+            "继续处理",
+            None,
+            Some(&runtime_session_state),
+            &["read: 读取工作区内文件，参数: path".to_string()],
+            None,
+        );
+
+        let session_section = pack
+            .section(ContextSectionKind::SessionText)
+            .expect("应包含 session_text section");
+        let rendered = session_section.render();
+        assert!(rendered.contains("mode: full"));
+        assert!(rendered.contains("短会话文本"));
+    }
+
+    #[test]
+    fn session_text_section_uses_boundary_compaction_for_long_input() {
+        let workspace = temp_workspace();
+        let session_text = format!(
+            "{}{}{}",
+            "head-start ".repeat(25),
+            "middle-noise ".repeat(50),
+            "tail-marker-xyz"
+        );
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "继续处理",
+            AgentRunContext::wechat_chat("user-session-long", "commit", vec![])
+                .with_session_text(session_text),
+        );
+        let runtime_session_state = derive_runtime_session_state(&trace, "继续处理", None, None);
+        let pack = ContextAssembler.build_pack(
+            &trace,
+            "继续处理",
+            None,
+            Some(&runtime_session_state),
+            &["read: 读取工作区内文件，参数: path".to_string()],
+            None,
+        );
+
+        let session_section = pack
+            .section(ContextSectionKind::SessionText)
+            .expect("应包含 session_text section");
+        let rendered = session_section.render();
+        assert!(rendered.contains("mode: boundary_compaction"));
+        assert!(rendered.contains("summary_compact"));
+        assert!(rendered.contains("recent_tail"));
+        assert!(rendered.contains("tail-marker-xyz"));
     }
 
     #[test]

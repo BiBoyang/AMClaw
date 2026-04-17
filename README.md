@@ -266,6 +266,17 @@ cargo test
 - 日报生成与调度时间解析
 - 仓库内 scope 标记文件存在性检查
 
+### 运行离线评测
+
+```bash
+cd ~/Desktop/AMClaw
+cargo run --bin context_eval
+```
+
+- 默认读取 `notes/context-memory/eval_samples.jsonl`，对比 `semantic` 与 `truncate` 的 session summary 质量与压缩率。
+- 默认输出报告到 `notes/context-memory/SESSION-SUMMARY-EVAL-2026-04-17.md`。
+- 可用 `--input`、`--output`、`--max-chars` 覆盖默认路径与预算。
+
 ## 协作与文档约定
 
 - `README.md`：面向人类读者，描述“当前能跑什么、怎么跑、怎么验证”。

@@ -1,4 +1,5 @@
 use crate::config::AgentConfig;
+use crate::session_summary::*;
 use crate::task_store::{
     FeedbackKind, MemoryFeedbackState, RecentTaskRecord, TaskStatusRecord, TaskStore,
     UserMemoryRecord,
@@ -26,28 +27,6 @@ const DEFAULT_MAX_REPLANS: usize = 3;
 const DEFAULT_OPENAI_MODEL: &str = "deepseek-chat";
 const DEFAULT_MOONSHOT_MODEL: &str = "kimi-k2.5";
 const LLM_PROVIDER_PRIORITY: [&str; 3] = ["DEEPSEEK", "MOONSHOT", "OPENAI"];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionSummaryStrategy {
-    Semantic,
-    Truncate,
-}
-
-impl SessionSummaryStrategy {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Semantic => "semantic",
-            Self::Truncate => "truncate",
-        }
-    }
-
-    fn from_config_text(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "truncate" => Self::Truncate,
-            _ => Self::Semantic,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy)]
 struct ContextCompactionConfig {
@@ -711,10 +690,6 @@ impl PlanningPolicy {
 struct ContextAssembler;
 
 const DEFAULT_CONTEXT_MAX_TOTAL_CHARS: usize = 2600;
-const SESSION_TEXT_FULL_MAX_CHARS: usize = 220;
-const SESSION_TEXT_SUMMARY_MAX_CHARS: usize = 140;
-const SESSION_TEXT_RECENT_TAIL_CHARS: usize = 120;
-
 #[derive(Debug, Clone, Copy)]
 struct ContextSectionPolicy {
     priority: u8,
@@ -3453,17 +3428,6 @@ fn sanitize_for_prompt(input: &str) -> String {
     }
 }
 
-fn summarize_for_markdown(input: &str, max_chars: usize) -> String {
-    let count = input.chars().count();
-    if count <= max_chars {
-        return input.to_string();
-    }
-    let head_chars = max_chars.saturating_sub(80).max(40);
-    let mut text: String = input.chars().take(head_chars).collect();
-    text.push_str(&format!("\n\n...[truncated, total_chars={count}]"));
-    text
-}
-
 fn render_daily_index_markdown(day: &str, entries: &[AgentTraceIndexEntry]) -> String {
     let total_runs = entries.len();
     let success_runs = entries.iter().filter(|entry| entry.success).count();
@@ -3765,187 +3729,6 @@ fn select_previous_observations<'a>(
     }
     selected.reverse();
     selected
-}
-
-fn build_session_text_section_lines(
-    session_text: &str,
-    session_summary_strategy: SessionSummaryStrategy,
-) -> Vec<String> {
-    let total_chars = session_text.chars().count();
-    let mut lines = vec![
-        String::new(),
-        "## Session Text".to_string(),
-        format!("- total_chars: {total_chars}"),
-    ];
-    if total_chars <= SESSION_TEXT_FULL_MAX_CHARS {
-        lines.push("- mode: full".to_string());
-        lines.push("```text".to_string());
-        lines.push(session_text.to_string());
-        lines.push("```".to_string());
-        return lines;
-    }
-
-    lines.push("- mode: boundary_compaction".to_string());
-    lines.push(format!(
-        "- summary_strategy: {}",
-        session_summary_strategy.as_str()
-    ));
-    lines.push("- summary_compact:".to_string());
-    lines.push("```text".to_string());
-    let summary_compact = match session_summary_strategy {
-        SessionSummaryStrategy::Semantic => {
-            summarize_session_text_semantic(session_text, SESSION_TEXT_SUMMARY_MAX_CHARS)
-        }
-        SessionSummaryStrategy::Truncate => {
-            summarize_for_markdown(session_text, SESSION_TEXT_SUMMARY_MAX_CHARS)
-        }
-    };
-    lines.push(summary_compact);
-    lines.push("```".to_string());
-    lines.push("- recent_tail:".to_string());
-    lines.push("```text".to_string());
-    lines.push(session_recent_tail_with_notice(
-        session_text,
-        SESSION_TEXT_RECENT_TAIL_CHARS,
-    ));
-    lines.push("```".to_string());
-    lines
-}
-
-fn session_recent_tail_with_notice(input: &str, max_chars: usize) -> String {
-    let total_chars = input.chars().count();
-    if total_chars <= max_chars {
-        return input.to_string();
-    }
-    let omitted_chars = total_chars.saturating_sub(max_chars);
-    let tail: String = input.chars().skip(omitted_chars).collect();
-    format!("...[{omitted_chars} chars omitted]\n{tail}")
-}
-
-fn summarize_session_text_semantic(input: &str, max_chars: usize) -> String {
-    if input.chars().count() <= max_chars {
-        return input.to_string();
-    }
-    let segments = split_session_segments(input);
-    if segments.is_empty() {
-        return summarize_for_markdown(input, max_chars);
-    }
-
-    let mut ranked = segments
-        .iter()
-        .enumerate()
-        .map(|(idx, segment)| {
-            (
-                idx,
-                score_session_segment(segment, idx, segments.len()),
-                segment.chars().count(),
-            )
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| {
-        right
-            .1
-            .cmp(&left.1)
-            .then_with(|| right.0.cmp(&left.0))
-            .then_with(|| left.2.cmp(&right.2))
-    });
-
-    let mut selected = std::collections::BTreeSet::new();
-    let last_index = segments.len() - 1;
-    selected.insert(last_index);
-    let mut budget_used = segments[last_index].chars().count();
-    for (idx, _, seg_chars) in ranked {
-        if selected.contains(&idx) {
-            continue;
-        }
-        let join_cost = usize::from(!selected.is_empty());
-        if budget_used + join_cost + seg_chars > max_chars {
-            continue;
-        }
-        selected.insert(idx);
-        budget_used += join_cost + seg_chars;
-    }
-
-    let mut summary = selected
-        .iter()
-        .map(|idx| segments[*idx].clone())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if summary.chars().count() > max_chars {
-        summary = summarize_for_markdown(&summary, max_chars);
-    }
-    if summary.trim().is_empty() {
-        summarize_for_markdown(input, max_chars)
-    } else {
-        summary
-    }
-}
-
-fn split_session_segments(input: &str) -> Vec<String> {
-    let mut segments = Vec::new();
-    let mut current = String::new();
-    for ch in input.chars() {
-        current.push(ch);
-        if matches!(ch, '\n' | '。' | '！' | '？' | '!' | '?') {
-            let trimmed = current.trim();
-            if !trimmed.is_empty() {
-                segments.push(trimmed.to_string());
-            }
-            current.clear();
-        }
-    }
-    let tail = current.trim();
-    if !tail.is_empty() {
-        segments.push(tail.to_string());
-    }
-    segments
-}
-
-fn score_session_segment(segment: &str, idx: usize, total: usize) -> i32 {
-    let mut score = 1_i32;
-    let normalized = segment.to_ascii_lowercase();
-    let keyword_hits = [
-        "目标",
-        "下一步",
-        "todo",
-        "待办",
-        "问题",
-        "卡住",
-        "失败",
-        "错误",
-        "风险",
-        "结论",
-        "决定",
-        "计划",
-        "完成",
-        "next",
-        "issue",
-        "blocker",
-        "should",
-        "must",
-    ]
-    .iter()
-    .filter(|keyword| segment.contains(**keyword) || normalized.contains(**keyword))
-    .count() as i32;
-    score += keyword_hits * 3;
-
-    if segment.starts_with("- ")
-        || segment.starts_with("* ")
-        || segment
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false)
-    {
-        score += 2;
-    }
-
-    let recency_bonus = if total <= 1 {
-        3
-    } else {
-        (idx as i32 * 3) / (total as i32 - 1)
-    };
-    score + recency_bonus
 }
 
 fn append_session_state_lines(

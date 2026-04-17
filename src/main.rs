@@ -1,3 +1,4 @@
+use amclaw::{agent_core, chat_adapter, config, scheduler};
 use anyhow::{Context, Result};
 use config::AppConfig;
 use serde_json::{json, Value};
@@ -5,17 +6,6 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-mod agent_core;
-mod chat_adapter;
-mod command_router;
-mod config;
-mod logging;
-mod pipeline;
-mod reporter;
-mod scheduler;
-mod session_router;
-mod task_store;
-mod tool_registry;
 
 fn main() -> Result<()> {
     load_startup_env_files()?;
@@ -142,5 +132,5 @@ fn log_startup_error(event: &str, fields: Vec<(&str, Value)>) {
 }
 
 fn log_startup_event(level: &str, event: &str, fields: Vec<(&str, Value)>) {
-    crate::logging::emit_structured_log(level, event, fields);
+    amclaw::logging::emit_structured_log(level, event, fields);
 }

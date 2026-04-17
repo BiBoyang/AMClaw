@@ -24,7 +24,7 @@ pub(crate) fn build_structured_log_payload(
     Value::Object(payload)
 }
 
-pub(crate) fn emit_structured_log(level: &str, event: &str, fields: Vec<(&str, Value)>) {
+pub fn emit_structured_log(level: &str, event: &str, fields: Vec<(&str, Value)>) {
     let line = build_structured_log_payload(level, event, fields).to_string();
     match level {
         "error" => eprintln!("{line}"),

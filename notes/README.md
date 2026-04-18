@@ -8,6 +8,7 @@
 - `retros/`：阶段复盘记录（如 sprint retro）。
 - `constraints/`：实验中的约束与规则记录。
 - `context-memory/`：`Context & Memory` 设计与状态管理相关纪要。
+- `agent-eval/`：Agent 评测与全量日志资产（报告、规则、基线、简报、阶段计划）。
 
 ## 说明
 

@@ -7,6 +7,7 @@
 ## 当前内容
 
 - `context_eval.rs`：离线评测 session summary 策略（semantic vs truncate）的可执行文件。
+- `trace_eval.rs`：离线评测 Agent trace 的可执行文件，产出多维度统计报告。
 
 ## 约束
 

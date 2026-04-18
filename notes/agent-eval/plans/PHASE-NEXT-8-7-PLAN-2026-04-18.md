@@ -35,7 +35,7 @@
 
 - 从 `data/agent_traces/<date>` 抽取样本（成功/失败/降级混合）
 - 生成统一样本表：run_id、source_type、失败类型、恢复结果
-- 产出：`notes/context-memory/EVAL-SAMPLE-BASELINE-2026-04-XX.md`
+- 产出：`notes/agent-eval/baselines/EVAL-BASELINE-SAMPLES-2026-04-XX.md`
 
 ### Day 2：指标口径冻结
 

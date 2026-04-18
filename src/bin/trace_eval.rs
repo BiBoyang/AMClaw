@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -128,7 +129,11 @@ struct TraceSummary {
     llm_failure_count: usize,
     tool_call_count: usize,
     tool_success_count: usize,
-    // flags for filtering
+    tool_failure_count: usize,
+    tool_error_types: Vec<String>,
+    has_recovery_attempt: bool,
+    recovery_succeeded: Option<bool>,
+    in_baseline: bool,
     is_interesting: bool,
     interest_reasons: Vec<String>,
 }
@@ -137,7 +142,10 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut trace_dir = PathBuf::from("data/agent_traces");
     let mut date = None;
-    let mut output_path = PathBuf::from("notes/context-memory/TRACE-EVAL-REPORT.md");
+    let mut output_path = PathBuf::from("notes/agent-eval/reports/TRACE-EVAL-REPORT.md");
+    let mut baseline_path = Some(PathBuf::from(
+        "notes/agent-eval/baselines/EVAL-BASELINE-SAMPLES-2026-04-18.md",
+    ));
     let mut only_interesting = false;
 
     while let Some(arg) = args.next() {
@@ -157,6 +165,14 @@ fn main() {
                     output_path = PathBuf::from(v);
                 }
             }
+            "--baseline" => {
+                if let Some(v) = args.next() {
+                    baseline_path = Some(PathBuf::from(v));
+                }
+            }
+            "--no-baseline" => {
+                baseline_path = None;
+            }
             "--only-interesting" => {
                 only_interesting = true;
             }
@@ -164,8 +180,8 @@ fn main() {
         }
     }
 
-    let traces = if let Some(d) = date {
-        load_traces_for_date(&trace_dir, &d)
+    let traces = if let Some(ref d) = date {
+        load_traces_for_date(&trace_dir, d)
     } else {
         load_all_traces(&trace_dir)
     };
@@ -175,9 +191,25 @@ fn main() {
         return;
     }
 
-    let summaries: Vec<TraceSummary> = traces.iter().map(summarize_trace).collect();
+    let baseline_run_ids = baseline_path
+        .as_ref()
+        .map(|path| load_baseline_run_ids(path))
+        .unwrap_or_default();
+    if baseline_path.is_some() && baseline_run_ids.is_empty() {
+        eprintln!("baseline 样本未加载到 run_id，报告将只输出全量统计");
+    }
 
-    let report = build_report(&summaries, only_interesting);
+    let summaries: Vec<TraceSummary> = traces
+        .iter()
+        .map(|trace| summarize_trace(trace, &baseline_run_ids))
+        .collect();
+
+    let report = build_report(
+        &summaries,
+        only_interesting,
+        &baseline_run_ids,
+        baseline_path.as_deref(),
+    );
     fs::write(&output_path, report).expect("写入报告失败");
     println!("报告已生成: {}", output_path.display());
     println!(
@@ -216,7 +248,6 @@ fn load_traces_from_dir(dir: &Path) -> Vec<AgentTrace> {
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        // skip index.jsonl
         if path.file_name().and_then(|s| s.to_str()) == Some("index.jsonl") {
             continue;
         }
@@ -225,14 +256,38 @@ fn load_traces_from_dir(dir: &Path) -> Vec<AgentTrace> {
             Err(_) => continue,
         };
         match serde_json::from_str::<AgentTrace>(&content) {
-            Ok(t) => traces.push(t),
-            Err(e) => eprintln!("解析失败 {}: {}", path.display(), e),
+            Ok(trace) => traces.push(trace),
+            Err(err) => eprintln!("解析失败 {}: {}", path.display(), err),
         }
     }
     traces
 }
 
-fn summarize_trace(trace: &AgentTrace) -> TraceSummary {
+fn load_baseline_run_ids(path: &Path) -> HashSet<String> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return HashSet::new();
+    };
+    let mut run_ids = HashSet::new();
+    for line in content.lines() {
+        if !line.contains('`') {
+            continue;
+        }
+        // markdown 常见格式：`run_id`
+        let tokens: Vec<&str> = line.split('`').collect();
+        for token in tokens.into_iter().skip(1).step_by(2) {
+            if is_uuid_like(token) {
+                run_ids.insert(token.to_string());
+            }
+        }
+    }
+    run_ids
+}
+
+fn is_uuid_like(token: &str) -> bool {
+    token.len() == 36 && token.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-')
+}
+
+fn summarize_trace(trace: &AgentTrace, baseline_run_ids: &HashSet<String>) -> TraceSummary {
     let mut interest_reasons = Vec::new();
 
     if !trace.success {
@@ -255,19 +310,32 @@ fn summarize_trace(trace: &AgentTrace) -> TraceSummary {
     }
 
     let is_interesting = !interest_reasons.is_empty();
-
+    let mut seen_types = std::collections::HashSet::new();
     let failure_types: Vec<String> = trace
         .failures
         .iter()
-        .map(|f| f.failure_type.clone())
+        .map(|failure| failure.failure_type.clone())
+        .filter(|ft| seen_types.insert(ft.clone()))
+        .collect();
+
+    let llm_success = trace.llm_calls.iter().filter(|call| call.success).count();
+    let llm_failure = trace.llm_calls.len().saturating_sub(llm_success);
+    let tool_success = trace.tool_calls.iter().filter(|call| call.success).count();
+    let tool_failure = trace.tool_calls.len().saturating_sub(tool_success);
+    let tool_error_types: Vec<String> = trace
+        .tool_calls
+        .iter()
+        .filter(|call| !call.success && call.error.is_some())
+        .filter_map(|call| call.error.clone())
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
-
-    let llm_success = trace.llm_calls.iter().filter(|c| c.success).count();
-    let llm_failure = trace.llm_calls.len() - llm_success;
-
-    let tool_success = trace.tool_calls.iter().filter(|c| c.success).count();
+    let has_recovery_attempt = !trace.failures.is_empty();
+    let recovery_succeeded = if has_recovery_attempt {
+        Some(trace.success)
+    } else {
+        None
+    };
 
     TraceSummary {
         run_id: trace.run_id.clone(),
@@ -275,11 +343,11 @@ fn summarize_trace(trace: &AgentTrace) -> TraceSummary {
         user_input: trace.user_input.clone(),
         user_input_chars: trace.user_input_chars,
         success: trace.success,
-        error_short: trace.error.as_ref().map(|e| {
-            if e.chars().count() > 80 {
-                format!("{}...", e.chars().take(80).collect::<String>())
+        error_short: trace.error.as_ref().map(|err| {
+            if err.chars().count() > 80 {
+                format!("{}...", err.chars().take(80).collect::<String>())
             } else {
-                e.clone()
+                err.clone()
             }
         }),
         duration_ms: trace.duration_ms,
@@ -300,35 +368,67 @@ fn summarize_trace(trace: &AgentTrace) -> TraceSummary {
         llm_failure_count: llm_failure,
         tool_call_count: trace.tool_calls.len(),
         tool_success_count: tool_success,
+        tool_failure_count: tool_failure,
+        tool_error_types,
+        has_recovery_attempt,
+        recovery_succeeded,
+        in_baseline: baseline_run_ids.contains(&trace.run_id),
         is_interesting,
         interest_reasons,
     }
 }
 
-fn build_report(summaries: &[TraceSummary], only_interesting: bool) -> String {
+fn build_report(
+    summaries: &[TraceSummary],
+    only_interesting: bool,
+    baseline_run_ids: &HashSet<String>,
+    baseline_path: Option<&Path>,
+) -> String {
     let mut lines = vec![
         "# Trace Evaluation Report".to_string(),
         String::new(),
         format!("- generated: {}", chrono::Utc::now().to_rfc3339()),
         format!("- total traces: {}", summaries.len()),
+        format!("- baseline_file: {}", display_path_or_na(baseline_path)),
+        format!("- baseline_run_ids: {}", baseline_run_ids.len()),
         format!(
             "- interesting traces: {}",
-            summaries.iter().filter(|s| s.is_interesting).count()
+            summaries
+                .iter()
+                .filter(|summary| summary.is_interesting)
+                .count()
         ),
         String::new(),
         "## Summary Statistics".to_string(),
         String::new(),
     ];
 
-    // Overall stats
     let total = summaries.len();
-    let success_count = summaries.iter().filter(|s| s.success).count();
-    let with_memory = summaries.iter().filter(|s| s.memory_injected > 0).count();
-    let with_dropped = summaries.iter().filter(|s| s.memory_dropped > 0).count();
-    let with_state = summaries.iter().filter(|s| s.state_present).count();
-    let with_ctx_drop = summaries.iter().filter(|s| s.context_pack_dropped).count();
-    let with_fallback = summaries.iter().filter(|s| s.llm_fallback).count();
-    let with_failures = summaries.iter().filter(|s| s.has_failures).count();
+    let success_count = summaries.iter().filter(|summary| summary.success).count();
+    let with_memory = summaries
+        .iter()
+        .filter(|summary| summary.memory_injected > 0)
+        .count();
+    let with_dropped = summaries
+        .iter()
+        .filter(|summary| summary.memory_dropped > 0)
+        .count();
+    let with_state = summaries
+        .iter()
+        .filter(|summary| summary.state_present)
+        .count();
+    let with_ctx_drop = summaries
+        .iter()
+        .filter(|summary| summary.context_pack_dropped)
+        .count();
+    let with_fallback = summaries
+        .iter()
+        .filter(|summary| summary.llm_fallback)
+        .count();
+    let with_failures = summaries
+        .iter()
+        .filter(|summary| summary.has_failures)
+        .count();
 
     lines.push("| metric | count | ratio |".to_string());
     lines.push("| --- | ---: | ---: |".to_string());
@@ -370,119 +470,397 @@ fn build_report(summaries: &[TraceSummary], only_interesting: bool) -> String {
     ));
     lines.push(String::new());
 
-    // Per-trace detail
+    if !baseline_run_ids.is_empty() {
+        let baseline_hit = summaries
+            .iter()
+            .filter(|summary| summary.in_baseline)
+            .count();
+        let baseline_missing = baseline_run_ids.len().saturating_sub(baseline_hit);
+        lines.push("## Baseline Coverage".to_string());
+        lines.push(String::new());
+        lines.push("| metric | count | ratio |".to_string());
+        lines.push("| --- | ---: | ---: |".to_string());
+        lines.push(format!(
+            "| baseline run ids | {} | 100% |",
+            baseline_run_ids.len()
+        ));
+        lines.push(format!(
+            "| baseline hits in current trace set | {} | {:.1}% |",
+            baseline_hit,
+            pct(baseline_hit, baseline_run_ids.len())
+        ));
+        lines.push(format!(
+            "| baseline missing in current trace set | {} | {:.1}% |",
+            baseline_missing,
+            pct(baseline_missing, baseline_run_ids.len())
+        ));
+        lines.push(String::new());
+    }
+
+    lines.push("## Failure Type Distribution".to_string());
+    lines.push(String::new());
+    let mut failure_counter: HashMap<String, usize> = HashMap::new();
+    for summary in summaries {
+        for failure_type in &summary.failure_types {
+            *failure_counter.entry(failure_type.clone()).or_insert(0) += 1;
+        }
+    }
+    lines.push("| failure_type | count | ratio |".to_string());
+    lines.push("| --- | ---: | ---: |".to_string());
+    if failure_counter.is_empty() {
+        lines.push("| (none) | 0 | 0.0% |".to_string());
+    } else {
+        let mut pairs = failure_counter.into_iter().collect::<Vec<_>>();
+        pairs.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        for (failure_type, count) in pairs {
+            lines.push(format!(
+                "| {} | {} | {:.1}% |",
+                failure_type,
+                count,
+                pct(count, total)
+            ));
+        }
+    }
+    lines.push(String::new());
+
+    // === Tool Use Dimension ===
+    lines.push("## Tool Use Statistics".to_string());
+    lines.push(String::new());
+    let traces_with_tools = summaries.iter().filter(|s| s.tool_call_count > 0).count();
+    let total_tool_calls: usize = summaries.iter().map(|s| s.tool_call_count).sum();
+    let total_tool_success: usize = summaries.iter().map(|s| s.tool_success_count).sum();
+    let total_tool_failure = total_tool_calls.saturating_sub(total_tool_success);
+    let tool_success_rate = if total_tool_calls > 0 {
+        (total_tool_success as f64 / total_tool_calls as f64) * 100.0
+    } else {
+        0.0
+    };
+    let tool_failure_rate = if total_tool_calls > 0 {
+        (total_tool_failure as f64 / total_tool_calls as f64) * 100.0
+    } else {
+        0.0
+    };
+    lines.push("| metric | count | ratio |".to_string());
+    lines.push("| --- | ---: | ---: |".to_string());
+    lines.push(format!(
+        "| traces with tool calls | {} | {:.1}% |",
+        traces_with_tools,
+        pct(traces_with_tools, total)
+    ));
+    lines.push(format!("| total tool calls | {} | - |", total_tool_calls));
+    lines.push(format!(
+        "| tool success | {} | {:.1}% |",
+        total_tool_success, tool_success_rate
+    ));
+    lines.push(format!(
+        "| tool failure | {} | {:.1}% |",
+        total_tool_failure, tool_failure_rate
+    ));
+    lines.push(String::new());
+
+    // Tool error type topN
+    let mut tool_error_counter: HashMap<String, usize> = HashMap::new();
+    for summary in summaries {
+        for error_type in &summary.tool_error_types {
+            *tool_error_counter.entry(error_type.clone()).or_insert(0) += 1;
+        }
+    }
+    if !tool_error_counter.is_empty() {
+        lines.push("### Tool Error Type TopN".to_string());
+        lines.push(String::new());
+        lines.push("| error_type | count |".to_string());
+        lines.push("| --- | ---: |".to_string());
+        let mut pairs = tool_error_counter.into_iter().collect::<Vec<_>>();
+        pairs.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        for (error_type, count) in pairs.iter().take(5) {
+            lines.push(format!("| {} | {} |", error_type, count));
+        }
+        lines.push(String::new());
+    }
+
+    // Tool call count distribution
+    lines.push("### Tool Call Count Distribution".to_string());
+    lines.push(String::new());
+    let mut tool_count_dist: HashMap<usize, usize> = HashMap::new();
+    for summary in summaries {
+        if summary.tool_call_count > 0 {
+            *tool_count_dist.entry(summary.tool_call_count).or_insert(0) += 1;
+        }
+    }
+    lines.push("| tool_calls | trace_count |".to_string());
+    lines.push("| --- | ---: |".to_string());
+    let mut dist_pairs = tool_count_dist.into_iter().collect::<Vec<_>>();
+    dist_pairs.sort_by(|left, right| left.0.cmp(&right.0));
+    for (call_count, trace_count) in dist_pairs {
+        lines.push(format!("| {} | {} |", call_count, trace_count));
+    }
+    lines.push(String::new());
+
+    // === Planning Dimension ===
+    lines.push("## Planning / ReAct Statistics".to_string());
+    lines.push(String::new());
+    let step_counts: Vec<usize> = summaries.iter().map(|s| s.step_count).collect();
+    let min_steps = step_counts.iter().min().copied().unwrap_or(0);
+    let max_steps = step_counts.iter().max().copied().unwrap_or(0);
+    let avg_steps = if !step_counts.is_empty() {
+        step_counts.iter().sum::<usize>() as f64 / step_counts.len() as f64
+    } else {
+        0.0
+    };
+    let unfinished_count = summaries
+        .iter()
+        .filter(|s| !s.success && s.step_count > 5)
+        .count();
+    let stall_drift_count = summaries
+        .iter()
+        .filter(|s| {
+            s.failure_types
+                .iter()
+                .any(|ft| ft == "planning_stall_or_drift")
+        })
+        .count();
+    lines.push("| metric | value |".to_string());
+    lines.push("| --- | --- |".to_string());
+    lines.push(format!(
+        "| step_count min / max / avg | {} / {} / {:.1} |",
+        min_steps, max_steps, avg_steps
+    ));
+    lines.push(format!(
+        "| unfinished_plan (failed + steps > 5) | {} |",
+        unfinished_count
+    ));
+    lines.push(format!("| stall_or_drift hits | {} |", stall_drift_count));
+    lines.push(String::new());
+
+    // Step count distribution
+    lines.push("### Step Count Distribution".to_string());
+    lines.push(String::new());
+    let mut step_dist: HashMap<String, usize> = HashMap::new();
+    for summary in summaries {
+        let bucket = match summary.step_count {
+            1 => "1".to_string(),
+            2 => "2".to_string(),
+            3..=5 => "3-5".to_string(),
+            6..=10 => "6-10".to_string(),
+            _ => "10+".to_string(),
+        };
+        *step_dist.entry(bucket).or_insert(0) += 1;
+    }
+    lines.push("| step_range | trace_count | ratio |".to_string());
+    lines.push("| --- | ---: | ---: |".to_string());
+    let bucket_order = vec!["1", "2", "3-5", "6-10", "10+"];
+    for bucket in bucket_order {
+        if let Some(count) = step_dist.get(bucket) {
+            lines.push(format!(
+                "| {} | {} | {:.1}% |",
+                bucket,
+                count,
+                pct(*count, total)
+            ));
+        }
+    }
+    lines.push(String::new());
+
+    // === Recovery Dimension ===
+    lines.push("## Recovery Statistics".to_string());
+    lines.push(String::new());
+    let recovery_attempts = summaries.iter().filter(|s| s.has_recovery_attempt).count();
+    let recovery_successes = summaries
+        .iter()
+        .filter(|s| s.has_recovery_attempt && s.recovery_succeeded == Some(true))
+        .count();
+    let recovery_failures = summaries
+        .iter()
+        .filter(|s| s.has_recovery_attempt && s.recovery_succeeded == Some(false))
+        .count();
+    let recovery_success_rate = if recovery_attempts > 0 {
+        (recovery_successes as f64 / recovery_attempts as f64) * 100.0
+    } else {
+        0.0
+    };
+    let recovery_failure_rate = if recovery_attempts > 0 {
+        (recovery_failures as f64 / recovery_attempts as f64) * 100.0
+    } else {
+        0.0
+    };
+    lines.push("| metric | count | ratio |".to_string());
+    lines.push("| --- | ---: | ---: |".to_string());
+    lines.push(format!(
+        "| recovery_attempt_count | {} | {:.1}% |",
+        recovery_attempts,
+        pct(recovery_attempts, total)
+    ));
+    lines.push(format!(
+        "| recovery_success | {} | {:.1}% |",
+        recovery_successes, recovery_success_rate
+    ));
+    lines.push(format!(
+        "| recovery_failure | {} | {:.1}% |",
+        recovery_failures, recovery_failure_rate
+    ));
+    lines.push(String::new());
+
+    // Recovery by failure type
+    if recovery_attempts > 0 {
+        lines.push("### Recovery by Failure Type".to_string());
+        lines.push(String::new());
+        lines.push("| failure_type | attempt | success | failure |".to_string());
+        lines.push("| --- | ---: | ---: | ---: |".to_string());
+        let mut recovery_by_type: HashMap<String, (usize, usize, usize)> = HashMap::new();
+        for summary in summaries {
+            if !summary.has_recovery_attempt {
+                continue;
+            }
+            let primary = summary
+                .failure_types
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            let entry = recovery_by_type.entry(primary).or_insert((0, 0, 0));
+            entry.0 += 1;
+            if summary.recovery_succeeded == Some(true) {
+                entry.1 += 1;
+            } else {
+                entry.2 += 1;
+            }
+        }
+        let mut pairs = recovery_by_type.into_iter().collect::<Vec<_>>();
+        pairs.sort_by(|left, right| right.1 .0.cmp(&left.1 .0));
+        for (failure_type, (attempt, success, failure)) in pairs {
+            lines.push(format!(
+                "| {} | {} | {} | {} |",
+                failure_type, attempt, success, failure
+            ));
+        }
+        lines.push(String::new());
+    }
+
     lines.push("## Per-Trace Detail".to_string());
     lines.push(String::new());
     lines.push(
-        "| run_id | success | steps | mem(r/i/d) | state | ctx_drop | failures | reasons | input |"
+        "| run_id | success | baseline | steps | mem(r/i/d) | state | ctx_drop | failures | reasons | input |"
             .to_string(),
     );
-    lines.push("| --- | --- | ---: | --- | --- | --- | --- | --- | --- |".to_string());
+    lines.push("| --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- |".to_string());
 
-    for s in summaries {
-        if only_interesting && !s.is_interesting {
+    for summary in summaries {
+        if only_interesting && !summary.is_interesting {
             continue;
         }
-        let input_short = if s.user_input.chars().count() > 40 {
-            format!("{}...", s.user_input.chars().take(40).collect::<String>())
+        let input_short = if summary.user_input.chars().count() > 40 {
+            format!(
+                "{}...",
+                summary.user_input.chars().take(40).collect::<String>()
+            )
         } else {
-            s.user_input.clone()
+            summary.user_input.clone()
         };
         lines.push(format!(
-            "| `{}` | {} | {} | {}/{}/{} | {} | {} | {} | {} | {} |",
-            &s.run_id[..8.min(s.run_id.len())],
-            if s.success { "✓" } else { "✗" },
-            s.step_count,
-            s.memory_retrieved,
-            s.memory_injected,
-            s.memory_dropped,
-            if s.state_present { "✓" } else { "·" },
-            if s.context_pack_dropped { "✓" } else { "·" },
-            s.failure_count,
-            s.interest_reasons.join(", "),
+            "| `{}` | {} | {} | {} | {}/{}/{} | {} | {} | {} | {} | {} |",
+            &summary.run_id[..8.min(summary.run_id.len())],
+            if summary.success { "✓" } else { "✗" },
+            if summary.in_baseline { "✓" } else { "·" },
+            summary.step_count,
+            summary.memory_retrieved,
+            summary.memory_injected,
+            summary.memory_dropped,
+            if summary.state_present { "✓" } else { "·" },
+            if summary.context_pack_dropped {
+                "✓"
+            } else {
+                "·"
+            },
+            summary.failure_count,
+            summary.interest_reasons.join(", "),
             input_short.replace("|", "\\|")
         ));
     }
     lines.push(String::new());
 
-    // Interesting traces deep dive
-    let interesting: Vec<_> = summaries.iter().filter(|s| s.is_interesting).collect();
+    let interesting: Vec<_> = summaries
+        .iter()
+        .filter(|summary| summary.is_interesting)
+        .collect();
     if !interesting.is_empty() {
         lines.push("## Interesting Traces Deep Dive".to_string());
         lines.push(String::new());
-        for s in &interesting {
-            lines.push(format!("### `{}`", s.run_id));
+        for summary in &interesting {
+            lines.push(format!("### `{}`", summary.run_id));
             lines.push(String::new());
-            lines.push(format!("- **user_input**: {}", s.user_input));
-            lines.push(format!("- **success**: {}", s.success));
-            if let Some(ref e) = s.error_short {
-                lines.push(format!("- **error**: {}", e));
+            lines.push(format!("- **user_input**: {}", summary.user_input));
+            lines.push(format!("- **success**: {}", summary.success));
+            lines.push(format!("- **in_baseline**: {}", summary.in_baseline));
+            if let Some(ref error_short) = summary.error_short {
+                lines.push(format!("- **error**: {}", error_short));
             }
             lines.push(format!(
                 "- **duration**: {}ms, **steps**: {}",
-                s.duration_ms
-                    .map(|d| d.to_string())
+                summary
+                    .duration_ms
+                    .map(|duration| duration.to_string())
                     .unwrap_or_else(|| "N/A".to_string()),
-                s.step_count
+                summary.step_count
             ));
             lines.push(format!(
                 "- **memory**: retrieved={}, injected={}, dropped={}, total_chars={}",
-                s.memory_retrieved, s.memory_injected, s.memory_dropped, s.memory_total_chars
+                summary.memory_retrieved,
+                summary.memory_injected,
+                summary.memory_dropped,
+                summary.memory_total_chars
             ));
-            lines.push(format!("- **session_state**: {}", s.state_present));
+            lines.push(format!("- **session_state**: {}", summary.state_present));
             lines.push(format!(
                 "- **context_pack**: dropped={}, reasons={:?}",
-                s.context_pack_dropped, s.context_pack_drop_reasons
+                summary.context_pack_dropped, summary.context_pack_drop_reasons
             ));
             lines.push(format!(
                 "- **llm_calls**: total={}, success={}, failed={}",
-                s.llm_call_count, s.llm_success_count, s.llm_failure_count
+                summary.llm_call_count, summary.llm_success_count, summary.llm_failure_count
             ));
             lines.push(format!(
                 "- **tool_calls**: total={}, success={}",
-                s.tool_call_count, s.tool_success_count
+                summary.tool_call_count, summary.tool_success_count
             ));
-            if !s.failure_types.is_empty() {
+            if !summary.failure_types.is_empty() {
                 lines.push(format!(
                     "- **failure_types**: {}",
-                    s.failure_types.join(", ")
+                    summary.failure_types.join(", ")
                 ));
             }
             lines.push(format!(
                 "- **interest_reasons**: {}",
-                s.interest_reasons.join(", ")
+                summary.interest_reasons.join(", ")
             ));
             lines.push(String::new());
         }
     }
 
-    // Failure taxonomy annotation template
     lines.push("## Failure Taxonomy Annotation Template".to_string());
     lines.push(String::new());
     lines.push("对以上 interesting traces 进行人工评审时，可按下表标注：".to_string());
     lines.push(String::new());
     lines.push("| run_id | primary_failure | severity | notes |".to_string());
     lines.push("| --- | --- | --- | --- |".to_string());
-
-    for s in interesting {
+    for summary in &interesting {
         lines.push(format!(
             "| `{}` | (待填) | (low/mid/high) | (待填) |",
-            &s.run_id[..8.min(s.run_id.len())]
+            &summary.run_id[..8.min(summary.run_id.len())]
         ));
     }
     lines.push(String::new());
 
     lines.push("### Failure Taxonomy".to_string());
     lines.push(String::new());
-    lines.push("- `forgot_known_fact`: 系统明知但本次未使用".to_string());
-    lines.push("- `missed_retrieval`: 应该检索到记忆但没检索到".to_string());
-    lines.push("- `wrong_retrieval`: 检索到了不相关记忆".to_string());
-    lines.push("- `overcompressed_summary`: session summary 丢失了关键信息".to_string());
-    lines.push("- `state_drift`: session state 与实际情况不一致".to_string());
-    lines.push("- `repeated_work`: 重复执行了已完成的步骤".to_string());
-    lines.push("- `llm_error`: LLM 调用失败或返回无效".to_string());
-    lines.push("- `tool_error`: 工具执行失败".to_string());
-    lines.push("- `other`: 其他".to_string());
+    lines.push("- `llm_auth_error`: 模型调用鉴权失败（如 401）".to_string());
+    lines.push("- `llm_transport_error`: 模型调用网络/传输失败（超时、连接失败等）".to_string());
+    lines.push("- `tool_call_error`: 工具调用失败（路径、参数、执行错误）".to_string());
+    lines.push("- `context_overtrim`: 上下文裁剪过度导致关键信息缺失".to_string());
+    lines.push("- `memory_conflict`: 记忆冲突/降级导致信息不一致".to_string());
+    lines.push("- `session_state_missing_or_stale`: SessionState 缺失、过期或不一致".to_string());
+    lines.push("- `planning_stall_or_drift`: 规划循环停滞、重规划过多、轨迹漂移".to_string());
+    lines.push("- `done_rule_validation_fail`: 工具成功但收敛判定失败".to_string());
+    lines.push("- `fallback_exhausted`: 主链路失败后 fallback 仍未收敛".to_string());
+    lines.push("- `unknown_failure`: 未命中以上分类的失败".to_string());
     lines.push(String::new());
 
     lines.push("---".to_string());
@@ -490,6 +868,11 @@ fn build_report(summaries: &[TraceSummary], only_interesting: bool) -> String {
     lines.push(String::new());
 
     lines.join("\n")
+}
+
+fn display_path_or_na(path: Option<&Path>) -> String {
+    path.map(|p| p.display().to_string())
+        .unwrap_or_else(|| "N/A".to_string())
 }
 
 fn pct(part: usize, total: usize) -> f64 {

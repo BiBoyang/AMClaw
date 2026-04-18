@@ -10,7 +10,7 @@
 - 技术历程：`notes/context-memory/CONTEXT-TECH-SELECTION-JOURNEY.md`
 - C0/C1/C2 方案：`notes/context-memory/SESSION-STATE-C0-C1-C2-PLAN-2026-04-17.md`
 - C3/C4 方案：`notes/context-memory/CONTEXT-PACK-C3-PLAN-2026-04-18.md`
-- Trace 闭环报告：`notes/context-memory/TRACE-EVAL-REPORT.md`
+- Trace 闭环报告：`notes/agent-eval/reports/TRACE-EVAL-REPORT.md`
 - 当日 session：`sessions/SESSION-2026-04-18.md`
 
 ---

@@ -272,6 +272,8 @@ cargo test
 
 ### 运行离线评测
 
+#### context_eval（Session Summary 策略评测）
+
 ```bash
 cd ~/Desktop/AMClaw
 cargo run --bin context_eval
@@ -280,6 +282,18 @@ cargo run --bin context_eval
 - 默认读取 `notes/context-memory/eval_samples.jsonl`，对比 `semantic` 与 `truncate` 的 session summary 质量与压缩率。
 - 默认输出报告到 `notes/context-memory/SESSION-SUMMARY-EVAL-2026-04-17.md`。
 - 可用 `--input`、`--output`、`--max-chars` 覆盖默认路径与预算。
+
+#### trace_eval（Agent Trace 评测）
+
+```bash
+cd ~/Desktop/AMClaw
+cargo run --bin trace_eval
+```
+
+- 扫描 `data/agent_traces/` 目录下的所有 trace JSON，生成统计报告。
+- 默认输出报告到 `notes/agent-eval/reports/TRACE-EVAL-REPORT.md`。
+- 默认关联 `notes/agent-eval/baselines/EVAL-BASELINE-SAMPLES-2026-04-18.md` 做 baseline 命中统计。
+- 支持 `--date`、`--dir`、`--output`、`--baseline`、`--no-baseline`、`--only-interesting` 参数。
 
 ## 协作与文档约定
 

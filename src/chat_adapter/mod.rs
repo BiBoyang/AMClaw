@@ -849,7 +849,7 @@ impl WeChatBot {
         let decision = self.task_store.govern_memory_write(
             user_id,
             content,
-            "explicit",
+            crate::task_store::MemoryType::Explicit,
             100,
             &mut write_state,
         );
@@ -959,9 +959,13 @@ impl WeChatBot {
             return;
         };
         let mut write_state = crate::task_store::MemoryWriteState::default();
-        let decision =
-            self.task_store
-                .govern_memory_write(user_id, &memory, "auto", 60, &mut write_state);
+        let decision = self.task_store.govern_memory_write(
+            user_id,
+            &memory,
+            crate::task_store::MemoryType::Auto,
+            60,
+            &mut write_state,
+        );
         match &decision {
             crate::task_store::WriteDecision::Written(_) => {
                 log_chat_info(

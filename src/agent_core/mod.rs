@@ -941,14 +941,9 @@ impl ContextAssembler {
             if !business_context.user_memories.is_empty() {
                 let mut memory_lines = vec![String::new(), "## User Memories".to_string()];
                 for memory in &business_context.user_memories {
-                    let type_tag = if memory.memory_type == "explicit" {
-                        "[explicit]"
-                    } else {
-                        "[auto]"
-                    };
                     memory_lines.push(format!(
                         "- {} (priority={}) {}",
-                        type_tag,
+                        memory.memory_type.label_prefix(),
                         memory.priority,
                         sanitize_for_prompt(&memory.content)
                     ));
@@ -5880,7 +5875,12 @@ mod tests {
         // 写 6 条记忆，预算 max_items=5 应只注入 5 条
         for i in 0..6 {
             store
-                .add_user_memory_typed("user-budget", &format!("记忆内容 {}", i), "explicit", 100)
+                .add_user_memory_typed(
+                    "user-budget",
+                    &format!("记忆内容 {}", i),
+                    crate::task_store::MemoryType::Explicit,
+                    100,
+                )
                 .expect("写入 memory 失败");
         }
         let trace = AgentRunTrace::new(

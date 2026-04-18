@@ -684,6 +684,8 @@ impl WeChatBot {
         true
     }
 
+    /// 返回 (reply_text, optional_run_id)
+    /// run_id 仅在 agent_core 成功执行时存在，用于后续 trace 补更新
     fn generate_reply(
         &self,
         user_id: &str,
@@ -691,9 +693,9 @@ impl WeChatBot {
         message_ids: &[String],
         reason: FlushReason,
         trace_context: AgentRunContext,
-    ) -> String {
+    ) -> (String, Option<String>) {
         match self.agent_core.run_with_context(user_text, trace_context) {
-            Ok(result) => return result,
+            Ok(result) => return (result.output, Some(result.run_id)),
             Err(err) => {
                 let err_text = err.to_string();
                 if is_agent_command(user_text) {
@@ -708,7 +710,7 @@ impl WeChatBot {
                             ("detail", json!(err_text.clone())),
                         ],
                     );
-                    return format!("执行失败: {err_text}");
+                    return (format!("执行失败: {err_text}"), None);
                 }
                 if is_llm_auth_error(&err_text) {
                     log_chat_warn(
@@ -722,8 +724,11 @@ impl WeChatBot {
                             ("detail", json!(err_text.clone())),
                         ],
                     );
-                    return "LLM 鉴权失败（401），请检查 MOONSHOT_* / DEEPSEEK_* / OPENAI_* 配置"
-                        .to_string();
+                    return (
+                        "LLM 鉴权失败（401），请检查 MOONSHOT_* / DEEPSEEK_* / OPENAI_* 配置"
+                            .to_string(),
+                        None,
+                    );
                 }
                 log_chat_warn(
                     "agent_reply_fallback",
@@ -739,17 +744,23 @@ impl WeChatBot {
             }
         }
         if user_text == "hello" || user_text == "你好" {
-            return "你好！我是 iLink Bot Demo（Rust版），有什么可以帮你的？".to_string();
+            return (
+                "你好！我是 iLink Bot Demo（Rust版），有什么可以帮你的？".to_string(),
+                None,
+            );
         }
         if user_text == "时间" || user_text == "几点了" {
             let now = Utc::now().with_timezone(&Shanghai);
-            return format!("现在是 {}", now.format("%Y-%m-%d %H:%M:%S"));
+            return (format!("现在是 {}", now.format("%Y-%m-%d %H:%M:%S")), None);
         }
         if user_text == "帮助" || user_text == "help" {
-            return "可用命令:\n- hello / 你好\n- 时间\n- 帮助 / help\n- 发送链接或 收藏 <url>\n- 状态 <task_id>\n- 最近任务\n- 日报 [YYYY-MM-DD] / 今日整理\n- 记住 <content>\n- 我的记忆\n- 有用 <memory_id>\n- 重试 <task_id>\n- /context [text]\n- /context verbose [text]\n- 其他文字我会 echo 回复"
-                .to_string();
+            return (
+                "可用命令:\n- hello / 你好\n- 时间\n- 帮助 / help\n- 发送链接或 收藏 <url>\n- 状态 <task_id>\n- 最近任务\n- 日报 [YYYY-MM-DD] / 今日整理\n- 记住 <content>\n- 我的记忆\n- 有用 <memory_id>\n- 重试 <task_id>\n- /context [text]\n- /context verbose [text]\n- 其他文字我会 echo 回复"
+                    .to_string(),
+                None,
+            );
         }
-        format!("Echo: {user_text}")
+        (format!("Echo: {user_text}"), None)
     }
 
     fn handle_link_submission(&mut self, user_id: &str, urls: Vec<String>) {
@@ -1040,6 +1051,7 @@ impl WeChatBot {
         } = event
         {
             let _ = self.task_store.delete_session_state(&user_id);
+            self.update_session_state_intent(&user_id, &merged_text);
             self.send_generated_reply(&user_id, &merged_text, &message_ids, reason);
         }
     }
@@ -1047,11 +1059,73 @@ impl WeChatBot {
     fn flush_expired_sessions(&mut self) {
         for item in self.session_router.flush_expired(Instant::now()) {
             let _ = self.task_store.delete_session_state(&item.user_id);
+            self.update_session_state_intent(&item.user_id, &item.merged_text);
             self.send_generated_reply(
                 &item.user_id,
                 &item.merged_text,
                 &item.message_ids,
                 item.reason,
+            );
+        }
+    }
+
+    /// C2: 在 session flush 时更新 last_user_intent
+    fn update_session_state_intent(&mut self, user_id: &str, merged_text: &str) {
+        let now = Utc::now().to_rfc3339();
+        let intent_preview = if merged_text.chars().count() > 120 {
+            let truncated: String = merged_text.chars().take(120).collect();
+            format!("{}...", truncated)
+        } else {
+            merged_text.to_string()
+        };
+        let record = match self.task_store.load_user_session_state(user_id) {
+            Ok(Some(existing)) => crate::task_store::UserSessionStateRecord {
+                user_id: user_id.to_string(),
+                last_user_intent: Some(intent_preview),
+                current_task: existing.current_task,
+                next_step: existing.next_step,
+                blocked_reason: existing.blocked_reason,
+                updated_at: now,
+            },
+            Ok(None) => crate::task_store::UserSessionStateRecord {
+                user_id: user_id.to_string(),
+                last_user_intent: Some(intent_preview),
+                current_task: None,
+                next_step: None,
+                blocked_reason: None,
+                updated_at: now,
+            },
+            Err(err) => {
+                log_chat_warn(
+                    "session_state_intent_update_failed",
+                    vec![
+                        ("user_id", json!(user_id)),
+                        ("error_kind", json!("session_state_load_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
+                return;
+            }
+        };
+        if let Err(err) = self.task_store.upsert_user_session_state(&record) {
+            log_chat_warn(
+                "session_state_intent_update_failed",
+                vec![
+                    ("user_id", json!(user_id)),
+                    ("error_kind", json!("session_state_upsert_failed")),
+                    ("detail", json!(err.to_string())),
+                ],
+            );
+        } else {
+            log_chat_info(
+                "session_state_upserted",
+                vec![
+                    ("user_id", json!(user_id)),
+                    (
+                        "intent_preview",
+                        json!(record.last_user_intent.unwrap_or_default()),
+                    ),
+                ],
             );
         }
     }
@@ -1103,15 +1177,107 @@ impl WeChatBot {
             ],
         );
 
-        let reply = self.generate_reply(
-            user_id,
-            merged_text,
-            message_ids,
-            reason,
-            AgentRunContext::wechat_chat(user_id, reason.as_str(), message_ids.to_vec())
-                .with_session_text(merged_text)
-                .with_context_token_present(self.context_token_map.contains_key(user_id)),
-        );
+        // C2: 加载持久化 SessionState
+        let session_state = match self.task_store.load_user_session_state(user_id) {
+            Ok(state) => {
+                log_chat_info(
+                    "session_state_loaded",
+                    vec![
+                        ("user_id", json!(user_id)),
+                        ("state_present", json!(state.is_some())),
+                        (
+                            "state_source",
+                            json!(if state.is_some() { "db" } else { "none" }),
+                        ),
+                    ],
+                );
+                state
+            }
+            Err(err) => {
+                log_chat_warn(
+                    "session_state_load_failed",
+                    vec![
+                        ("user_id", json!(user_id)),
+                        ("error_kind", json!("session_state_load_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
+                None
+            }
+        };
+
+        let context = AgentRunContext::wechat_chat(user_id, reason.as_str(), message_ids.to_vec())
+            .with_session_text(merged_text)
+            .with_context_token_present(self.context_token_map.contains_key(user_id))
+            .with_user_session_state(session_state);
+
+        let (reply, run_id) =
+            self.generate_reply(user_id, merged_text, message_ids, reason, context);
+
+        // C2: agent 完成后回写 updated_at（最小回写，不推导深状态）
+        let mut state_updated = false;
+        match self.task_store.load_user_session_state(user_id) {
+            Ok(Some(state)) => {
+                let mut updated = state.clone();
+                updated.updated_at = Utc::now().to_rfc3339();
+                if let Err(err) = self.task_store.upsert_user_session_state(&updated) {
+                    log_chat_warn(
+                        "session_state_upsert_failed",
+                        vec![
+                            ("user_id", json!(user_id)),
+                            ("error_kind", json!("session_state_upsert_failed")),
+                            ("detail", json!(err.to_string())),
+                        ],
+                    );
+                } else {
+                    state_updated = true;
+                    log_chat_info(
+                        "session_state_upserted",
+                        vec![("user_id", json!(user_id)), ("state_updated", json!(true))],
+                    );
+                }
+            }
+            Ok(None) => {
+                log_chat_info(
+                    "session_state_noop",
+                    vec![
+                        ("user_id", json!(user_id)),
+                        ("reason", json!("no_persistent_state")),
+                    ],
+                );
+            }
+            Err(err) => {
+                log_chat_warn(
+                    "session_state_upsert_read_failed",
+                    vec![
+                        ("user_id", json!(user_id)),
+                        ("error_kind", json!("session_state_load_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
+            }
+        }
+
+        // 补更新 trace 中的 persistent_state_updated
+        if state_updated {
+            if let Some(run_id) = run_id {
+                if let Err(err) = self
+                    .agent_core
+                    .patch_trace_persistent_state_updated(&run_id, true)
+                {
+                    log_chat_warn(
+                        "trace_patch_state_updated_failed",
+                        vec![
+                            ("user_id", json!(user_id)),
+                            ("run_id", json!(&run_id)),
+                            ("error_kind", json!("trace_patch_failed")),
+                            ("detail", json!(err.to_string())),
+                        ],
+                    );
+                }
+            }
+        }
+
         log_chat_info(
             "agent_reply_finished",
             vec![
@@ -2603,5 +2769,133 @@ mod tests {
         assert_eq!(payload["message_id"], "msg-1");
         assert!(payload.get("ts").is_some());
         assert!(payload.get("detail").is_none());
+    }
+
+    // ——— UserSessionState 接线测试 ———
+
+    #[test]
+    fn session_state_is_written_on_flush() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        // 直接调用 update_session_state_intent 验证写入逻辑
+        bot.update_session_state_intent("user-a", "你好，帮我查状态");
+
+        let state = bot
+            .task_store
+            .load_user_session_state("user-a")
+            .expect("加载失败")
+            .expect("应存在记录");
+        assert_eq!(state.user_id, "user-a");
+        assert_eq!(state.last_user_intent, Some("你好，帮我查状态".to_string()));
+    }
+
+    #[test]
+    fn session_state_is_loaded_and_injected_into_agent_context() {
+        let db_path = temp_db_path();
+        let workspace_root = temp_dir();
+        let mut bot = build_test_bot(&db_path, workspace_root.clone());
+
+        // 预写入一条 session_state
+        let record = crate::task_store::UserSessionStateRecord {
+            user_id: "user-a".to_string(),
+            last_user_intent: Some("预先存在的意图".to_string()),
+            current_task: Some("task-pre".to_string()),
+            next_step: Some("等待回复".to_string()),
+            blocked_reason: None,
+            updated_at: "2026-04-17T10:00:00Z".to_string(),
+        };
+        bot.task_store
+            .upsert_user_session_state(&record)
+            .expect("预写入失败");
+
+        // 触发 send_generated_reply，它会加载 session_state 并注入 context
+        // 使用 agent 能成功执行的命令（创建文件），确保 run_with_context 成功返回 run_id
+        bot.send_generated_reply(
+            "user-a",
+            "创建文件 test_session_state.txt :: hello",
+            &["msg-ss-2".to_string()],
+            FlushReason::Commit,
+        );
+
+        // 验证 trace 中记录了 persistent_state_present
+        let trace_root = workspace_root.join("data").join("agent_traces");
+        let day_dir = std::fs::read_dir(&trace_root)
+            .expect("应存在 trace 根目录")
+            .next()
+            .expect("应存在日期目录")
+            .expect("读取日期目录失败")
+            .path();
+        let trace_path = std::fs::read_dir(day_dir)
+            .expect("应存在 trace 文件")
+            .filter_map(|entry| entry.ok().map(|value| value.path()))
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .expect("应存在至少一个 json trace 文件");
+        let payload: Value = serde_json::from_str(
+            &std::fs::read_to_string(trace_path).expect("读取 trace 文件失败"),
+        )
+        .expect("trace JSON 应合法");
+
+        assert_eq!(payload["persistent_state_present"], true);
+        assert_eq!(payload["persistent_state_source"], "db");
+        assert_eq!(payload["persistent_state_updated"], true); // send_generated_reply 成功更新后 patch
+    }
+
+    #[test]
+    fn session_state_updated_at_is_refreshed_after_agent_run() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        // 预写入旧状态
+        let old = crate::task_store::UserSessionStateRecord {
+            user_id: "user-a".to_string(),
+            last_user_intent: Some("旧意图".to_string()),
+            current_task: None,
+            next_step: None,
+            blocked_reason: None,
+            updated_at: "2026-04-01T00:00:00Z".to_string(),
+        };
+        bot.task_store
+            .upsert_user_session_state(&old)
+            .expect("预写入失败");
+
+        // 直接触发 send_generated_reply，它会加载已有 state 并回写 updated_at
+        bot.send_generated_reply(
+            "user-a",
+            "读文件 README.md",
+            &["msg-ss-3".to_string()],
+            FlushReason::Commit,
+        );
+
+        let state = bot
+            .task_store
+            .load_user_session_state("user-a")
+            .expect("加载失败")
+            .expect("应存在");
+        // updated_at 应被刷新（不是旧值）
+        assert_ne!(state.updated_at, "2026-04-01T00:00:00Z");
+    }
+
+    #[test]
+    fn session_state_user_isolation_in_chat_adapter() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        // 直接调用 update_session_state_intent 验证用户隔离
+        bot.update_session_state_intent("user-a", "A 的消息");
+        bot.update_session_state_intent("user-b", "B 的消息");
+
+        let state_a = bot
+            .task_store
+            .load_user_session_state("user-a")
+            .expect("加载失败")
+            .expect("应存在");
+        let state_b = bot
+            .task_store
+            .load_user_session_state("user-b")
+            .expect("加载失败")
+            .expect("应存在");
+        assert_eq!(state_a.last_user_intent, Some("A 的消息".to_string()));
+        assert_eq!(state_b.last_user_intent, Some("B 的消息".to_string()));
     }
 }

@@ -2,6 +2,7 @@ pub mod agent_core;
 pub mod chat_adapter;
 pub mod command_router;
 pub mod config;
+pub mod context_pack;
 pub mod logging;
 pub mod pipeline;
 pub mod reporter;

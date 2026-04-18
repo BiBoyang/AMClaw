@@ -1,8 +1,9 @@
 use crate::config::AgentConfig;
+use crate::context_pack::*;
 use crate::session_summary::*;
 use crate::task_store::{
     FeedbackKind, MemoryFeedbackState, RecentTaskRecord, TaskStatusRecord, TaskStore,
-    UserMemoryRecord,
+    UserMemoryRecord, UserSessionStateRecord,
 };
 use crate::tool_registry::{ToolAction, ToolRegistry};
 use anyhow::{anyhow, bail, Context, Result};
@@ -61,6 +62,7 @@ pub struct AgentRunContext {
     article_id: Option<String>,
     session_text: Option<String>,
     context_token_present: bool,
+    user_session_state: Option<UserSessionStateRecord>,
 }
 
 impl AgentRunContext {
@@ -74,6 +76,7 @@ impl AgentRunContext {
             article_id: None,
             session_text: None,
             context_token_present: false,
+            user_session_state: None,
         }
     }
 
@@ -104,6 +107,7 @@ impl AgentRunContext {
             article_id: None,
             session_text: None,
             context_token_present: false,
+            user_session_state: None,
         }
     }
 
@@ -128,6 +132,11 @@ impl AgentRunContext {
         self.context_token_present = present;
         self
     }
+
+    pub fn with_user_session_state(mut self, state: Option<UserSessionStateRecord>) -> Self {
+        self.user_session_state = state;
+        self
+    }
 }
 
 #[allow(dead_code)]
@@ -148,46 +157,6 @@ impl AgentObservation {
             content: output.to_string(),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct ContextSectionSnapshot {
-    kind: String,
-    priority: u8,
-    max_chars: usize,
-    original_char_count: usize,
-    line_count: usize,
-    item_count: usize,
-    char_count: usize,
-    included: bool,
-    trimmed: bool,
-    trim_reason: Option<ContextSectionChangeReason>,
-    drop_reason: Option<ContextSectionChangeReason>,
-    content: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ContextSectionChangeReason {
-    SectionBudgetExceeded,
-    TotalBudgetExceeded,
-}
-
-impl ContextSectionChangeReason {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::SectionBudgetExceeded => "section_budget_exceeded",
-            Self::TotalBudgetExceeded => "total_budget_exceeded",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct ContextBudgetSummary {
-    max_total_chars: usize,
-    final_total_chars: usize,
-    trimmed_section_count: usize,
-    dropped_section_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
@@ -689,344 +658,6 @@ impl PlanningPolicy {
 #[derive(Debug, Default)]
 struct ContextAssembler;
 
-const DEFAULT_CONTEXT_MAX_TOTAL_CHARS: usize = 2600;
-#[derive(Debug, Clone, Copy)]
-struct ContextSectionPolicy {
-    priority: u8,
-    max_chars: usize,
-    pinned_lines: usize,
-    required: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContextSectionKind {
-    Preamble,
-    CurrentIntent,
-    RuntimeContext,
-    SessionState,
-    SessionText,
-    PreviousObservations,
-    LatestObservation,
-    RuntimePlan,
-    CurrentTask,
-    RecentTasks,
-    UserMemories,
-    ToolDescriptions,
-    ResponseContract,
-}
-
-impl ContextSectionKind {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Preamble => "preamble",
-            Self::CurrentIntent => "current_intent",
-            Self::RuntimeContext => "runtime_context",
-            Self::SessionState => "session_state",
-            Self::SessionText => "session_text",
-            Self::PreviousObservations => "previous_observations",
-            Self::LatestObservation => "latest_observation",
-            Self::RuntimePlan => "runtime_plan",
-            Self::CurrentTask => "current_task",
-            Self::RecentTasks => "recent_tasks",
-            Self::UserMemories => "user_memories",
-            Self::ToolDescriptions => "tool_descriptions",
-            Self::ResponseContract => "response_contract",
-        }
-    }
-
-    fn policy(&self) -> ContextSectionPolicy {
-        match self {
-            Self::Preamble => ContextSectionPolicy {
-                priority: 100,
-                max_chars: 120,
-                pinned_lines: 1,
-                required: true,
-            },
-            Self::CurrentIntent => ContextSectionPolicy {
-                priority: 100,
-                max_chars: 360,
-                pinned_lines: 3,
-                required: true,
-            },
-            Self::RuntimeContext => ContextSectionPolicy {
-                priority: 95,
-                max_chars: 520,
-                pinned_lines: 10,
-                required: true,
-            },
-            Self::SessionState => ContextSectionPolicy {
-                priority: 94,
-                max_chars: 560,
-                pinned_lines: 4,
-                required: false,
-            },
-            Self::SessionText => ContextSectionPolicy {
-                priority: 55,
-                max_chars: 460,
-                pinned_lines: 6,
-                required: false,
-            },
-            Self::PreviousObservations => ContextSectionPolicy {
-                priority: 70,
-                max_chars: 360,
-                pinned_lines: 2,
-                required: false,
-            },
-            Self::LatestObservation => ContextSectionPolicy {
-                priority: 92,
-                max_chars: 560,
-                pinned_lines: 4,
-                required: false,
-            },
-            Self::RuntimePlan => ContextSectionPolicy {
-                priority: 93,
-                max_chars: 520,
-                pinned_lines: 4,
-                required: false,
-            },
-            Self::CurrentTask => ContextSectionPolicy {
-                priority: 94,
-                max_chars: 420,
-                pinned_lines: 5,
-                required: false,
-            },
-            Self::RecentTasks => ContextSectionPolicy {
-                priority: 50,
-                max_chars: 300,
-                pinned_lines: 2,
-                required: false,
-            },
-            Self::UserMemories => ContextSectionPolicy {
-                priority: 75,
-                max_chars: 420,
-                pinned_lines: 2,
-                required: false,
-            },
-            Self::ToolDescriptions => ContextSectionPolicy {
-                priority: 40,
-                max_chars: 360,
-                pinned_lines: 2,
-                required: true,
-            },
-            Self::ResponseContract => ContextSectionPolicy {
-                priority: 100,
-                max_chars: 260,
-                pinned_lines: 2,
-                required: true,
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ContextSection {
-    kind: ContextSectionKind,
-    lines: Vec<String>,
-    policy: ContextSectionPolicy,
-    original_content: String,
-    trimmed: bool,
-    trim_reason: Option<ContextSectionChangeReason>,
-    included: bool,
-    drop_reason: Option<ContextSectionChangeReason>,
-}
-
-impl ContextSection {
-    fn new(kind: ContextSectionKind, lines: Vec<String>) -> Self {
-        let original_content = lines.join("\n");
-        let policy = kind.policy();
-        let mut section = Self {
-            kind,
-            lines,
-            policy,
-            original_content,
-            trimmed: false,
-            trim_reason: None,
-            included: true,
-            drop_reason: None,
-        };
-        section.apply_section_budget();
-        section
-    }
-
-    fn render(&self) -> String {
-        self.lines.join("\n")
-    }
-
-    fn char_count(&self) -> usize {
-        if self.included {
-            self.render().chars().count()
-        } else {
-            0
-        }
-    }
-
-    fn original_char_count(&self) -> usize {
-        self.original_content.chars().count()
-    }
-
-    fn item_count(&self) -> usize {
-        if self.included {
-            self.lines.iter().filter(|line| !line.is_empty()).count()
-        } else {
-            0
-        }
-    }
-
-    fn line_count(&self) -> usize {
-        if self.included {
-            self.lines.len()
-        } else {
-            0
-        }
-    }
-
-    fn content_for_snapshot(&self) -> String {
-        if self.included {
-            self.render()
-        } else {
-            summarize_for_markdown(&self.original_content, 240)
-        }
-    }
-
-    fn drop_from_prompt(&mut self, reason: ContextSectionChangeReason) {
-        self.included = false;
-        self.drop_reason = Some(reason);
-    }
-
-    fn apply_section_budget(&mut self) {
-        if self.original_char_count() <= self.policy.max_chars {
-            return;
-        }
-        self.trimmed = true;
-        self.trim_reason = Some(ContextSectionChangeReason::SectionBudgetExceeded);
-        self.lines =
-            trim_section_lines(&self.lines, self.policy.max_chars, self.policy.pinned_lines);
-    }
-}
-
-fn trim_section_lines(lines: &[String], max_chars: usize, pinned_lines: usize) -> Vec<String> {
-    let rendered = lines.join("\n");
-    if rendered.chars().count() <= max_chars {
-        return lines.to_vec();
-    }
-    if max_chars < 48 {
-        return vec![summarize_for_markdown(&rendered, max_chars)];
-    }
-
-    let pinned = pinned_lines.min(lines.len());
-    let prefix = lines[..pinned].to_vec();
-    let prefix_rendered = prefix.join("\n");
-    let prefix_chars = prefix_rendered.chars().count();
-    if prefix.is_empty() || prefix_chars + 48 >= max_chars {
-        return vec![summarize_for_markdown(&rendered, max_chars)];
-    }
-
-    let body = lines[pinned..].join("\n");
-    let available_for_body = max_chars.saturating_sub(prefix_chars + 16);
-    let body_summary = summarize_for_markdown(&body, available_for_body.max(24));
-    let mut trimmed = prefix;
-    trimmed.push(format!("- trimmed: {}", body_summary));
-    trimmed
-}
-
-#[derive(Debug, Clone)]
-struct ContextPack {
-    sections: Vec<ContextSection>,
-    max_total_chars: usize,
-}
-
-impl ContextPack {
-    fn default() -> Self {
-        Self {
-            sections: Vec::new(),
-            max_total_chars: DEFAULT_CONTEXT_MAX_TOTAL_CHARS,
-        }
-    }
-
-    fn push(&mut self, section: ContextSection) {
-        self.sections.push(section);
-    }
-
-    #[cfg(test)]
-    fn section(&self, kind: ContextSectionKind) -> Option<&ContextSection> {
-        self.sections.iter().find(|section| section.kind == kind)
-    }
-
-    fn render(&self) -> String {
-        let mut rendered = Vec::new();
-        for section in &self.sections {
-            if section.included {
-                rendered.extend(section.lines.iter().cloned());
-            }
-        }
-        rendered.join("\n")
-    }
-
-    fn total_chars(&self) -> usize {
-        self.sections.iter().map(ContextSection::char_count).sum()
-    }
-
-    fn apply_total_budget(&mut self) {
-        while self.total_chars() > self.max_total_chars {
-            let drop_idx = self
-                .sections
-                .iter()
-                .enumerate()
-                .filter(|(_, section)| section.included && !section.policy.required)
-                .min_by(|(_, left), (_, right)| {
-                    left.policy
-                        .priority
-                        .cmp(&right.policy.priority)
-                        .then_with(|| right.char_count().cmp(&left.char_count()))
-                })
-                .map(|(idx, _)| idx);
-
-            let Some(drop_idx) = drop_idx else {
-                break;
-            };
-            self.sections[drop_idx]
-                .drop_from_prompt(ContextSectionChangeReason::TotalBudgetExceeded);
-        }
-    }
-
-    fn budget_summary(&self) -> ContextBudgetSummary {
-        ContextBudgetSummary {
-            max_total_chars: self.max_total_chars,
-            final_total_chars: self.total_chars(),
-            trimmed_section_count: self
-                .sections
-                .iter()
-                .filter(|section| section.trimmed)
-                .count(),
-            dropped_section_count: self
-                .sections
-                .iter()
-                .filter(|section| !section.included)
-                .count(),
-        }
-    }
-
-    fn snapshot(&self) -> Vec<ContextSectionSnapshot> {
-        self.sections
-            .iter()
-            .map(|section| ContextSectionSnapshot {
-                kind: section.kind.as_str().to_string(),
-                priority: section.policy.priority,
-                max_chars: section.policy.max_chars,
-                original_char_count: section.original_char_count(),
-                line_count: section.line_count(),
-                item_count: section.item_count(),
-                char_count: section.char_count(),
-                included: section.included,
-                trimmed: section.trimmed,
-                trim_reason: section.trim_reason.clone(),
-                drop_reason: section.drop_reason.clone(),
-                content: section.content_for_snapshot(),
-            })
-            .collect()
-    }
-}
-
 impl ContextAssembler {
     #[cfg(test)]
     fn assemble(
@@ -1349,12 +980,37 @@ impl ContextAssembler {
     }
 }
 
+/// Build a ContextPack from runtime state (public entry point).
+///
+/// This is the single-entry API for constructing structured context packs.
+/// All prompt assembly should go through this path.
+fn build_context_pack(
+    trace: &AgentRunTrace,
+    user_input: &str,
+    observation: Option<&AgentObservation>,
+    runtime_session_state: Option<&RuntimeSessionStateSnapshot>,
+    available_tools: &[String],
+    business_context: Option<&BusinessContextSnapshot>,
+    session_summary_strategy: SessionSummaryStrategy,
+) -> ContextPack {
+    ContextAssembler.build_pack_with_summary_strategy(
+        trace,
+        user_input,
+        observation,
+        runtime_session_state,
+        available_tools,
+        business_context,
+        session_summary_strategy,
+    )
+}
+
 fn derive_runtime_session_state(
     trace: &AgentRunTrace,
     user_input: &str,
     observation: Option<&AgentObservation>,
     business_context: Option<&BusinessContextSnapshot>,
 ) -> RuntimeSessionStateSnapshot {
+    let persistent_session_state = trace.user_session_state.as_ref();
     let current_step = trace.active_plan_steps.iter().find(|step| {
         matches!(
             step.status,
@@ -1369,7 +1025,20 @@ fn derive_runtime_session_state(
         .take(3)
         .collect::<Vec<_>>();
 
-    let goal = if let Some(task) = business_context.and_then(|ctx| ctx.current_task.as_ref()) {
+    // 优先从持久化 session_state 推导 goal
+    let goal = if let Some(pss) = persistent_session_state {
+        if let Some(ref intent) = pss.last_user_intent {
+            Some(format!(
+                "响应当前用户请求（基于历史意图）：{}",
+                summarize_for_markdown(intent, 120)
+            ))
+        } else {
+            Some(format!(
+                "响应当前用户请求：{}",
+                summarize_for_markdown(user_input.trim(), 120)
+            ))
+        }
+    } else if let Some(task) = business_context.and_then(|ctx| ctx.current_task.as_ref()) {
         Some(format!("推进任务 {} 到下一可收敛状态", task.task_id))
     } else if let Some(current_step) = current_step {
         Some(format!("完成当前计划：{}", current_step.description))
@@ -1380,8 +1049,14 @@ fn derive_runtime_session_state(
         ))
     };
 
-    let current_subtask = current_step
-        .map(|step| step.description.clone())
+    // 持久化 session_state 的 current_task / next_step 优先
+    let current_subtask = persistent_session_state
+        .and_then(|pss| {
+            pss.current_task
+                .as_ref()
+                .map(|t| format!("当前关注任务: {}", t))
+        })
+        .or_else(|| current_step.map(|step| step.description.clone()))
         .or_else(|| {
             business_context
                 .and_then(|ctx| ctx.current_task.as_ref())
@@ -1389,6 +1064,12 @@ fn derive_runtime_session_state(
         });
 
     let mut constraints = Vec::new();
+    // 持久化 blocked_reason 作为硬约束注入
+    if let Some(pss) = persistent_session_state {
+        if let Some(ref reason) = pss.blocked_reason {
+            constraints.push(format!("当前阻塞原因（来自历史状态）：{}", reason));
+        }
+    }
     if trace.controller_state.remaining_replans() == 0 {
         constraints.push("replan budget 已耗尽，应优先收敛或 ask_user".to_string());
     }
@@ -1425,8 +1106,9 @@ fn derive_runtime_session_state(
         confirmed_facts.push(format!("memory_injected={}", trace.memory_hit_count));
     }
 
-    let next_step = current_step
-        .map(|step| step.description.clone())
+    let next_step = persistent_session_state
+        .and_then(|pss| pss.next_step.clone())
+        .or_else(|| current_step.map(|step| step.description.clone()))
         .or_else(|| {
             if observation.is_some() {
                 Some("基于 latest observation 判断是继续调工具还是直接结束".to_string())
@@ -1473,6 +1155,12 @@ fn derive_runtime_session_state(
         next_step,
         open_questions,
     }
+}
+
+#[derive(Debug)]
+pub struct AgentRunResult {
+    pub output: String,
+    pub run_id: String,
 }
 
 #[derive(Debug)]
@@ -1606,11 +1294,17 @@ impl AgentCore {
 
     pub fn run(&self, user_input: &str) -> Result<String> {
         self.run_with_context(user_input, AgentRunContext::agent_demo())
+            .map(|result| result.output)
     }
 
-    pub fn run_with_context(&self, user_input: &str, context: AgentRunContext) -> Result<String> {
+    pub fn run_with_context(
+        &self,
+        user_input: &str,
+        context: AgentRunContext,
+    ) -> Result<AgentRunResult> {
         let started = Instant::now();
         let mut trace = AgentRunTrace::new(&self.workspace_root, user_input, context);
+        let run_id = trace.run_id.clone();
         trace.configure_controller_limits(self.max_steps, self.max_replans);
         let mut last_observation: Option<AgentObservation> = None;
         let result = (|| -> Result<String> {
@@ -1659,7 +1353,45 @@ impl AgentCore {
             );
         }
 
-        result
+        result.map(|output| AgentRunResult { output, run_id })
+    }
+
+    /// 事后补更新 trace 中的 persistent_state_updated 字段
+    pub fn patch_trace_persistent_state_updated(&self, run_id: &str, updated: bool) -> Result<()> {
+        let day = Utc::now()
+            .with_timezone(&Shanghai)
+            .format("%Y-%m-%d")
+            .to_string();
+        let dir = self
+            .workspace_root
+            .join("data")
+            .join("agent_traces")
+            .join(&day);
+
+        let entries = fs::read_dir(&dir)
+            .with_context(|| format!("读取 trace 目录失败: {}", dir.display()))?;
+        let mut found = None;
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.ends_with(".json") && name_str.contains(run_id) {
+                found = Some(entry.path());
+                break;
+            }
+        }
+        let json_path =
+            found.ok_or_else(|| anyhow!("未找到对应 run_id 的 trace 文件: {run_id}"))?;
+
+        let content = fs::read_to_string(&json_path)
+            .with_context(|| format!("读取 trace 文件失败: {}", json_path.display()))?;
+        let mut payload: Value = serde_json::from_str(&content).context("解析 trace JSON 失败")?;
+        payload["persistent_state_updated"] = json!(updated);
+        let updated_content =
+            serde_json::to_string_pretty(&payload).context("序列化更新后的 trace 失败")?;
+        fs::write(&json_path, format!("{updated_content}\n"))
+            .with_context(|| format!("写入更新后的 trace 失败: {}", json_path.display()))?;
+        Ok(())
     }
 
     pub fn preview_context_with_context(
@@ -1912,7 +1644,7 @@ impl AgentCore {
         if step == 0 && !runtime_session_state.is_empty() {
             trace.record_session_state_snapshot(runtime_session_state.clone());
         }
-        let planner_input = ContextAssembler.assemble_with_summary_strategy(
+        let context_pack = build_context_pack(
             trace,
             user_input,
             observation,
@@ -1921,6 +1653,50 @@ impl AgentCore {
             business_context.as_ref(),
             self.context_compaction.session_summary_strategy,
         );
+
+        // 记录 ContextPack 级可观测字段（仅在 step 0 写入）
+        if step == 0 {
+            trace.context_pack_present = true;
+            trace.context_pack_section_count = context_pack.section_count();
+            trace.context_pack_total_chars = context_pack.total_chars();
+            trace.context_pack_drop_reasons = context_pack.drop_reasons();
+            let budget = context_pack.budget_summary();
+            log_agent_info(
+                "context_pack_built",
+                vec![
+                    ("section_count", json!(trace.context_pack_section_count)),
+                    ("total_chars", json!(trace.context_pack_total_chars)),
+                    ("trimmed_sections", json!(budget.trimmed_section_count)),
+                    ("dropped_sections", json!(budget.dropped_section_count)),
+                ],
+            );
+            if budget.trimmed_section_count > 0 || budget.dropped_section_count > 0 {
+                log_agent_info(
+                    "context_pack_trimmed",
+                    vec![
+                        ("trimmed_sections", json!(budget.trimmed_section_count)),
+                        ("dropped_sections", json!(budget.dropped_section_count)),
+                        (
+                            "drop_reasons",
+                            json!(trace.context_pack_drop_reasons.clone()),
+                        ),
+                    ],
+                );
+            }
+        }
+
+        let assembled_user_prompt = render_prompt_from_context_pack(&context_pack);
+        let context_sections = context_pack.snapshot();
+        let context_budget_summary = context_pack.budget_summary();
+        let context_summary = build_context_summary(trace, observation);
+
+        let planner_input = PlannerInput {
+            raw_user_input: user_input.to_string(),
+            assembled_user_prompt,
+            context_sections,
+            context_budget_summary,
+            context_summary,
+        };
 
         #[cfg(test)]
         if let Some(planned) = self.scripted_decisions.borrow_mut().pop_front() {
@@ -2360,6 +2136,16 @@ struct AgentRunTrace {
     memory_total_chars: usize,     // 注入记忆的总字符数
     memory_dropped_count: usize,   // 被裁剪掉的记忆条数
     memory_ids: Vec<String>,       // 注入记忆的 ID 列表
+    persistent_state_present: bool,
+    persistent_state_source: Option<String>,
+    persistent_state_updated: bool,
+    // --- ContextPack-level observability (C3/C4) ---
+    context_pack_present: bool,
+    context_pack_section_count: usize,
+    context_pack_total_chars: usize,
+    context_pack_drop_reasons: Vec<String>,
+    #[serde(skip_serializing)]
+    user_session_state: Option<UserSessionStateRecord>,
     #[serde(skip_serializing)]
     trace_dir_root: PathBuf,
 }
@@ -2475,6 +2261,9 @@ struct AgentTraceIndexEntry {
     memory_retrieved_count: usize,
     memory_total_chars: usize,
     memory_dropped_count: usize,
+    context_pack_present: bool,
+    context_pack_section_count: usize,
+    context_pack_total_chars: usize,
     json_file: String,
     markdown_file: String,
 }
@@ -2529,6 +2318,18 @@ impl AgentRunTrace {
             memory_total_chars: 0,
             memory_dropped_count: 0,
             memory_ids: Vec::new(),
+            persistent_state_present: context.user_session_state.is_some(),
+            persistent_state_source: if context.user_session_state.is_some() {
+                Some("db".to_string())
+            } else {
+                None
+            },
+            persistent_state_updated: false,
+            context_pack_present: false,
+            context_pack_section_count: 0,
+            context_pack_total_chars: 0,
+            context_pack_drop_reasons: Vec::new(),
+            user_session_state: context.user_session_state,
         }
     }
 
@@ -2948,6 +2749,9 @@ impl AgentRunTrace {
             memory_retrieved_count: self.memory_retrieved_count,
             memory_total_chars: self.memory_total_chars,
             memory_dropped_count: self.memory_dropped_count,
+            context_pack_present: self.context_pack_present,
+            context_pack_section_count: self.context_pack_section_count,
+            context_pack_total_chars: self.context_pack_total_chars,
             json_file: json_path
                 .file_name()
                 .and_then(|v| v.to_str())
@@ -4665,15 +4469,18 @@ fn split_path_and_content(raw: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_agent_log_payload, build_context_summary, classify_tool_execution_failure,
-        derive_runtime_session_state, detect_stalled_trajectory_failure,
-        load_business_context_snapshot, map_llm_plan, parse_llm_plan, select_previous_observations,
-        validate_expected_observation, AgentCore, AgentObservation, AgentRunContext, AgentRunTrace,
-        BusinessContextSnapshot, ContextAssembler, ContextPreviewMode, ContextSectionChangeReason,
-        ContextSectionKind, DoneRule, DropReason, ExecutionPlan, ExpectedObservation,
-        FailureAction, FailureDecision, LlmPlan, MinimumNovelty, ObservationKind, PlannedDecision,
-        ReplanScope, RuntimeSessionStateSnapshot, StepFailureKind,
+        build_agent_log_payload, build_context_pack, build_context_summary,
+        classify_tool_execution_failure, derive_runtime_session_state,
+        detect_stalled_trajectory_failure, load_business_context_snapshot, map_llm_plan,
+        parse_llm_plan, select_previous_observations, validate_expected_observation, AgentCore,
+        AgentObservation, AgentRunContext, AgentRunTrace, BusinessContextSnapshot,
+        ContextAssembler, ContextPreviewMode, DoneRule, DropReason, ExecutionPlan,
+        ExpectedObservation, FailureAction, FailureDecision, LlmPlan, MinimumNovelty,
+        ObservationKind, PlannedDecision, ReplanScope, RuntimeSessionStateSnapshot,
+        StepFailureKind,
     };
+    use crate::context_pack::{ContextSectionChangeReason, ContextSectionKind};
+    use crate::session_summary::SessionSummaryStrategy;
     use crate::task_store::TaskStore;
     use serde_json::{json, Value};
     use uuid::Uuid;
@@ -5638,10 +5445,10 @@ mod tests {
         let latest = pack
             .section(ContextSectionKind::LatestObservation)
             .expect("应包含 latest observation section");
-        assert_eq!(latest.kind.as_str(), "latest_observation");
+        assert_eq!(latest.kind().as_str(), "latest_observation");
         assert!(latest.item_count() >= 5);
         assert!(latest.char_count() > 0);
-        assert!(latest.lines.iter().any(|line| line.contains("read_file")));
+        assert!(latest.lines().iter().any(|line| line.contains("read_file")));
 
         let rendered = pack.render();
         assert!(rendered.contains("## User Input"));
@@ -5806,7 +5613,7 @@ mod tests {
             ],
             None,
         );
-        pack.max_total_chars = 1500;
+        pack.set_max_total_chars(1500);
         pack.apply_total_budget();
 
         let snapshot = pack.snapshot();
@@ -6380,5 +6187,77 @@ mod tests {
             classify_tool_execution_failure("tool:read".to_string(), "operation timed out");
         assert_eq!(failure.kind, StepFailureKind::Transient);
         assert_eq!(failure.action, FailureAction::RetryStep);
+    }
+
+    #[test]
+    fn trace_context_pack_fields_present_after_run() {
+        let root = temp_workspace();
+        let agent = AgentCore::new(root.clone()).expect("初始化 agent 失败");
+
+        agent.run("读文件 missing.txt").expect_err("应当返回错误");
+
+        let trace_root = root.join("data").join("agent_traces");
+        let day_dir = std::fs::read_dir(&trace_root)
+            .expect("应存在 trace 根目录")
+            .next()
+            .expect("应存在日期目录")
+            .expect("读取日期目录失败")
+            .path();
+        let trace_path = std::fs::read_dir(day_dir)
+            .expect("应存在 trace 文件")
+            .filter_map(|entry| entry.ok().map(|v| v.path()))
+            .find(|path| path.extension().and_then(|v| v.to_str()) == Some("json"))
+            .expect("应存在至少一个 json trace 文件");
+        let payload: Value = serde_json::from_str(
+            &std::fs::read_to_string(&trace_path).expect("读取 trace 文件失败"),
+        )
+        .expect("trace JSON 应合法");
+
+        assert_eq!(payload["context_pack_present"], true);
+        assert!(payload["context_pack_section_count"].as_u64().unwrap_or(0) > 0);
+        assert!(payload["context_pack_total_chars"].as_u64().unwrap_or(0) > 0);
+        assert!(payload["context_pack_drop_reasons"].is_array());
+    }
+
+    #[test]
+    fn trace_context_pack_fields_populated_on_budget_trim() {
+        let workspace = temp_workspace();
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "请帮我处理一个很长的上下文请求",
+            AgentRunContext::wechat_chat("user-budget", "commit", vec![])
+                .with_session_text("session ".repeat(240)),
+        );
+        let observation =
+            AgentObservation::tool_result(1, "read_file", &"observation ".repeat(240));
+        let runtime_session_state = RuntimeSessionStateSnapshot {
+            goal: Some("推进一个需要大量上下文的信息整理任务".to_string()),
+            current_subtask: Some("先整理线索，再决定是否继续调工具".to_string()),
+            constraints: vec!["避免重复无效动作".to_string(); 4],
+            confirmed_facts: vec![
+                "已有较长 session_text 和 latest_observation".to_string();
+                4
+            ],
+            done_items: vec!["已完成初步读取".to_string(); 3],
+            next_step: Some("优先收敛上下文而不是继续膨胀 prompt".to_string()),
+            open_questions: vec!["哪些 section 可以先被丢弃".to_string(); 3],
+        };
+        let mut pack = build_context_pack(
+            &trace,
+            "请帮我处理一个很长的上下文请求",
+            Some(&observation),
+            Some(&runtime_session_state),
+            &[
+                format!("read: {}", "tool ".repeat(120)),
+                format!("write: {}", "tool ".repeat(120)),
+            ],
+            None,
+            SessionSummaryStrategy::Semantic,
+        );
+        pack.set_max_total_chars(1500);
+        pack.apply_total_budget();
+
+        assert!(pack.budget_summary().final_total_chars <= 1500);
+        assert!(!pack.drop_reasons().is_empty());
     }
 }

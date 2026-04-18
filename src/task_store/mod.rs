@@ -126,6 +126,17 @@ pub struct UserMemoryRecord {
     pub updated_at: String,
 }
 
+/// 用户会话结构化状态（跨会话持久化）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserSessionStateRecord {
+    pub user_id: String,
+    pub last_user_intent: Option<String>,
+    pub current_task: Option<String>,
+    pub next_step: Option<String>,
+    pub blocked_reason: Option<String>,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
     /// 内容为空或仅 whitespace
@@ -459,6 +470,75 @@ impl TaskStore {
             sessions.push(row.context("读取 session_state 失败")?);
         }
         Ok(sessions)
+    }
+
+    // ---- UserSessionState API ----
+
+    /// 加载用户会话结构化状态
+    pub fn load_user_session_state(&self, user_id: &str) -> Result<Option<UserSessionStateRecord>> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT user_id, last_user_intent, current_task, next_step, blocked_reason, updated_at
+                FROM user_session_states WHERE user_id = ?1
+                "#,
+                [user_id],
+                |row| {
+                    Ok(UserSessionStateRecord {
+                        user_id: row.get(0)?,
+                        last_user_intent: row.get(1)?,
+                        current_task: row.get(2)?,
+                        next_step: row.get(3)?,
+                        blocked_reason: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .context("加载 user_session_state 失败")
+    }
+
+    /// 覆盖写入用户会话结构化状态
+    pub fn upsert_user_session_state(&mut self, record: &UserSessionStateRecord) -> Result<()> {
+        let user_id = record.user_id.trim();
+        if user_id.is_empty() {
+            bail!("user_id 不能为空");
+        }
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO user_session_states (user_id, last_user_intent, current_task, next_step, blocked_reason, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    last_user_intent = excluded.last_user_intent,
+                    current_task = excluded.current_task,
+                    next_step = excluded.next_step,
+                    blocked_reason = excluded.blocked_reason,
+                    updated_at = excluded.updated_at
+                "#,
+                params![
+                    user_id,
+                    record.last_user_intent,
+                    record.current_task,
+                    record.next_step,
+                    record.blocked_reason,
+                    record.updated_at,
+                ],
+            )
+            .context("写入 user_session_state 失败")?;
+        Ok(())
+    }
+
+    /// 清空用户会话结构化状态
+    pub fn clear_user_session_state(&mut self, user_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM user_session_states WHERE user_id = ?1",
+                [user_id],
+            )
+            .context("清空 user_session_state 失败")?;
+        log_task_store_info("session_state_cleared", vec![("user_id", json!(user_id))]);
+        Ok(())
     }
 
     /// 写入显式用户记忆（用户明确要求"记住"）
@@ -1424,6 +1504,15 @@ impl TaskStore {
                 updated_at       DATETIME NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS user_session_states (
+                user_id          TEXT PRIMARY KEY,
+                last_user_intent TEXT,
+                current_task     TEXT,
+                next_step        TEXT,
+                blocked_reason   TEXT,
+                updated_at       DATETIME NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS user_memories (
                 id          TEXT PRIMARY KEY,
                 user_id     TEXT NOT NULL,
@@ -1699,7 +1788,7 @@ mod tests {
         build_task_store_log_payload, ArchivedTaskRecord, FeedbackKind, LinkTaskRecord,
         MarkTaskArchivedInput, MemoryFeedbackState, MemoryWriteState, PendingTaskRecord,
         PromoteReason, RecentTaskRecord, SkipReason, StoredSessionRecord, TaskStatusRecord,
-        TaskStore, UserMemoryRecord, WriteDecision,
+        TaskStore, UserMemoryRecord, UserSessionStateRecord, WriteDecision,
     };
     use rusqlite::Connection;
     use serde_json::{json, Value};
@@ -3061,5 +3150,207 @@ mod tests {
         assert_eq!(fb.retrieved_count("m2"), 1);
         assert_eq!(fb.injected_count("m2"), 0);
         assert!(fb.has_feedback());
+    }
+
+    // ——— UserSessionState 测试 ———
+
+    #[test]
+    fn user_session_state_empty_load_returns_none() {
+        let db_path = temp_db_path();
+        let store = TaskStore::open(&db_path).expect("初始化失败");
+        let result = store.load_user_session_state("user-a").expect("加载失败");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn user_session_state_first_write_and_read_back() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+
+        let record = UserSessionStateRecord {
+            user_id: "user-a".to_string(),
+            last_user_intent: Some("查询任务状态".to_string()),
+            current_task: Some("task-123".to_string()),
+            next_step: Some("等待用户确认".to_string()),
+            blocked_reason: None,
+            updated_at: "2026-04-17T10:00:00Z".to_string(),
+        };
+        store.upsert_user_session_state(&record).expect("写入失败");
+
+        let loaded = store
+            .load_user_session_state("user-a")
+            .expect("加载失败")
+            .expect("应存在记录");
+        assert_eq!(loaded.user_id, "user-a");
+        assert_eq!(loaded.last_user_intent, Some("查询任务状态".to_string()));
+        assert_eq!(loaded.current_task, Some("task-123".to_string()));
+        assert_eq!(loaded.next_step, Some("等待用户确认".to_string()));
+        assert_eq!(loaded.blocked_reason, None);
+    }
+
+    #[test]
+    fn user_session_state_overwrite_updates_fields() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+
+        let first = UserSessionStateRecord {
+            user_id: "user-a".to_string(),
+            last_user_intent: Some("旧意图".to_string()),
+            current_task: Some("task-1".to_string()),
+            next_step: Some("步骤1".to_string()),
+            blocked_reason: None,
+            updated_at: "2026-04-17T10:00:00Z".to_string(),
+        };
+        store.upsert_user_session_state(&first).expect("写入失败");
+
+        let second = UserSessionStateRecord {
+            user_id: "user-a".to_string(),
+            last_user_intent: Some("新意图".to_string()),
+            current_task: Some("task-2".to_string()),
+            next_step: Some("步骤2".to_string()),
+            blocked_reason: Some("等待人工输入".to_string()),
+            updated_at: "2026-04-17T11:00:00Z".to_string(),
+        };
+        store.upsert_user_session_state(&second).expect("更新失败");
+
+        let loaded = store
+            .load_user_session_state("user-a")
+            .expect("加载失败")
+            .expect("应存在记录");
+        assert_eq!(loaded.last_user_intent, Some("新意图".to_string()));
+        assert_eq!(loaded.current_task, Some("task-2".to_string()));
+        assert_eq!(loaded.next_step, Some("步骤2".to_string()));
+        assert_eq!(loaded.blocked_reason, Some("等待人工输入".to_string()));
+        assert_eq!(loaded.updated_at, "2026-04-17T11:00:00Z".to_string());
+    }
+
+    #[test]
+    fn user_session_state_user_isolation() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+
+        let record_a = UserSessionStateRecord {
+            user_id: "user-a".to_string(),
+            last_user_intent: Some("A的意图".to_string()),
+            current_task: None,
+            next_step: None,
+            blocked_reason: None,
+            updated_at: "2026-04-17T10:00:00Z".to_string(),
+        };
+        let record_b = UserSessionStateRecord {
+            user_id: "user-b".to_string(),
+            last_user_intent: Some("B的意图".to_string()),
+            current_task: None,
+            next_step: None,
+            blocked_reason: None,
+            updated_at: "2026-04-17T10:00:00Z".to_string(),
+        };
+        store
+            .upsert_user_session_state(&record_a)
+            .expect("写入A失败");
+        store
+            .upsert_user_session_state(&record_b)
+            .expect("写入B失败");
+
+        let loaded_a = store
+            .load_user_session_state("user-a")
+            .expect("加载失败")
+            .expect("应存在");
+        let loaded_b = store
+            .load_user_session_state("user-b")
+            .expect("加载失败")
+            .expect("应存在");
+        assert_eq!(loaded_a.last_user_intent, Some("A的意图".to_string()));
+        assert_eq!(loaded_b.last_user_intent, Some("B的意图".to_string()));
+    }
+
+    #[test]
+    fn user_session_state_clear_removes_record() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+
+        let record = UserSessionStateRecord {
+            user_id: "user-a".to_string(),
+            last_user_intent: Some("意图".to_string()),
+            current_task: None,
+            next_step: None,
+            blocked_reason: None,
+            updated_at: "2026-04-17T10:00:00Z".to_string(),
+        };
+        store.upsert_user_session_state(&record).expect("写入失败");
+        assert!(store.load_user_session_state("user-a").unwrap().is_some());
+
+        store.clear_user_session_state("user-a").expect("清空失败");
+        assert!(store.load_user_session_state("user-a").unwrap().is_none());
+    }
+
+    #[test]
+    fn user_session_state_upsert_empty_user_id_fails() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+
+        let record = UserSessionStateRecord {
+            user_id: "   ".to_string(),
+            last_user_intent: None,
+            current_task: None,
+            next_step: None,
+            blocked_reason: None,
+            updated_at: "2026-04-17T10:00:00Z".to_string(),
+        };
+        let err = store
+            .upsert_user_session_state(&record)
+            .expect_err("应失败");
+        assert!(err.to_string().contains("user_id"));
+    }
+
+    #[test]
+    fn user_session_state_all_optional_fields_can_be_none() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+
+        let record = UserSessionStateRecord {
+            user_id: "user-a".to_string(),
+            last_user_intent: None,
+            current_task: None,
+            next_step: None,
+            blocked_reason: None,
+            updated_at: "2026-04-17T10:00:00Z".to_string(),
+        };
+        store.upsert_user_session_state(&record).expect("写入失败");
+
+        let loaded = store
+            .load_user_session_state("user-a")
+            .expect("加载失败")
+            .expect("应存在");
+        assert!(loaded.last_user_intent.is_none());
+        assert!(loaded.current_task.is_none());
+        assert!(loaded.next_step.is_none());
+        assert!(loaded.blocked_reason.is_none());
+    }
+
+    #[test]
+    fn user_session_state_survives_reopen() {
+        let db_path = temp_db_path();
+        {
+            let mut store = TaskStore::open(&db_path).expect("初始化失败");
+            let record = UserSessionStateRecord {
+                user_id: "user-a".to_string(),
+                last_user_intent: Some("持久化测试".to_string()),
+                current_task: Some("task-xyz".to_string()),
+                next_step: None,
+                blocked_reason: Some("blocked".to_string()),
+                updated_at: "2026-04-17T12:00:00Z".to_string(),
+            };
+            store.upsert_user_session_state(&record).expect("写入失败");
+        }
+
+        let store = TaskStore::open(&db_path).expect("重新打开失败");
+        let loaded = store
+            .load_user_session_state("user-a")
+            .expect("加载失败")
+            .expect("应存在");
+        assert_eq!(loaded.last_user_intent, Some("持久化测试".to_string()));
+        assert_eq!(loaded.current_task, Some("task-xyz".to_string()));
+        assert_eq!(loaded.blocked_reason, Some("blocked".to_string()));
     }
 }

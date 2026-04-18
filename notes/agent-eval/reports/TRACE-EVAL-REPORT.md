@@ -1,6 +1,6 @@
 # Trace Evaluation Report
 
-- generated: 2026-04-18T08:36:22.517783+00:00
+- generated: 2026-04-18T09:41:03.187594+00:00
 - total traces: 20
 - baseline_file: notes/agent-eval/baselines/EVAL-BASELINE-SAMPLES-2026-04-18.md
 - baseline_run_ids: 20
@@ -87,7 +87,8 @@
 
 | metric | count | ratio |
 | --- | ---: | ---: |
-| recovery_attempt_count | 6 | 30.0% |
+| traces_with_recovery | 6 | 30.0% |
+| recovery_attempt_count | 6 | - |
 | recovery_success | 1 | 16.7% |
 | recovery_failure | 5 | 83.3% |
 
@@ -96,10 +97,10 @@
 | failure_type | attempt | success | failure |
 | --- | ---: | ---: | ---: |
 | tool_call_error | 2 | 1 | 1 |
-| planning_stall_or_drift | 1 | 0 | 1 |
 | fallback_exhausted | 1 | 0 | 1 |
-| llm_auth_error | 1 | 0 | 1 |
 | unknown_failure | 1 | 0 | 1 |
+| llm_auth_error | 1 | 0 | 1 |
+| planning_stall_or_drift | 1 | 0 | 1 |
 
 ## Per-Trace Detail
 
@@ -140,6 +141,7 @@
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=2, success=0, failed=2
 - **tool_calls**: total=0, success=0
+- **recovery**: attempts=1, success=0, actions=[], results=[]
 - **failure_types**: fallback_exhausted
 - **interest_reasons**: failed, has_failures, llm_fallback
 
@@ -155,6 +157,7 @@
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=5, success=5, failed=0
 - **tool_calls**: total=3, success=1
+- **recovery**: attempts=1, success=0, actions=[], results=[]
 - **failure_types**: planning_stall_or_drift
 - **interest_reasons**: failed, has_failures
 
@@ -169,6 +172,7 @@
 - **context_pack**: dropped=true, reasons=["context_budget_exceeded", "dropped_sections: state, history_tail"]
 - **llm_calls**: total=1, success=1, failed=0
 - **tool_calls**: total=2, success=2
+- **recovery**: attempts=0, success=0, actions=[], results=[]
 - **interest_reasons**: memory_dropped, context_pack_dropped, memory_retrieved_but_none_injected
 
 ### `c3333333-3333-3333-3333-333333333333`
@@ -182,6 +186,7 @@
 - **context_pack**: dropped=true, reasons=["history_truncated", "older_turns_removed: 3"]
 - **llm_calls**: total=1, success=1, failed=0
 - **tool_calls**: total=1, success=1
+- **recovery**: attempts=0, success=0, actions=[], results=[]
 - **interest_reasons**: context_pack_dropped
 
 ### `d5555555-5555-5555-5555-555555555555`
@@ -195,6 +200,7 @@
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=2, success=2, failed=0
 - **tool_calls**: total=2, success=1
+- **recovery**: attempts=1, success=1, actions=[], results=[]
 - **failure_types**: tool_call_error
 - **interest_reasons**: has_failures
 
@@ -210,6 +216,7 @@
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=1, success=1, failed=0
 - **tool_calls**: total=1, success=0
+- **recovery**: attempts=1, success=0, actions=[], results=[]
 - **failure_types**: unknown_failure
 - **interest_reasons**: failed, has_failures
 
@@ -224,6 +231,7 @@
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=1, success=0, failed=1
 - **tool_calls**: total=1, success=1
+- **recovery**: attempts=0, success=0, actions=[], results=[]
 - **interest_reasons**: llm_fallback
 
 ### `b2222222-2222-2222-2222-222222222222`
@@ -237,6 +245,7 @@
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=1, success=0, failed=1
 - **tool_calls**: total=1, success=1
+- **recovery**: attempts=0, success=0, actions=[], results=[]
 - **interest_reasons**: llm_fallback
 
 ### `c1111111-1111-1111-1111-111111111111`
@@ -250,6 +259,7 @@
 - **context_pack**: dropped=true, reasons=["memory_budget_exceeded", "section_priority_reorder"]
 - **llm_calls**: total=2, success=2, failed=0
 - **tool_calls**: total=4, success=4
+- **recovery**: attempts=0, success=0, actions=[], results=[]
 - **interest_reasons**: memory_dropped, context_pack_dropped
 
 ### `d1111111-1111-1111-1111-111111111111`
@@ -264,6 +274,7 @@
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=1, success=1, failed=0
 - **tool_calls**: total=1, success=0
+- **recovery**: attempts=1, success=0, actions=[], results=[]
 - **failure_types**: tool_call_error
 - **interest_reasons**: failed, has_failures
 
@@ -279,6 +290,7 @@
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=1, success=0, failed=1
 - **tool_calls**: total=0, success=0
+- **recovery**: attempts=1, success=0, actions=[], results=[]
 - **failure_types**: llm_auth_error
 - **interest_reasons**: failed, has_failures
 
@@ -293,6 +305,7 @@
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=1, success=0, failed=1
 - **tool_calls**: total=1, success=1
+- **recovery**: attempts=0, success=0, actions=[], results=[]
 - **interest_reasons**: llm_fallback
 
 ### `21cced62-914e-4453-b2dc-352d363c67e7`
@@ -306,6 +319,7 @@
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=1, success=0, failed=1
 - **tool_calls**: total=1, success=1
+- **recovery**: attempts=0, success=0, actions=[], results=[]
 - **interest_reasons**: llm_fallback
 
 ### `9aa8cdec-ed66-4731-94a4-638e57ab2976`
@@ -319,6 +333,7 @@
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=1, success=0, failed=1
 - **tool_calls**: total=1, success=1
+- **recovery**: attempts=0, success=0, actions=[], results=[]
 - **interest_reasons**: llm_fallback
 
 ### `9633a8ee-6479-45ba-94a0-ac3831af5727`
@@ -332,6 +347,7 @@
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=1, success=0, failed=1
 - **tool_calls**: total=1, success=1
+- **recovery**: attempts=0, success=0, actions=[], results=[]
 - **interest_reasons**: llm_fallback
 
 ## Failure Taxonomy Annotation Template

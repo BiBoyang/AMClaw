@@ -294,6 +294,7 @@ cargo run --bin trace_eval
 - 默认输出报告到 `notes/agent-eval/reports/TRACE-EVAL-REPORT.md`。
 - 默认关联 `notes/agent-eval/baselines/EVAL-BASELINE-SAMPLES-2026-04-18.md` 做 baseline 命中统计。
 - 支持 `--date`、`--dir`、`--output`、`--baseline`、`--no-baseline`、`--only-interesting` 参数。
+- 支持 `--compare-before <path>`、`--compare-after <path>`、`--compare-output <path>` 对比两份已有报告，输出 PASS/WARN/FAIL 结论。缺少 `--compare-before` 或 `--compare-after` 时报错退出。
 
 ## 协作与文档约定
 

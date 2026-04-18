@@ -276,6 +276,15 @@ enum FailureAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+enum RecoveryOutcome {
+    Continued,
+    EscalatedToAskUser,
+    Aborted,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum ReplanScope {
     CurrentStep,
     RemainingPlan,
@@ -1560,16 +1569,22 @@ impl AgentCore {
         trace: &mut AgentRunTrace,
     ) -> Result<LoopControl> {
         match failure.action {
-            FailureAction::RetryStep => Err(anyhow!(failure.detail)),
+            FailureAction::RetryStep => {
+                trace.record_recovery_attempt(step, &failure, RecoveryOutcome::Failed);
+                Err(anyhow!(failure.detail))
+            }
             FailureAction::Replan => {
                 if !self.can_replan() {
+                    trace.record_recovery_attempt(step, &failure, RecoveryOutcome::Failed);
                     return Err(anyhow!(failure.detail));
                 }
                 if trace.controller_state.try_consume_replan() {
+                    trace.record_recovery_attempt(step, &failure, RecoveryOutcome::Continued);
                     return Ok(LoopControl::Continue(Some(failure_to_observation(
                         step, &failure,
                     ))));
                 }
+                trace.record_recovery_attempt(step, &failure, RecoveryOutcome::Failed);
                 let exhausted = FailureDecision {
                     kind: StepFailureKind::BudgetExhausted,
                     action: FailureAction::AskUser,
@@ -1585,6 +1600,11 @@ impl AgentCore {
                     ),
                 };
                 trace.record_failure(step, &exhausted);
+                trace.record_recovery_attempt(
+                    step,
+                    &exhausted,
+                    RecoveryOutcome::EscalatedToAskUser,
+                );
                 trace.controller_state.record_ask_user();
                 Ok(LoopControl::Finish(
                     exhausted
@@ -1593,6 +1613,7 @@ impl AgentCore {
                 ))
             }
             FailureAction::AskUser => {
+                trace.record_recovery_attempt(step, &failure, RecoveryOutcome::EscalatedToAskUser);
                 trace.controller_state.record_ask_user();
                 Ok(LoopControl::Finish(
                     failure
@@ -1600,7 +1621,10 @@ impl AgentCore {
                         .unwrap_or_else(|| failure.detail.clone()),
                 ))
             }
-            FailureAction::Abort => Err(anyhow!(failure.detail)),
+            FailureAction::Abort => {
+                trace.record_recovery_attempt(step, &failure, RecoveryOutcome::Aborted);
+                Err(anyhow!(failure.detail))
+            }
         }
     }
 
@@ -2117,6 +2141,9 @@ struct AgentRunTrace {
     workspace_root: String,
     llm_fallback_reason: Option<String>,
     rule_parse_error: Option<String>,
+    recovery_action: Option<FailureAction>,
+    recovery_result: Option<RecoveryOutcome>,
+    recovery_attempts: Vec<RecoveryTrace>,
     decisions: Vec<DecisionTrace>,
     observations: Vec<ObservationTrace>,
     failures: Vec<FailureTrace>,
@@ -2226,6 +2253,18 @@ struct FailureTrace {
     user_message: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct RecoveryTrace {
+    step: usize,
+    current_step_index: Option<usize>,
+    failure_kind: StepFailureKind,
+    action: FailureAction,
+    outcome: RecoveryOutcome,
+    successful: bool,
+    source: String,
+    detail: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct AgentTraceIndexEntry {
     trace_version: String,
@@ -2256,6 +2295,14 @@ struct AgentTraceIndexEntry {
     memory_retrieved_count: usize,
     memory_total_chars: usize,
     memory_dropped_count: usize,
+    #[serde(default)]
+    recovery_attempt_count: usize,
+    #[serde(default)]
+    recovery_success_count: usize,
+    #[serde(default)]
+    recovery_action: Option<String>,
+    #[serde(default)]
+    recovery_result: Option<String>,
     context_pack_present: bool,
     context_pack_section_count: usize,
     context_pack_total_chars: usize,
@@ -2298,6 +2345,9 @@ impl AgentRunTrace {
             workspace_root: workspace_root.display().to_string(),
             llm_fallback_reason: None,
             rule_parse_error: None,
+            recovery_action: None,
+            recovery_result: None,
+            recovery_attempts: Vec::new(),
             decisions: Vec::new(),
             observations: Vec::new(),
             failures: Vec::new(),
@@ -2466,6 +2516,26 @@ impl AgentRunTrace {
             source: failure.source.clone(),
             detail: failure.detail.clone(),
             user_message: failure.user_message.clone(),
+        });
+    }
+
+    fn record_recovery_attempt(
+        &mut self,
+        step: usize,
+        failure: &FailureDecision,
+        outcome: RecoveryOutcome,
+    ) {
+        self.recovery_action = Some(failure.action.clone());
+        self.recovery_result = Some(outcome.clone());
+        self.recovery_attempts.push(RecoveryTrace {
+            step,
+            current_step_index: self.current_step_index,
+            failure_kind: failure.kind.clone(),
+            action: failure.action.clone(),
+            successful: outcome == RecoveryOutcome::Continued,
+            outcome,
+            source: failure.source.clone(),
+            detail: failure.detail.clone(),
         });
     }
 
@@ -2744,6 +2814,20 @@ impl AgentRunTrace {
             memory_retrieved_count: self.memory_retrieved_count,
             memory_total_chars: self.memory_total_chars,
             memory_dropped_count: self.memory_dropped_count,
+            recovery_attempt_count: self.recovery_attempts.len(),
+            recovery_success_count: self
+                .recovery_attempts
+                .iter()
+                .filter(|attempt| attempt.successful)
+                .count(),
+            recovery_action: self
+                .recovery_action
+                .as_ref()
+                .map(|action| action.as_str().to_string()),
+            recovery_result: self
+                .recovery_result
+                .as_ref()
+                .map(|result| result.as_str().to_string()),
             context_pack_present: self.context_pack_present,
             context_pack_section_count: self.context_pack_section_count,
             context_pack_total_chars: self.context_pack_total_chars,
@@ -2835,6 +2919,28 @@ impl AgentRunTrace {
             ),
             format!("- failure_count: {}", self.controller_state.failure_count),
             format!("- ask_user_count: {}", self.controller_state.ask_user_count),
+            format!("- recovery_attempt_count: {}", self.recovery_attempts.len()),
+            format!(
+                "- recovery_success_count: {}",
+                self.recovery_attempts
+                    .iter()
+                    .filter(|attempt| attempt.successful)
+                    .count()
+            ),
+            format!(
+                "- recovery_action(last): {}",
+                self.recovery_action
+                    .as_ref()
+                    .map(FailureAction::as_str)
+                    .unwrap_or("(none)")
+            ),
+            format!(
+                "- recovery_result(last): {}",
+                self.recovery_result
+                    .as_ref()
+                    .map(RecoveryOutcome::as_str)
+                    .unwrap_or("(none)")
+            ),
             format!("- memory_hit_count: {} (injected)", self.memory_hit_count),
             format!("- memory_retrieved_count: {}", self.memory_retrieved_count),
             format!("- memory_dropped_count: {}", self.memory_dropped_count),
@@ -3134,6 +3240,30 @@ impl AgentRunTrace {
                 if let Some(user_message) = &failure.user_message {
                     lines.push(format!("  - user_message: {}", user_message));
                 }
+            }
+        }
+
+        lines.push(String::new());
+        lines.push("## Recovery Attempts".to_string());
+        lines.push(String::new());
+        if self.recovery_attempts.is_empty() {
+            lines.push("- (none)".to_string());
+        } else {
+            for attempt in &self.recovery_attempts {
+                lines.push(format!(
+                    "- step={} current_step={} kind={} action={} outcome={} successful={} source={} detail={}",
+                    attempt.step,
+                    attempt
+                        .current_step_index
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "(none)".to_string()),
+                    attempt.failure_kind.as_str(),
+                    attempt.action.as_str(),
+                    attempt.outcome.as_str(),
+                    attempt.successful,
+                    attempt.source,
+                    attempt.detail
+                ));
             }
         }
 
@@ -4038,6 +4168,17 @@ impl FailureAction {
     }
 }
 
+impl RecoveryOutcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Continued => "continued",
+            Self::EscalatedToAskUser => "escalated_to_ask_user",
+            Self::Aborted => "aborted",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 fn resulting_source_name(action: &ToolAction) -> String {
     format!("tool:{}", action.name())
 }
@@ -4471,8 +4612,8 @@ mod tests {
         AgentObservation, AgentRunContext, AgentRunTrace, BusinessContextSnapshot,
         ContextAssembler, ContextPreviewMode, DoneRule, DropReason, ExecutionPlan,
         ExpectedObservation, FailureAction, FailureDecision, LlmPlan, MinimumNovelty,
-        ObservationKind, PlannedDecision, ReplanScope, RuntimeSessionStateSnapshot,
-        StepFailureKind,
+        ObservationKind, PlannedDecision, RecoveryOutcome, ReplanScope,
+        RuntimeSessionStateSnapshot, StepFailureKind,
     };
     use crate::context_pack::{ContextSectionChangeReason, ContextSectionKind};
     use crate::session_summary::SessionSummaryStrategy;
@@ -4565,6 +4706,9 @@ mod tests {
         assert!(payload["tool_calls"].as_array().is_some());
         assert!(payload["decisions"].as_array().is_some());
         assert!(payload["observations"].as_array().is_some());
+        assert!(payload["recovery_attempts"].is_array());
+        assert!(payload.get("recovery_action").is_some());
+        assert!(payload.get("recovery_result").is_some());
 
         let markdown_path = trace_path.with_extension("md");
         let markdown = std::fs::read_to_string(markdown_path).expect("应生成 markdown trace");
@@ -5269,6 +5413,11 @@ mod tests {
             super::LoopControl::Continue(_) => panic!("ask_user 不应继续执行"),
         }
         assert_eq!(trace.controller_state.ask_user_count, 1);
+        assert_eq!(trace.recovery_attempts.len(), 1);
+        assert_eq!(
+            trace.recovery_attempts[0].outcome,
+            RecoveryOutcome::EscalatedToAskUser
+        );
     }
 
     #[test]
@@ -5322,6 +5471,15 @@ mod tests {
         }
         assert_eq!(trace.controller_state.replan_count, 1);
         assert_eq!(trace.controller_state.ask_user_count, 1);
+        assert_eq!(trace.recovery_attempts.len(), 3);
+        assert!(trace
+            .recovery_attempts
+            .iter()
+            .any(|attempt| attempt.outcome == RecoveryOutcome::Continued));
+        assert!(trace
+            .recovery_attempts
+            .iter()
+            .any(|attempt| { attempt.outcome == RecoveryOutcome::EscalatedToAskUser }));
         assert_eq!(
             trace.failures.last().map(|failure| failure.kind.clone()),
             Some(StepFailureKind::BudgetExhausted)

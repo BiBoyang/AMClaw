@@ -235,3 +235,46 @@ cargo test --test doc_mirrors
 1. 先确认 `README.md` 写的“当前实现”还准不准
 2. 再确认 `AGENTS.md` / `CLAUDE.md` 有没有漂移
 3. 最后再决定是继续堆功能，还是先补基建
+
+## 11. Trace Compare 门禁策略（Step 3 / 4）
+
+为避免 `trace_eval` 指标回归在合并时被遗漏，约定以下流程：
+
+### 11.1 当前阶段：Soft Gate（告警不阻塞）
+
+PR 流程中执行：
+
+1. `cargo check`
+2. `cargo test --bin trace_eval`
+3. `./scripts/trace_compare.sh`（生成 `TRACE-EVAL-COMPARE.md`）
+
+若 compare 报告出现 `**综合判定**: FAIL`：
+
+- 在 CI 输出 warning（可见告警）
+- 上传 compare 报告 artifact
+- **暂不阻塞合并**
+
+### 11.2 升级条件：Soft -> Hard
+
+满足以下条件后可升级为 Hard Gate：
+
+- 连续 5 次 PR compare 结果稳定、无明显误报；
+- 团队（当前为你自己）确认门槛与误报成本可接受。
+
+Hard Gate 生效后：
+
+- `FAIL`：阻塞合并；
+- `WARN`：不阻塞，但需在 PR 描述中说明原因与后续观察计划。
+
+### 11.3 Baseline 更新规则
+
+默认不频繁滚动 baseline。仅在以下场景更新：
+
+1. 版本发布日（建议）；
+2. 发生明确、可解释的行为变化且已达成预期（例如评测口径升级）。
+
+每次 baseline 更新需要在 PR 描述里写清楚：
+
+- 为什么要更新 baseline；
+- 新旧 baseline 的窗口范围；
+- 更新后预期对 compare 判定的影响。

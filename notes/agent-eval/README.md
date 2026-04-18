@@ -12,6 +12,7 @@
   - `EVAL-COMPARISON-RULES-2026-04-18.md`：PASS/WARN/FAIL 对比判定规则。
 - `baselines/`
   - `EVAL-BASELINE-SAMPLES-2026-04-18.md`：固定 baseline 样本集。
+  - `TRACE-EVAL-BASELINE-2026-04-18.md`：当前 trace compare 默认 baseline 报告。
 - `plans/`
   - `PHASE-8-EVAL-PLAN-2026-04-18.md`：评测阶段执行计划。
   - `PHASE-8-EVAL-SUMMARY-2026-04-18.md`：阶段总结。
@@ -30,5 +31,14 @@ cargo run --bin trace_eval
 
 默认输出：
 - 报告：`notes/agent-eval/reports/TRACE-EVAL-REPORT.md`
-- baseline：`notes/agent-eval/baselines/EVAL-BASELINE-SAMPLES-2026-04-18.md`
+- baseline samples：`notes/agent-eval/baselines/EVAL-BASELINE-SAMPLES-2026-04-18.md`
+- current baseline（用于 `scripts/trace_compare.sh` 默认 before）：`notes/agent-eval/baselines/TRACE-EVAL-BASELINE-2026-04-18.md`
 
+## Trace Compare（本地一键）
+
+```bash
+cd ~/Desktop/AMClaw
+./scripts/trace_compare.sh
+```
+
+- 默认输出 compare 报告：`notes/agent-eval/reports/TRACE-EVAL-COMPARE.md`

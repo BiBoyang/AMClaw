@@ -1,0 +1,41 @@
+name: trace-eval-compare
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  trace-compare:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo check
+        run: cargo check
+
+      - name: Trace eval unit tests
+        run: cargo test --bin trace_eval
+
+      - name: Run trace compare
+        run: ./scripts/trace_compare.sh
+
+      - name: Soft gate on compare FAIL
+        run: |
+          REPORT="notes/agent-eval/reports/TRACE-EVAL-COMPARE.md"
+          if grep -q "\*\*综合判定\*\*: FAIL" "$REPORT"; then
+            echo "::warning::trace compare verdict is FAIL (soft gate, not blocking merge)"
+          fi
+
+      - name: Upload compare report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trace-eval-compare-report
+          path: notes/agent-eval/reports/TRACE-EVAL-COMPARE.md
+          if-no-files-found: warn

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
@@ -187,12 +187,12 @@ fn main() {
     );
 }
 
-fn load_traces_for_date(root: &PathBuf, date: &str) -> Vec<AgentTrace> {
+fn load_traces_for_date(root: &Path, date: &str) -> Vec<AgentTrace> {
     let dir = root.join(date);
     load_traces_from_dir(&dir)
 }
 
-fn load_all_traces(root: &PathBuf) -> Vec<AgentTrace> {
+fn load_all_traces(root: &Path) -> Vec<AgentTrace> {
     let mut traces = Vec::new();
     let Ok(entries) = fs::read_dir(root) else {
         return traces;
@@ -206,7 +206,7 @@ fn load_all_traces(root: &PathBuf) -> Vec<AgentTrace> {
     traces
 }
 
-fn load_traces_from_dir(dir: &PathBuf) -> Vec<AgentTrace> {
+fn load_traces_from_dir(dir: &Path) -> Vec<AgentTrace> {
     let mut traces = Vec::new();
     let Ok(entries) = fs::read_dir(dir) else {
         return traces;
@@ -330,8 +330,8 @@ fn build_report(summaries: &[TraceSummary], only_interesting: bool) -> String {
     let with_fallback = summaries.iter().filter(|s| s.llm_fallback).count();
     let with_failures = summaries.iter().filter(|s| s.has_failures).count();
 
-    lines.push(format!("| metric | count | ratio |"));
-    lines.push(format!("| --- | ---: | ---: |"));
+    lines.push("| metric | count | ratio |".to_string());
+    lines.push("| --- | ---: | ---: |".to_string());
     lines.push(format!("| total | {} | 100% |", total));
     lines.push(format!(
         "| success | {} | {:.1}% |",

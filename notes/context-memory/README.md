@@ -5,6 +5,8 @@
 ## 索引
 
 - `ARTICLE-PUBLISH-PLAYBOOK-2026-04-18.md`：Context 技术文章发布作战手册（长文/短文/配图/发布节奏/DoD）。
+- `CONTEXT-TECH-ARTICLE-SHORT-2026-04-18.md`：对外短文版草稿（800~1200 字，适合公众号/社媒发布）。
+- `ARTICLE-DIAGRAM-SCRIPT-2026-04-18.md`：文章配图文案（SessionState 接线图 + ContextPack 组装图）。
 - `PHASE-NEXT-8-7-PLAN-2026-04-18.md`：下一阶段主线（Agent 评测 + 错误恢复闭环）两周执行计划。
 - `CONTEXT-TECH-SELECTION-JOURNEY.md`：Context 技术选型与逐步接入历程主文档（面向后续技术文章写作）。
 - `CONTEXT-PACK-C3-PLAN-2026-04-18.md`：C3 ContextPack 结构化设计冻结文档（结构定义、入口 API、兼容策略、In/Out Scope）。

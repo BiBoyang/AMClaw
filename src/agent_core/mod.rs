@@ -849,17 +849,37 @@ impl ContextAssembler {
         }
 
         if let Some(observation) = observation {
+            let section_max = ContextSectionKind::LatestObservation.policy().max_chars;
+            let step_line = format!("- step: {}", observation.step);
+            let source_line = format!("- source: {}", observation.source);
+            // 7 lines total → 6 "\n" separators; frame = everything except content
+            let frame_chars = "".chars().count()
+                + "## Latest Observation".chars().count()
+                + step_line.chars().count()
+                + source_line.chars().count()
+                + "```text".chars().count()
+                + "```".chars().count()
+                + 6;
+            let content_budget = section_max.saturating_sub(frame_chars).max(24);
+            let content = summarize_for_markdown(&observation.content, content_budget);
+            let section_lines = vec![
+                String::new(),
+                "## Latest Observation".to_string(),
+                step_line,
+                source_line,
+                "```text".to_string(),
+                content,
+                "```".to_string(),
+            ];
+            debug_assert!(
+                section_lines.join("\n").chars().count() <= section_max,
+                "LatestObservation section exceeds budget: {} > {}",
+                section_lines.join("\n").chars().count(),
+                section_max
+            );
             pack.push(ContextSection::new(
                 ContextSectionKind::LatestObservation,
-                vec![
-                    String::new(),
-                    "## Latest Observation".to_string(),
-                    format!("- step: {}", observation.step),
-                    format!("- source: {}", observation.source),
-                    "```text".to_string(),
-                    summarize_for_markdown(&observation.content, 800),
-                    "```".to_string(),
-                ],
+                section_lines,
             ));
         }
 
@@ -5608,6 +5628,46 @@ mod tests {
         assert!(rendered.contains("## Session State"));
         assert!(rendered.contains("## Session Text"));
         assert!(rendered.contains("## Available Tools"));
+    }
+
+    #[test]
+    fn latest_observation_pre_trims_to_section_budget() {
+        let workspace = temp_workspace();
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "读文件 demo.txt",
+            AgentRunContext::wechat_chat("user-context", "commit", vec![]),
+        );
+        // Content far exceeds both old 800-limit and new section max (560)
+        let long_content = "observation content ".repeat(100);
+        let observation = AgentObservation::tool_result(1, "read_file", &long_content);
+        let runtime_session_state =
+            derive_runtime_session_state(&trace, "读文件 demo.txt", Some(&observation), None);
+        let pack = ContextAssembler.build_pack(
+            &trace,
+            "读文件 demo.txt",
+            Some(&observation),
+            Some(&runtime_session_state),
+            &["read: 读取工作区内文件，参数: path".to_string()],
+            None,
+        );
+
+        let latest = pack
+            .section(ContextSectionKind::LatestObservation)
+            .expect("应包含 latest observation section");
+        let max_chars = ContextSectionKind::LatestObservation.policy().max_chars;
+        assert!(
+            latest.char_count() <= max_chars,
+            "latest_observation char_count {} exceeds max_chars {}",
+            latest.char_count(),
+            max_chars
+        );
+        // Pre-trimming means the section enters ContextSection::new already within budget,
+        // so section-level trim should NOT fire (no double-truncation).
+        assert!(
+            !latest.trimmed(),
+            "latest_observation should not be trimmed at section level when pre-trimmed"
+        );
     }
 
     #[test]

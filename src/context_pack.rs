@@ -69,7 +69,7 @@ impl ContextPack {
                     left.policy
                         .priority
                         .cmp(&right.policy.priority)
-                        .then_with(|| right.char_count().cmp(&left.char_count()))
+                        .then_with(|| left.char_count().cmp(&right.char_count()))
                 })
                 .map(|(idx, _)| idx);
 
@@ -297,13 +297,13 @@ impl ContextSectionKind {
             },
             Self::CurrentIntent => ContextSectionPolicy {
                 priority: 100,
-                max_chars: 360,
+                max_chars: 320,
                 pinned_lines: 3,
                 required: true,
             },
             Self::RuntimeContext => ContextSectionPolicy {
                 priority: 95,
-                max_chars: 520,
+                max_chars: 420,
                 pinned_lines: 10,
                 required: true,
             },
@@ -314,7 +314,7 @@ impl ContextSectionKind {
                 required: false,
             },
             Self::SessionText => ContextSectionPolicy {
-                priority: 55,
+                priority: 60,
                 max_chars: 460,
                 pinned_lines: 6,
                 required: false,
@@ -326,44 +326,44 @@ impl ContextSectionKind {
                 required: false,
             },
             Self::LatestObservation => ContextSectionPolicy {
-                priority: 92,
+                priority: 96,
                 max_chars: 560,
                 pinned_lines: 4,
                 required: false,
             },
             Self::RuntimePlan => ContextSectionPolicy {
-                priority: 93,
+                priority: 92,
                 max_chars: 520,
                 pinned_lines: 4,
                 required: false,
             },
             Self::CurrentTask => ContextSectionPolicy {
-                priority: 94,
+                priority: 95,
                 max_chars: 420,
                 pinned_lines: 5,
                 required: false,
             },
             Self::RecentTasks => ContextSectionPolicy {
-                priority: 50,
+                priority: 72,
                 max_chars: 300,
                 pinned_lines: 2,
                 required: false,
             },
             Self::UserMemories => ContextSectionPolicy {
-                priority: 75,
+                priority: 84,
                 max_chars: 420,
                 pinned_lines: 2,
                 required: false,
             },
             Self::ToolDescriptions => ContextSectionPolicy {
                 priority: 40,
-                max_chars: 360,
+                max_chars: 240,
                 pinned_lines: 2,
                 required: true,
             },
             Self::ResponseContract => ContextSectionPolicy {
                 priority: 100,
-                max_chars: 260,
+                max_chars: 220,
                 pinned_lines: 2,
                 required: true,
             },
@@ -529,5 +529,35 @@ mod tests {
 
         assert!(pack.section(ContextSectionKind::RuntimeContext).is_some());
         assert!(pack.section(ContextSectionKind::SessionState).is_none());
+    }
+
+    #[test]
+    fn tie_break_drops_smaller_section_first() {
+        // Three non-required sections at same priority; smallest should be dropped first.
+        let mut pack = ContextPack::new();
+        pack.push(ContextSection::new(
+            ContextSectionKind::Preamble,
+            vec!["required preamble".to_string()],
+        ));
+        // All three have same priority (84 after tuning)
+        pack.push(ContextSection::new(
+            ContextSectionKind::UserMemories,
+            vec!["medium section xxxxxxxxx".to_string()],
+        ));
+        pack.push(ContextSection::new(
+            ContextSectionKind::UserMemories,
+            vec!["tiny".to_string()],
+        ));
+        pack.push(ContextSection::new(
+            ContextSectionKind::UserMemories,
+            vec!["large section xxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_string()],
+        ));
+        pack.max_total_chars = 40;
+        pack.apply_total_budget();
+
+        // The tiny section (smallest) should be the first dropped at same priority.
+        let snapshots = pack.snapshot();
+        let tiny = snapshots.iter().find(|s| s.content == "tiny").unwrap();
+        assert!(!tiny.included, "tiny section should be dropped first on tie-break");
     }
 }

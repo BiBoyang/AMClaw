@@ -1,6 +1,6 @@
 # Trace Evaluation Report
 
-- generated: 2026-04-18T09:41:03.187594+00:00
+- generated: 2026-04-18T11:20:10.620477+00:00
 - total traces: 20
 - baseline_file: notes/agent-eval/baselines/EVAL-BASELINE-SAMPLES-2026-04-18.md
 - baseline_run_ids: 20
@@ -98,9 +98,9 @@
 | --- | ---: | ---: | ---: |
 | tool_call_error | 2 | 1 | 1 |
 | fallback_exhausted | 1 | 0 | 1 |
-| unknown_failure | 1 | 0 | 1 |
 | llm_auth_error | 1 | 0 | 1 |
 | planning_stall_or_drift | 1 | 0 | 1 |
+| unknown_failure | 1 | 0 | 1 |
 
 ## Per-Trace Detail
 

@@ -90,10 +90,18 @@ struct RecoveryAttemptTrace {
     failure_kind: String,
     #[serde(default)]
     action: String,
+    /// 映射前原始 action（旧 trace 可能缺失，fallback 到 action）
+    #[serde(default)]
+    original_action: String,
+    /// 实际执行的 action（可能因防循环升级，旧 trace 可能缺失）
+    #[serde(default)]
+    effective_action: String,
     #[serde(default)]
     outcome: String,
     #[serde(default)]
     successful: bool,
+    #[serde(default)]
+    escalated: bool,
 }
 
 #[allow(dead_code)]
@@ -2838,5 +2846,96 @@ mod tests {
             .find(|v| v.metric == "avg_step_count")
             .unwrap();
         assert_eq!(step_v.verdict, Verdict::Warn); // increase 0.5 step = WARN
+    }
+
+    #[test]
+    fn recovery_success_rate_computation_with_mixed_attempts() {
+        // 混合成功/失败的 recovery attempts，计算成功率
+        let summary1 = make_summary(
+            "run-1",
+            vec![
+                RecoveryAttemptSummary {
+                    failure_kind: "transient".to_string(),
+                    successful: true,
+                },
+                RecoveryAttemptSummary {
+                    failure_kind: "transient".to_string(),
+                    successful: false,
+                },
+                RecoveryAttemptSummary {
+                    failure_kind: "low_value_observation".to_string(),
+                    successful: false,
+                },
+            ],
+        );
+        let summary2 = make_summary(
+            "run-2",
+            vec![RecoveryAttemptSummary {
+                failure_kind: "repeated_action".to_string(),
+                successful: true,
+            }],
+        );
+
+        let report = build_report(&[summary1, summary2], false, &HashSet::new(), None);
+        // 4 attempts, 2 successes = 50% recovery success rate
+        assert!(report.contains("| recovery_success | 2 | 50.0% |"));
+        assert!(report.contains("| recovery_attempt_count | 4 | - |"));
+        // recovery by failure type
+        assert!(report.contains("| transient | 2 | 1 | 1 |"));
+        assert!(report.contains("| low_value_observation | 1 | 0 | 1 |"));
+        assert!(report.contains("| repeated_action | 1 | 1 | 0 |"));
+    }
+
+    #[test]
+    fn report_parser_tolerates_missing_recovery_fields() {
+        // 模拟旧 trace 无 recovery_attempts，只有 failures + recovery_action
+        let trace = AgentTrace {
+            trace_version: "agent_trace_v1".to_string(),
+            run_id: "run-old".to_string(),
+            started_at: "2026-04-18T00:00:00Z".to_string(),
+            finished_at: None,
+            duration_ms: Some(100),
+            success: false,
+            error: Some("error".to_string()),
+            final_output: None,
+            user_input: "test".to_string(),
+            user_input_chars: 4,
+            step_count: 2,
+            llm_fallback_reason: None,
+            recovery_action: Some("replan".to_string()),
+            recovery_result: Some("failed".to_string()),
+            memory_retrieved_count: 0,
+            memory_hit_count: 0,
+            memory_dropped_count: 0,
+            memory_total_chars: 0,
+            memory_ids: vec![],
+            persistent_state_present: false,
+            persistent_state_source: None,
+            persistent_state_updated: false,
+            context_pack_present: false,
+            context_pack_drop_reasons: vec![],
+            context_pack_section_count: 0,
+            context_pack_total_chars: 0,
+            decisions: vec![],
+            failures: vec![FailureTrace {
+                step: 1,
+                failure_type: "semantic".to_string(),
+                message: "old failure".to_string(),
+            }],
+            recovery_attempts: vec![],
+            llm_calls: vec![],
+            tool_calls: vec![],
+        };
+
+        let summary = summarize_trace(&trace, &HashSet::new());
+        assert_eq!(summary.recovery_attempt_count, 1);
+        assert_eq!(summary.recovery_success_count, 0);
+        assert!(summary.has_recovery_attempt);
+        assert_eq!(summary.recovery_succeeded, Some(false));
+        assert_eq!(summary.recovery_actions, vec!["replan"]);
+        assert_eq!(summary.recovery_results, vec!["failed"]);
+        assert_eq!(summary.recovery_attempt_details.len(), 1);
+        assert_eq!(summary.recovery_attempt_details[0].failure_kind, "semantic");
+        assert!(!summary.recovery_attempt_details[0].successful);
     }
 }

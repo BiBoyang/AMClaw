@@ -283,7 +283,7 @@ enum PlanStepStatus {
     Skipped,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum StepFailureKind {
     Transient,
@@ -298,7 +298,7 @@ enum StepFailureKind {
     Irrecoverable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum FailureAction {
     RetryStep,
@@ -307,13 +307,78 @@ enum FailureAction {
     Abort,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RecoveryOutcome {
     Continued,
     EscalatedToAskUser,
     Aborted,
     Failed,
+}
+
+/// 统一恢复策略定义（集中映射表，不分散 if/else）。
+///
+/// 映射规则（代码内唯一真相源）：
+/// - Transient         → RetryStep (max 1) → 失败则 Replan
+/// - LowValueObservation → Replan (max 1) → 再失败 AskUser
+/// - RepeatedAction    → Replan (max 1) → 再失败 AskUser
+/// - StalledTrajectory → Replan (max 1) → 再失败 AskUser
+/// - TrajectoryDrift   → Replan (max 1) → 再失败 AskUser
+/// - Expectation       → Replan (max 1) → 再失败 AskUser
+/// - Semantic          → Replan (max 1) → 再失败 AskUser
+/// - ManualIntervention → AskUser (立即)
+/// - BudgetExhausted   → AskUser (立即)
+/// - Irrecoverable     → Abort (立即)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecoveryPolicy {
+    action: FailureAction,
+    /// 该 failure kind 在当前 run 中最多允许的恢复尝试次数
+    max_attempts: usize,
+    /// 超过 max_attempts 后自动升级到的 action
+    escalate_to: FailureAction,
+}
+
+impl RecoveryPolicy {
+    fn no_recovery(action: FailureAction) -> Self {
+        Self {
+            action,
+            max_attempts: 0,
+            escalate_to: action,
+        }
+    }
+
+    fn with_escalate(
+        action: FailureAction,
+        max_attempts: usize,
+        escalate_to: FailureAction,
+    ) -> Self {
+        Self {
+            action,
+            max_attempts,
+            escalate_to,
+        }
+    }
+}
+
+/// 默认恢复策略映射表（集中定义，所有 failure kind 的恢复行为从此处读取）。
+fn default_recovery_for_failure(kind: StepFailureKind) -> RecoveryPolicy {
+    match kind {
+        StepFailureKind::Transient => {
+            RecoveryPolicy::with_escalate(FailureAction::RetryStep, 1, FailureAction::Replan)
+        }
+        StepFailureKind::LowValueObservation
+        | StepFailureKind::RepeatedAction
+        | StepFailureKind::StalledTrajectory
+        | StepFailureKind::TrajectoryDrift
+        | StepFailureKind::Expectation
+        | StepFailureKind::Semantic => {
+            RecoveryPolicy::with_escalate(FailureAction::Replan, 1, FailureAction::AskUser)
+        }
+        StepFailureKind::ManualIntervention | StepFailureKind::BudgetExhausted => {
+            RecoveryPolicy::no_recovery(FailureAction::AskUser)
+        }
+        StepFailureKind::Irrecoverable => RecoveryPolicy::no_recovery(FailureAction::Abort),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -439,6 +504,10 @@ struct RuntimeControllerState {
     failure_count: usize,
     replan_count: usize,
     ask_user_count: usize,
+    /// per-failure-kind 恢复尝试计数（防循环保护）。
+    /// key: kind.as_str()，value: 该 kind 已触发的恢复次数。
+    #[serde(skip)]
+    recovery_kind_counts: std::collections::HashMap<String, usize>,
 }
 
 impl RuntimeControllerState {
@@ -449,6 +518,7 @@ impl RuntimeControllerState {
             failure_count: 0,
             replan_count: 0,
             ask_user_count: 0,
+            recovery_kind_counts: std::collections::HashMap::new(),
         }
     }
 
@@ -475,6 +545,14 @@ impl RuntimeControllerState {
 
     fn remaining_replans(&self) -> usize {
         self.max_replans.saturating_sub(self.replan_count)
+    }
+
+    /// 记录一次 failure kind 的恢复尝试，返回当前计数（含本次）。
+    fn record_recovery_for_kind(&mut self, kind: &StepFailureKind) -> usize {
+        let key = kind.as_str().to_string();
+        let count = self.recovery_kind_counts.entry(key).or_insert(0);
+        *count += 1;
+        *count
     }
 }
 
@@ -1353,6 +1431,7 @@ pub struct AgentCore {
     scripted_decisions: RefCell<VecDeque<PlannedDecision>>,
 }
 
+#[derive(Debug)]
 enum LoopControl {
     Continue(Option<AgentObservation>),
     Finish(String),
@@ -1732,23 +1811,73 @@ impl AgentCore {
         failure: FailureDecision,
         trace: &mut AgentRunTrace,
     ) -> Result<LoopControl> {
-        match failure.action {
+        // 阶段 B/C：统一映射表 + 防循环保护
+        let policy = default_recovery_for_failure(failure.kind);
+
+        let kind_count = trace
+            .controller_state
+            .record_recovery_for_kind(&failure.kind);
+
+        // 防循环：同一 kind 超过阈值则升级 action
+        let escalated = kind_count > policy.max_attempts && policy.max_attempts > 0;
+        let effective_action = if escalated {
+            log_agent_warn(
+                "recovery_escalated",
+                vec![
+                    ("step", json!(step)),
+                    ("failure_kind", json!(failure.kind.as_str())),
+                    ("original_action", json!(failure.action.as_str())),
+                    ("escalated_action", json!(policy.escalate_to.as_str())),
+                    ("kind_count", json!(kind_count)),
+                    ("max_attempts", json!(policy.max_attempts)),
+                ],
+            );
+            policy.escalate_to
+        } else {
+            failure.action
+        };
+
+        match effective_action {
             FailureAction::RetryStep => {
-                trace.record_recovery_attempt(step, &failure, RecoveryOutcome::Failed);
+                trace.record_recovery_attempt(
+                    step,
+                    &failure,
+                    RecoveryOutcome::Failed,
+                    escalated,
+                    effective_action,
+                );
                 Err(anyhow!(failure.detail))
             }
             FailureAction::Replan => {
                 if !self.can_replan() {
-                    trace.record_recovery_attempt(step, &failure, RecoveryOutcome::Failed);
+                    trace.record_recovery_attempt(
+                        step,
+                        &failure,
+                        RecoveryOutcome::Failed,
+                        escalated,
+                        effective_action,
+                    );
                     return Err(anyhow!(failure.detail));
                 }
                 if trace.controller_state.try_consume_replan() {
-                    trace.record_recovery_attempt(step, &failure, RecoveryOutcome::Continued);
+                    trace.record_recovery_attempt(
+                        step,
+                        &failure,
+                        RecoveryOutcome::Continued,
+                        escalated,
+                        effective_action,
+                    );
                     return Ok(LoopControl::Continue(Some(failure_to_observation(
                         step, &failure,
                     ))));
                 }
-                trace.record_recovery_attempt(step, &failure, RecoveryOutcome::Failed);
+                trace.record_recovery_attempt(
+                    step,
+                    &failure,
+                    RecoveryOutcome::Failed,
+                    escalated,
+                    effective_action,
+                );
                 let exhausted = FailureDecision {
                     kind: StepFailureKind::BudgetExhausted,
                     action: FailureAction::AskUser,
@@ -1768,6 +1897,8 @@ impl AgentCore {
                     step,
                     &exhausted,
                     RecoveryOutcome::EscalatedToAskUser,
+                    false,
+                    FailureAction::AskUser,
                 );
                 trace.controller_state.record_ask_user();
                 Ok(LoopControl::Finish(
@@ -1777,7 +1908,13 @@ impl AgentCore {
                 ))
             }
             FailureAction::AskUser => {
-                trace.record_recovery_attempt(step, &failure, RecoveryOutcome::EscalatedToAskUser);
+                trace.record_recovery_attempt(
+                    step,
+                    &failure,
+                    RecoveryOutcome::EscalatedToAskUser,
+                    escalated,
+                    effective_action,
+                );
                 trace.controller_state.record_ask_user();
                 Ok(LoopControl::Finish(
                     failure
@@ -1786,7 +1923,13 @@ impl AgentCore {
                 ))
             }
             FailureAction::Abort => {
-                trace.record_recovery_attempt(step, &failure, RecoveryOutcome::Aborted);
+                trace.record_recovery_attempt(
+                    step,
+                    &failure,
+                    RecoveryOutcome::Aborted,
+                    escalated,
+                    effective_action,
+                );
                 Err(anyhow!(failure.detail))
             }
         }
@@ -2428,9 +2571,16 @@ struct RecoveryTrace {
     step: usize,
     current_step_index: Option<usize>,
     failure_kind: StepFailureKind,
+    /// 映射前原始 action（failure 自带或映射表默认值）
+    original_action: FailureAction,
+    /// 实际执行的 action（可能因防循环升级）
+    effective_action: FailureAction,
+    /// 兼容旧消费方，保留 action 字段（值同 effective_action）
     action: FailureAction,
     outcome: RecoveryOutcome,
     successful: bool,
+    /// 本次恢复是否因防循环保护而被升级
+    escalated: bool,
     source: String,
     detail: String,
 }
@@ -2702,8 +2852,8 @@ impl AgentRunTrace {
         self.failures.push(FailureTrace {
             step,
             current_step_index: self.current_step_index,
-            kind: failure.kind.clone(),
-            action: failure.action.clone(),
+            kind: failure.kind,
+            action: failure.action,
             replan_scope: failure.replan_scope.clone(),
             source: failure.source.clone(),
             detail: failure.detail.clone(),
@@ -2716,16 +2866,21 @@ impl AgentRunTrace {
         step: usize,
         failure: &FailureDecision,
         outcome: RecoveryOutcome,
+        escalated: bool,
+        effective_action: FailureAction,
     ) {
-        self.recovery_action = Some(failure.action.clone());
-        self.recovery_result = Some(outcome.clone());
+        self.recovery_action = Some(effective_action);
+        self.recovery_result = Some(outcome);
         self.recovery_attempts.push(RecoveryTrace {
             step,
             current_step_index: self.current_step_index,
-            failure_kind: failure.kind.clone(),
-            action: failure.action.clone(),
+            failure_kind: failure.kind,
+            original_action: failure.action,
+            effective_action,
+            action: effective_action,
             successful: outcome == RecoveryOutcome::Continued,
             outcome,
+            escalated,
             source: failure.source.clone(),
             detail: failure.detail.clone(),
         });
@@ -4359,65 +4514,47 @@ fn failure_to_observation(step: usize, failure: &FailureDecision) -> AgentObserv
 
 fn classify_tool_execution_failure(source: String, detail: &str) -> FailureDecision {
     let lower = detail.to_ascii_lowercase();
-    if lower.contains("timeout")
+    let kind = if lower.contains("timeout")
         || lower.contains("timed out")
         || lower.contains("429")
         || lower.contains("governor")
         || lower.contains("too many requests")
     {
-        return FailureDecision {
-            kind: StepFailureKind::Transient,
-            action: FailureAction::RetryStep,
-            replan_scope: None,
-            detail: detail.to_string(),
-            source,
-            user_message: None,
-        };
-    }
-    if lower.contains("尚未生成归档")
+        StepFailureKind::Transient
+    } else if lower.contains("尚未生成归档")
         || lower.contains("归档 output_path")
         || lower.contains("未找到对应任务")
     {
-        return FailureDecision {
-            kind: StepFailureKind::ManualIntervention,
-            action: FailureAction::AskUser,
-            replan_scope: None,
-            detail: detail.to_string(),
-            source,
-            user_message: Some(
-                "当前任务还缺少可直接继续的业务输入。你可以先查任务状态、确认 task_id，或先补正文/等待归档完成后再继续。"
-                    .to_string(),
-            ),
-        };
-    }
-    if lower.contains("路径越界") || lower.contains("不能为空") || lower.contains("不支持")
+        StepFailureKind::ManualIntervention
+    } else if lower.contains("路径越界") || lower.contains("不能为空") || lower.contains("不支持")
     {
-        return FailureDecision {
-            kind: StepFailureKind::Irrecoverable,
-            action: FailureAction::Abort,
-            replan_scope: None,
-            detail: detail.to_string(),
-            source,
-            user_message: None,
-        };
-    }
-    if lower.contains("读取文件失败") || lower.contains("未找到") {
-        return FailureDecision {
-            kind: StepFailureKind::Semantic,
-            action: FailureAction::Replan,
-            replan_scope: Some(ReplanScope::RemainingPlan),
-            detail: detail.to_string(),
-            source,
-            user_message: None,
-        };
-    }
+        StepFailureKind::Irrecoverable
+    } else if lower.contains("读取文件失败") || lower.contains("未找到") {
+        StepFailureKind::Semantic
+    } else {
+        StepFailureKind::Irrecoverable
+    };
+
+    let policy = default_recovery_for_failure(kind);
+    let user_message = match kind {
+        StepFailureKind::ManualIntervention => Some(
+            "当前任务还缺少可直接继续的业务输入。你可以先查任务状态、确认 task_id，或先补正文/等待归档完成后再继续。"
+                .to_string(),
+        ),
+        _ => None,
+    };
+    let replan_scope = match kind {
+        StepFailureKind::Semantic => Some(ReplanScope::RemainingPlan),
+        _ => None,
+    };
+
     FailureDecision {
-        kind: StepFailureKind::Irrecoverable,
-        action: FailureAction::Abort,
-        replan_scope: None,
+        kind,
+        action: policy.action,
+        replan_scope,
         detail: detail.to_string(),
         source,
-        user_message: None,
+        user_message,
     }
 }
 
@@ -5742,11 +5879,13 @@ mod tests {
         assert!(matches!(first, super::LoopControl::Continue(_)));
         assert_eq!(trace.controller_state.replan_count, 1);
 
+        // 第二次用不同 kind（expectation），避免防循环升级先触发，
+        // 从而确保能走到 budget exhaustion 路径
         let second = agent
             .handle_recorded_failure(
                 2,
                 FailureDecision {
-                    kind: StepFailureKind::Semantic,
+                    kind: StepFailureKind::Expectation,
                     action: FailureAction::Replan,
                     replan_scope: Some(ReplanScope::CurrentStep),
                     detail: "second".to_string(),
@@ -5764,6 +5903,7 @@ mod tests {
         }
         assert_eq!(trace.controller_state.replan_count, 1);
         assert_eq!(trace.controller_state.ask_user_count, 1);
+        // 两次 recovery + 一次 budget_exhausted = 3
         assert_eq!(trace.recovery_attempts.len(), 3);
         assert!(trace
             .recovery_attempts
@@ -5774,7 +5914,7 @@ mod tests {
             .iter()
             .any(|attempt| { attempt.outcome == RecoveryOutcome::EscalatedToAskUser }));
         assert_eq!(
-            trace.failures.last().map(|failure| failure.kind.clone()),
+            trace.failures.last().map(|failure| failure.kind),
             Some(StepFailureKind::BudgetExhausted)
         );
     }
@@ -7178,5 +7318,199 @@ mod tests {
             snapshot.done_items.contains(&"运行时完成项".to_string()),
             "done_items 应包含运行时值"
         );
+    }
+
+    #[test]
+    fn transient_failure_retry_then_replan() {
+        let workspace = temp_workspace();
+        let agent = AgentCore::with_scripted_decisions(
+            workspace.clone(),
+            3,
+            vec![super::AgentDecision::Final("noop".to_string())],
+        )
+        .expect("初始化 agent 失败");
+        let mut trace = AgentRunTrace::new(&workspace, "retry", AgentRunContext::agent_demo());
+        trace.configure_controller_limits(3, 3);
+
+        // 第一次 Transient -> RetryStep（原始 action）
+        let first = agent
+            .handle_recorded_failure(
+                1,
+                FailureDecision {
+                    kind: StepFailureKind::Transient,
+                    action: FailureAction::RetryStep,
+                    replan_scope: None,
+                    detail: "timeout".to_string(),
+                    source: "test".to_string(),
+                    user_message: None,
+                },
+                &mut trace,
+            )
+            .expect_err("第一次应为 RetryStep，返回失败");
+        assert!(first.to_string().contains("timeout"));
+        let first_attempt = trace.recovery_attempts.last().unwrap();
+        assert_eq!(first_attempt.original_action, FailureAction::RetryStep);
+        assert_eq!(first_attempt.effective_action, FailureAction::RetryStep);
+        assert_eq!(first_attempt.action, FailureAction::RetryStep);
+        assert!(!first_attempt.escalated);
+
+        // 第二次 Transient -> 因防循环升级为 Replan
+        let second = agent
+            .handle_recorded_failure(
+                2,
+                FailureDecision {
+                    kind: StepFailureKind::Transient,
+                    action: FailureAction::RetryStep,
+                    replan_scope: None,
+                    detail: "timeout again".to_string(),
+                    source: "test".to_string(),
+                    user_message: None,
+                },
+                &mut trace,
+            )
+            .expect("升级后应成功 Replan");
+        assert!(matches!(second, super::LoopControl::Continue(_)));
+        let last = trace.recovery_attempts.last().unwrap();
+        assert!(last.escalated, "第二次应标记为 escalated");
+        assert_eq!(last.original_action, FailureAction::RetryStep);
+        assert_eq!(last.effective_action, FailureAction::Replan);
+        assert_eq!(last.action, FailureAction::Replan);
+        assert_eq!(last.outcome, RecoveryOutcome::Continued);
+    }
+
+    #[test]
+    fn low_value_observation_replan_then_ask_user() {
+        let workspace = temp_workspace();
+        let agent = AgentCore::with_scripted_decisions(
+            workspace.clone(),
+            3,
+            vec![super::AgentDecision::Final("noop".to_string())],
+        )
+        .expect("初始化 agent 失败");
+        let mut trace = AgentRunTrace::new(&workspace, "lvo", AgentRunContext::agent_demo());
+        trace.configure_controller_limits(3, 3);
+
+        // 第一次 LowValueObservation -> Replan
+        let first = agent
+            .handle_recorded_failure(
+                1,
+                FailureDecision {
+                    kind: StepFailureKind::LowValueObservation,
+                    action: FailureAction::Replan,
+                    replan_scope: Some(ReplanScope::RemainingPlan),
+                    detail: "no new info".to_string(),
+                    source: "test".to_string(),
+                    user_message: None,
+                },
+                &mut trace,
+            )
+            .expect("第一次 Replan 应成功");
+        assert!(matches!(first, super::LoopControl::Continue(_)));
+        assert!(!trace.recovery_attempts.last().unwrap().escalated);
+
+        // 第二次 LowValueObservation -> 升级 AskUser
+        let second = agent
+            .handle_recorded_failure(
+                2,
+                FailureDecision {
+                    kind: StepFailureKind::LowValueObservation,
+                    action: FailureAction::Replan,
+                    replan_scope: Some(ReplanScope::RemainingPlan),
+                    detail: "still no new info".to_string(),
+                    source: "test".to_string(),
+                    user_message: None,
+                },
+                &mut trace,
+            )
+            .expect("升级后应 ask_user");
+        assert!(matches!(second, super::LoopControl::Finish(_)));
+        let last = trace.recovery_attempts.last().unwrap();
+        assert!(last.escalated, "第二次应标记为 escalated");
+        assert_eq!(last.outcome, RecoveryOutcome::EscalatedToAskUser);
+    }
+
+    #[test]
+    fn recovery_loop_guard_prevents_infinite_escalation() {
+        let workspace = temp_workspace();
+        let agent = AgentCore::with_scripted_decisions(
+            workspace.clone(),
+            3,
+            vec![super::AgentDecision::Final("noop".to_string())],
+        )
+        .expect("初始化 agent 失败");
+        let mut trace = AgentRunTrace::new(&workspace, "loop", AgentRunContext::agent_demo());
+        trace.configure_controller_limits(3, 3);
+
+        // 连续触发同一 kind 多次，确保不会无限循环
+        for i in 1..=4 {
+            let _ = agent.handle_recorded_failure(
+                i,
+                FailureDecision {
+                    kind: StepFailureKind::Transient,
+                    action: FailureAction::RetryStep,
+                    replan_scope: None,
+                    detail: format!("attempt {}", i),
+                    source: "test".to_string(),
+                    user_message: None,
+                },
+                &mut trace,
+            );
+        }
+
+        // Transient 的 max_attempts = 1，所以第 2 次就升级为 Replan
+        // 第 3、4 次仍然是 Replan（因为 Replan 的 max_attempts = 1，但 Replan 成功执行，
+        // 下一次再遇到 Transient 已经是新 kind 计数... 不，是同 kind 计数继续累加）
+        // 实际上第 3 次时 kind_count=3 > max_attempts(1)，仍然升级，但 escalate_to 也是 Replan
+        // 第 4 次同理
+        let transient_attempts: Vec<_> = trace
+            .recovery_attempts
+            .iter()
+            .filter(|a| a.failure_kind == StepFailureKind::Transient)
+            .collect();
+        assert_eq!(transient_attempts.len(), 4);
+        // 第一次未升级
+        assert!(!transient_attempts[0].escalated);
+        // 第 2~4 次都被升级（因为 kind_count 一直 > 1）
+        assert!(transient_attempts[1].escalated);
+        assert!(transient_attempts[2].escalated);
+        assert!(transient_attempts[3].escalated);
+    }
+
+    #[test]
+    fn trace_records_recovery_attempt_action_outcome() {
+        let workspace = temp_workspace();
+        let agent = AgentCore::with_scripted_decisions(
+            workspace.clone(),
+            3,
+            vec![super::AgentDecision::Final("noop".to_string())],
+        )
+        .expect("初始化 agent 失败");
+        let mut trace = AgentRunTrace::new(&workspace, "trace", AgentRunContext::agent_demo());
+        trace.configure_controller_limits(3, 3);
+
+        // 记录一次 recovery
+        let _ = agent.handle_recorded_failure(
+            1,
+            FailureDecision {
+                kind: StepFailureKind::Semantic,
+                action: FailureAction::Replan,
+                replan_scope: Some(ReplanScope::CurrentStep),
+                detail: "语义错误".to_string(),
+                source: "test".to_string(),
+                user_message: None,
+            },
+            &mut trace,
+        );
+
+        assert_eq!(trace.recovery_attempts.len(), 1);
+        let attempt = &trace.recovery_attempts[0];
+        assert_eq!(attempt.failure_kind, StepFailureKind::Semantic);
+        assert_eq!(attempt.action, FailureAction::Replan);
+        assert_eq!(attempt.outcome, RecoveryOutcome::Continued);
+        assert_eq!(attempt.step, 1);
+        assert_eq!(attempt.source, "test");
+        assert_eq!(attempt.detail, "语义错误");
+        assert!(!attempt.escalated);
+        assert!(attempt.successful);
     }
 }

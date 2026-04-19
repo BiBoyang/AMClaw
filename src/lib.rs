@@ -6,6 +6,7 @@ pub mod context_pack;
 pub mod logging;
 pub mod pipeline;
 pub mod reporter;
+pub mod retriever;
 pub mod scheduler;
 pub mod session_router;
 pub mod session_summary;

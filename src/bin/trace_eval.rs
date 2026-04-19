@@ -33,6 +33,14 @@ struct AgentTrace {
     #[serde(default)]
     memory_ids: Vec<String>,
     #[serde(default)]
+    retriever_name: String,
+    #[serde(default)]
+    retrieval_candidate_count: usize,
+    #[serde(default)]
+    retrieval_hit_count: usize,
+    #[serde(default)]
+    retrieval_latency_ms: u128,
+    #[serde(default)]
     persistent_state_present: bool,
     #[serde(default)]
     persistent_state_source: Option<String>,
@@ -150,6 +158,10 @@ struct TraceSummary {
     memory_injected: usize,
     memory_dropped: usize,
     memory_total_chars: usize,
+    retriever_name: String,
+    retrieval_candidate_count: usize,
+    retrieval_hit_count: usize,
+    retrieval_latency_ms: u128,
     state_present: bool,
     context_pack_dropped: bool,
     context_pack_drop_reasons: Vec<String>,
@@ -490,6 +502,10 @@ fn summarize_trace(trace: &AgentTrace, baseline_run_ids: &HashSet<String>) -> Tr
         memory_injected: trace.memory_hit_count,
         memory_dropped: trace.memory_dropped_count,
         memory_total_chars: trace.memory_total_chars,
+        retriever_name: trace.retriever_name.clone(),
+        retrieval_candidate_count: trace.retrieval_candidate_count,
+        retrieval_hit_count: trace.retrieval_hit_count,
+        retrieval_latency_ms: trace.retrieval_latency_ms,
         state_present: trace.persistent_state_present,
         context_pack_dropped: !trace.context_pack_drop_reasons.is_empty(),
         context_pack_drop_reasons: trace.context_pack_drop_reasons.clone(),
@@ -629,6 +645,53 @@ fn build_report(
             baseline_missing,
             pct(baseline_missing, baseline_run_ids.len())
         ));
+        lines.push(String::new());
+    }
+
+    // === Retriever Dimension ===
+    let mut retriever_counter: HashMap<String, (usize, usize, usize, u128)> = HashMap::new();
+    for summary in summaries {
+        let name = if summary.retriever_name.is_empty() {
+            "(unknown)".to_string()
+        } else {
+            summary.retriever_name.clone()
+        };
+        let entry = retriever_counter.entry(name).or_insert((0, 0, 0, 0));
+        entry.0 += 1; // trace count
+        entry.1 += summary.retrieval_candidate_count; // total candidates
+        entry.2 += summary.retrieval_hit_count; // total hits
+        entry.3 += summary.retrieval_latency_ms; // total latency
+    }
+    if !retriever_counter.is_empty() {
+        lines.push("## Retriever Statistics".to_string());
+        lines.push(String::new());
+        lines.push(
+            "| retriever | traces | avg_candidates | avg_hits | avg_latency_ms |".to_string(),
+        );
+        lines.push("| --- | ---: | ---: | ---: | ---: |".to_string());
+        let mut pairs = retriever_counter.into_iter().collect::<Vec<_>>();
+        pairs.sort_by(|left, right| right.1 .0.cmp(&left.1 .0));
+        for (name, (count, candidates, hits, latency)) in pairs {
+            let avg_candidates = if count > 0 {
+                candidates as f64 / count as f64
+            } else {
+                0.0
+            };
+            let avg_hits = if count > 0 {
+                hits as f64 / count as f64
+            } else {
+                0.0
+            };
+            let avg_latency = if count > 0 {
+                latency as f64 / count as f64
+            } else {
+                0.0
+            };
+            lines.push(format!(
+                "| {} | {} | {:.1} | {:.1} | {:.1} |",
+                name, count, avg_candidates, avg_hits, avg_latency
+            ));
+        }
         lines.push(String::new());
     }
 
@@ -2110,6 +2173,10 @@ mod tests {
             memory_injected: 0,
             memory_dropped: 0,
             memory_total_chars: 0,
+            retriever_name: String::new(),
+            retrieval_candidate_count: 0,
+            retrieval_hit_count: 0,
+            retrieval_latency_ms: 0,
             state_present: false,
             context_pack_dropped: false,
             context_pack_drop_reasons: Vec::new(),
@@ -2909,6 +2976,10 @@ mod tests {
             memory_dropped_count: 0,
             memory_total_chars: 0,
             memory_ids: vec![],
+            retriever_name: String::new(),
+            retrieval_candidate_count: 0,
+            retrieval_hit_count: 0,
+            retrieval_latency_ms: 0,
             persistent_state_present: false,
             persistent_state_source: None,
             persistent_state_updated: false,
@@ -2937,5 +3008,201 @@ mod tests {
         assert_eq!(summary.recovery_attempt_details.len(), 1);
         assert_eq!(summary.recovery_attempt_details[0].failure_kind, "semantic");
         assert!(!summary.recovery_attempt_details[0].successful);
+    }
+
+    #[test]
+    fn report_parser_tolerates_missing_retriever_fields() {
+        // 模拟旧 trace：retriever 字段为空（默认）
+        let trace = AgentTrace {
+            trace_version: "agent_trace_v1".to_string(),
+            run_id: "run-no-retriever".to_string(),
+            started_at: "2026-04-18T00:00:00Z".to_string(),
+            finished_at: None,
+            duration_ms: Some(100),
+            success: true,
+            error: None,
+            final_output: None,
+            user_input: "test".to_string(),
+            user_input_chars: 4,
+            step_count: 1,
+            llm_fallback_reason: None,
+            recovery_action: None,
+            recovery_result: None,
+            memory_retrieved_count: 3,
+            memory_hit_count: 2,
+            memory_dropped_count: 1,
+            memory_total_chars: 100,
+            memory_ids: vec!["m1".to_string()],
+            retriever_name: String::new(),
+            retrieval_candidate_count: 0,
+            retrieval_hit_count: 0,
+            retrieval_latency_ms: 0,
+            persistent_state_present: false,
+            persistent_state_source: None,
+            persistent_state_updated: false,
+            context_pack_present: false,
+            context_pack_drop_reasons: vec![],
+            context_pack_section_count: 0,
+            context_pack_total_chars: 0,
+            decisions: vec![],
+            failures: vec![],
+            recovery_attempts: vec![],
+            llm_calls: vec![],
+            tool_calls: vec![],
+        };
+
+        let summary = summarize_trace(&trace, &HashSet::new());
+        assert_eq!(summary.retriever_name, "");
+        assert_eq!(summary.retrieval_candidate_count, 0);
+        assert_eq!(summary.retrieval_hit_count, 0);
+        assert_eq!(summary.retrieval_latency_ms, 0);
+
+        let report = build_report(&[summary], false, &HashSet::new(), None);
+        // 空 retriever_name 应显示为 (unknown)
+        assert!(report.contains("(unknown)"));
+    }
+
+    #[test]
+    fn report_aggregates_metrics_by_retriever_name() {
+        let s1 = TraceSummary {
+            run_id: "r1".to_string(),
+            started_at: "2026-04-18T00:00:00Z".to_string(),
+            user_input: "a".to_string(),
+            user_input_chars: 1,
+            success: true,
+            error_short: None,
+            duration_ms: None,
+            step_count: 1,
+            llm_fallback: false,
+            has_failures: false,
+            failure_count: 0,
+            failure_types: vec![],
+            memory_retrieved: 0,
+            memory_injected: 0,
+            memory_dropped: 0,
+            memory_total_chars: 0,
+            retriever_name: "rule_v1".to_string(),
+            retrieval_candidate_count: 10,
+            retrieval_hit_count: 5,
+            retrieval_latency_ms: 20,
+            state_present: false,
+            context_pack_dropped: false,
+            context_pack_drop_reasons: vec![],
+            llm_call_count: 0,
+            llm_success_count: 0,
+            llm_failure_count: 0,
+            tool_call_count: 0,
+            tool_success_count: 0,
+            tool_failure_count: 0,
+            tool_error_types: vec![],
+            has_recovery_attempt: false,
+            recovery_attempt_count: 0,
+            recovery_success_count: 0,
+            recovery_succeeded: None,
+            recovery_actions: vec![],
+            recovery_results: vec![],
+            recovery_attempt_details: vec![],
+            in_baseline: false,
+            is_interesting: false,
+            interest_reasons: vec![],
+        };
+        let s2 = TraceSummary {
+            run_id: "r2".to_string(),
+            started_at: "2026-04-18T00:00:00Z".to_string(),
+            user_input: "b".to_string(),
+            user_input_chars: 1,
+            success: true,
+            error_short: None,
+            duration_ms: None,
+            step_count: 1,
+            llm_fallback: false,
+            has_failures: false,
+            failure_count: 0,
+            failure_types: vec![],
+            memory_retrieved: 0,
+            memory_injected: 0,
+            memory_dropped: 0,
+            memory_total_chars: 0,
+            retriever_name: "rule_v1".to_string(),
+            retrieval_candidate_count: 8,
+            retrieval_hit_count: 4,
+            retrieval_latency_ms: 15,
+            state_present: false,
+            context_pack_dropped: false,
+            context_pack_drop_reasons: vec![],
+            llm_call_count: 0,
+            llm_success_count: 0,
+            llm_failure_count: 0,
+            tool_call_count: 0,
+            tool_success_count: 0,
+            tool_failure_count: 0,
+            tool_error_types: vec![],
+            has_recovery_attempt: false,
+            recovery_attempt_count: 0,
+            recovery_success_count: 0,
+            recovery_succeeded: None,
+            recovery_actions: vec![],
+            recovery_results: vec![],
+            recovery_attempt_details: vec![],
+            in_baseline: false,
+            is_interesting: false,
+            interest_reasons: vec![],
+        };
+        let s3 = TraceSummary {
+            run_id: "r3".to_string(),
+            started_at: "2026-04-18T00:00:00Z".to_string(),
+            user_input: "c".to_string(),
+            user_input_chars: 1,
+            success: true,
+            error_short: None,
+            duration_ms: None,
+            step_count: 1,
+            llm_fallback: false,
+            has_failures: false,
+            failure_count: 0,
+            failure_types: vec![],
+            memory_retrieved: 0,
+            memory_injected: 0,
+            memory_dropped: 0,
+            memory_total_chars: 0,
+            retriever_name: "semantic_v1".to_string(),
+            retrieval_candidate_count: 20,
+            retrieval_hit_count: 8,
+            retrieval_latency_ms: 50,
+            state_present: false,
+            context_pack_dropped: false,
+            context_pack_drop_reasons: vec![],
+            llm_call_count: 0,
+            llm_success_count: 0,
+            llm_failure_count: 0,
+            tool_call_count: 0,
+            tool_success_count: 0,
+            tool_failure_count: 0,
+            tool_error_types: vec![],
+            has_recovery_attempt: false,
+            recovery_attempt_count: 0,
+            recovery_success_count: 0,
+            recovery_succeeded: None,
+            recovery_actions: vec![],
+            recovery_results: vec![],
+            recovery_attempt_details: vec![],
+            in_baseline: false,
+            is_interesting: false,
+            interest_reasons: vec![],
+        };
+
+        let report = build_report(&[s1, s2, s3], false, &HashSet::new(), None);
+        // rule_v1: 2 traces, avg_candidates=9.0, avg_hits=4.5, avg_latency=17.5
+        assert!(
+            report.contains("| rule_v1 | 2 | 9.0 | 4.5 | 17.5 |"),
+            "report:\n{}",
+            report
+        );
+        // semantic_v1: 1 trace, avg_candidates=20.0, avg_hits=8.0, avg_latency=50.0
+        assert!(
+            report.contains("| semantic_v1 | 1 | 20.0 | 8.0 | 50.0 |"),
+            "report:\n{}",
+            report
+        );
     }
 }

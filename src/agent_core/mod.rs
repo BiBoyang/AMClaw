@@ -1,5 +1,7 @@
 use crate::config::AgentConfig;
 use crate::context_pack::*;
+use crate::retriever::rule::RuleRetriever;
+use crate::retriever::Retriever;
 use crate::session_summary::*;
 use crate::task_store::{
     FeedbackKind, MemoryFeedbackState, RecentTaskRecord, TaskStatusRecord, TaskStore,
@@ -701,6 +703,14 @@ struct SessionState {
     injected: Vec<UserMemoryRecord>,
     /// 被裁剪掉的记忆及原因
     dropped: Vec<DroppedMemory>,
+    /// 使用的检索器名称（用于 trace / A/B 对比）
+    retriever_name: String,
+    /// 检索耗时（毫秒）
+    retrieval_latency_ms: u128,
+    /// 检索器原始候选条数
+    retrieval_candidate_count: usize,
+    /// 预算裁剪后命中（注入）条数
+    retrieval_hit_count: usize,
 }
 
 impl SessionState {
@@ -757,6 +767,10 @@ impl SessionState {
             retrieved,
             injected,
             dropped,
+            retriever_name: String::new(),
+            retrieval_latency_ms: 0,
+            retrieval_candidate_count: 0,
+            retrieval_hit_count: 0,
         }
     }
 
@@ -786,6 +800,11 @@ impl SessionState {
     /// 是否有任何记忆活动（检索到或注入）
     fn has_memory_activity(&self) -> bool {
         !self.retrieved.is_empty()
+    }
+
+    /// 是否记录了 retriever 级可观测信息
+    fn has_retrieval_observability(&self) -> bool {
+        !self.retriever_name.is_empty()
     }
 }
 
@@ -1420,7 +1439,20 @@ pub struct AgentRunResult {
     pub trace_json_path: Option<PathBuf>,
 }
 
+/// 空检索器 —— 当没有 task_store_db_path 时的 fallback。
+/// 永远返回空结果，零延迟。
 #[derive(Debug)]
+struct NoOpRetriever;
+
+impl crate::retriever::Retriever for NoOpRetriever {
+    fn retrieve(
+        &self,
+        _query: &crate::retriever::RetrieveQuery,
+    ) -> anyhow::Result<crate::retriever::RetrieveResult> {
+        Ok(crate::retriever::RetrieveResult::empty("noop"))
+    }
+}
+
 pub struct AgentCore {
     workspace_root: PathBuf,
     // 负责实际执行工具动作（读写文件等）
@@ -1432,8 +1464,23 @@ pub struct AgentCore {
     max_steps: usize,
     max_replans: usize,
     planning_policy: PlanningPolicy,
+    // 可插拔检索器（默认 RuleRetriever）
+    retriever: Box<dyn Retriever + Send + Sync>,
     #[cfg(test)]
     scripted_decisions: RefCell<VecDeque<PlannedDecision>>,
+}
+
+impl std::fmt::Debug for AgentCore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentCore")
+            .field("workspace_root", &self.workspace_root)
+            .field("task_store_db_path", &self.task_store_db_path)
+            .field("max_steps", &self.max_steps)
+            .field("max_replans", &self.max_replans)
+            .field("planning_policy", &self.planning_policy)
+            .field("retriever", &"(dyn Retriever)")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -1518,6 +1565,10 @@ impl AgentCore {
             workspace_root.clone(),
             task_store_db_path.clone(),
         )?;
+        let retriever: Box<dyn Retriever + Send + Sync> = match &task_store_db_path {
+            Some(db_path) => Box::new(RuleRetriever::new(db_path)),
+            None => Box::new(NoOpRetriever),
+        };
         Ok(Self {
             workspace_root: workspace_root.clone(),
             tool_registry,
@@ -1527,6 +1578,7 @@ impl AgentCore {
             max_steps,
             max_replans: DEFAULT_MAX_REPLANS,
             planning_policy: PlanningPolicy::Reactive,
+            retriever,
             #[cfg(test)]
             scripted_decisions: RefCell::new(VecDeque::new()),
         })
@@ -1660,14 +1712,9 @@ impl AgentCore {
             self.task_store_db_path.as_deref(),
             &trace,
             self.context_compaction.memory_budget,
+            self.retriever.as_ref(),
         )?;
-        if session_state.has_memory_activity() {
-            trace.memory_hit_count = session_state.injected_count();
-            trace.memory_retrieved_count = session_state.retrieved_count();
-            trace.memory_total_chars = session_state.injected_total_chars();
-            trace.memory_dropped_count = session_state.dropped.len();
-            trace.memory_ids = session_state.injected_ids();
-        }
+        project_session_state_to_trace(&mut trace, &session_state);
         let runtime_session_state =
             derive_runtime_session_state(&trace, user_input, None, business_context.as_ref());
         let planner_input = ContextAssembler {
@@ -1951,6 +1998,7 @@ impl AgentCore {
             self.task_store_db_path.as_deref(),
             trace,
             self.context_compaction.memory_budget,
+            self.retriever.as_ref(),
         ) {
             Ok(result) => result,
             Err(err) => {
@@ -1966,12 +2014,8 @@ impl AgentCore {
             }
         };
         // 从 SessionState 投影到 trace（仅在 step 0 写入，后续 step 不重复）
-        if step == 0 && session_state.has_memory_activity() {
-            trace.memory_hit_count = session_state.injected_count();
-            trace.memory_retrieved_count = session_state.retrieved_count();
-            trace.memory_total_chars = session_state.injected_total_chars();
-            trace.memory_dropped_count = session_state.dropped.len();
-            trace.memory_ids = session_state.injected_ids();
+        if step == 0 {
+            project_session_state_to_trace(trace, &session_state);
         }
         let runtime_session_state =
             derive_runtime_session_state(trace, user_input, observation, business_context.as_ref());
@@ -2474,6 +2518,11 @@ struct AgentRunTrace {
     memory_total_chars: usize,     // 注入记忆的总字符数
     memory_dropped_count: usize,   // 被裁剪掉的记忆条数
     memory_ids: Vec<String>,       // 注入记忆的 ID 列表
+    // --- Retriever-level observability ---
+    retriever_name: String,           // 使用的检索器名称
+    retrieval_candidate_count: usize, // 检索器返回的候选条数
+    retrieval_hit_count: usize,       // 经裁剪后实际命中的条数
+    retrieval_latency_ms: u128,       // 检索耗时（毫秒）
     persistent_state_present: bool,
     persistent_state_source: Option<String>,
     persistent_state_updated: bool,
@@ -2688,6 +2737,10 @@ impl AgentRunTrace {
             memory_total_chars: 0,
             memory_dropped_count: 0,
             memory_ids: Vec::new(),
+            retriever_name: String::new(),
+            retrieval_candidate_count: 0,
+            retrieval_hit_count: 0,
+            retrieval_latency_ms: 0,
             persistent_state_present: context.user_session_state.is_some(),
             persistent_state_source: if context.user_session_state.is_some() {
                 Some("db".to_string())
@@ -3300,6 +3353,17 @@ impl AgentRunTrace {
                 "- memory_total_chars: {} (injected)",
                 self.memory_total_chars
             ),
+            format!(
+                "- retriever: {} (latency={}ms, candidates={}, hits={})",
+                if self.retriever_name.is_empty() {
+                    "(none)"
+                } else {
+                    &self.retriever_name
+                },
+                self.retrieval_latency_ms,
+                self.retrieval_candidate_count,
+                self.retrieval_hit_count,
+            ),
             String::new(),
             "## User Input".to_string(),
             String::new(),
@@ -3850,10 +3914,86 @@ fn normalize_optional_text(input: String) -> Option<String> {
     }
 }
 
+fn project_session_state_to_trace(trace: &mut AgentRunTrace, session_state: &SessionState) {
+    if session_state.has_memory_activity() {
+        trace.memory_hit_count = session_state.injected_count();
+        trace.memory_retrieved_count = session_state.retrieved_count();
+        trace.memory_total_chars = session_state.injected_total_chars();
+        trace.memory_dropped_count = session_state.dropped.len();
+        trace.memory_ids = session_state.injected_ids();
+    }
+    if session_state.has_retrieval_observability() {
+        trace
+            .retriever_name
+            .clone_from(&session_state.retriever_name);
+        trace.retrieval_latency_ms = session_state.retrieval_latency_ms;
+        trace.retrieval_candidate_count = session_state.retrieval_candidate_count;
+        trace.retrieval_hit_count = session_state.retrieval_hit_count;
+    }
+}
+
+/// 将 RetrievedItem 映射为 UserMemoryRecord，供现有 SessionState / prompt 链路零回归使用。
+fn retrieved_item_to_user_memory_record(
+    item: &crate::retriever::RetrievedItem,
+    user_id: &str,
+) -> UserMemoryRecord {
+    let meta = &item.metadata;
+    let parse_i64 = |key: &str| meta.get(key).and_then(|value| value.parse().ok());
+    let parse_bool = |key: &str| {
+        meta.get(key)
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    };
+    let memory_type = meta
+        .get("memory_type")
+        .or(Some(&item.source_type))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(crate::task_store::MemoryType::Auto);
+    let priority = meta
+        .get("priority")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(memory_type.default_priority());
+    let status = meta
+        .get("status")
+        .cloned()
+        .unwrap_or_else(|| "active".to_string());
+    let use_count = parse_i64("use_count").unwrap_or(0);
+    let retrieved_count = parse_i64("retrieved_count").unwrap_or(0);
+    let injected_count = parse_i64("injected_count").unwrap_or(0);
+    let useful = parse_bool("useful");
+    let now = chrono::Utc::now().to_rfc3339();
+    let created_at = meta
+        .get("created_at")
+        .cloned()
+        .or_else(|| meta.get("updated_at").cloned())
+        .unwrap_or_else(|| now.clone());
+    let updated_at = meta
+        .get("updated_at")
+        .cloned()
+        .or_else(|| meta.get("created_at").cloned())
+        .unwrap_or_else(|| now.clone());
+    UserMemoryRecord {
+        id: item.id.clone(),
+        user_id: user_id.to_string(),
+        content: item.content.clone(),
+        memory_type,
+        status,
+        priority,
+        last_used_at: meta.get("last_used_at").cloned(),
+        use_count,
+        retrieved_count,
+        injected_count,
+        useful,
+        created_at,
+        updated_at,
+    }
+}
+
 fn load_business_context_snapshot(
     task_store_db_path: Option<&std::path::Path>,
     trace: &AgentRunTrace,
     memory_budget: MemoryBudget,
+    retriever: &dyn crate::retriever::Retriever,
 ) -> Result<(Option<BusinessContextSnapshot>, SessionState)> {
     let Some(db_path) = task_store_db_path else {
         return Ok((None, SessionState::default()));
@@ -3873,13 +4013,33 @@ fn load_business_context_snapshot(
 
     let mut session_state = SessionState::default();
     let user_memories = if let Some(user_id) = &trace.user_id {
-        match store.search_user_memories(user_id, 15) {
-            Ok(retrieved) => {
+        let query = crate::retriever::RetrieveQuery::new(user_id, 15)
+            .with_hint(
+                "has_current_task",
+                if current_task.is_some() {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .with_hint("plan_step_count", trace.active_plan_steps.len().to_string());
+
+        match retriever.retrieve(&query) {
+            Ok(retrieve_result) => {
                 let has_current_task = current_task.is_some();
                 let plan_step_count = trace.active_plan_steps.len();
                 let budget =
                     memory_budget.with_dynamic_adjustment(has_current_task, plan_step_count);
+                let retrieved: Vec<UserMemoryRecord> = retrieve_result
+                    .candidates
+                    .iter()
+                    .map(|item| retrieved_item_to_user_memory_record(item, user_id))
+                    .collect();
                 session_state = SessionState::from_retrieved(retrieved, budget);
+                session_state.retriever_name = retrieve_result.retriever_name.clone();
+                session_state.retrieval_latency_ms = retrieve_result.latency_ms;
+                session_state.retrieval_candidate_count = session_state.retrieved_count();
+                session_state.retrieval_hit_count = session_state.injected_count();
                 let mut feedback_state = MemoryFeedbackState::default();
                 for memory in &session_state.retrieved {
                     feedback_state.record(&memory.id, FeedbackKind::Retrieved);
@@ -3906,6 +4066,16 @@ fn load_business_context_snapshot(
                             json!(session_state.injected_total_chars()),
                         ),
                         ("memory_ids", json!(session_state.injected_ids())),
+                        ("retriever_name", json!(retrieve_result.retriever_name)),
+                        (
+                            "retrieval_candidate_count",
+                            json!(session_state.retrieval_candidate_count),
+                        ),
+                        (
+                            "retrieval_hit_count",
+                            json!(session_state.retrieval_hit_count),
+                        ),
+                        ("retrieval_latency_ms", json!(retrieve_result.latency_ms)),
                     ],
                 );
                 if let Err(err) = store.apply_memory_feedback(&feedback_state) {
@@ -5043,14 +5213,15 @@ mod tests {
         build_agent_log_payload, build_context_pack, build_context_summary,
         classify_tool_execution_failure, derive_runtime_session_state,
         detect_stalled_trajectory_failure, load_business_context_snapshot, map_llm_plan,
-        parse_llm_plan, select_previous_observations, validate_expected_observation, AgentCore,
-        AgentObservation, AgentRunContext, AgentRunTrace, BusinessContextSnapshot,
-        ContextAssembler, ContextPreviewMode, DoneRule, DropReason, ExecutionPlan,
-        ExpectedObservation, FailureAction, FailureDecision, GoalSignal, LlmPlan, MemoryBudget,
-        MinimumNovelty, ObservationKind, PlannedDecision, RecoveryOutcome, ReplanScope,
-        RuntimeSessionStateSnapshot, StepFailureKind,
+        parse_llm_plan, project_session_state_to_trace, select_previous_observations,
+        validate_expected_observation, AgentCore, AgentObservation, AgentRunContext, AgentRunTrace,
+        BusinessContextSnapshot, ContextAssembler, ContextPreviewMode, DoneRule, DropReason,
+        ExecutionPlan, ExpectedObservation, FailureAction, FailureDecision, GoalSignal, LlmPlan,
+        MemoryBudget, MinimumNovelty, ObservationKind, PlannedDecision, RecoveryOutcome,
+        ReplanScope, RuntimeSessionStateSnapshot, StepFailureKind,
     };
     use crate::context_pack::{ContextSectionChangeReason, ContextSectionKind};
+    use crate::retriever::rule::RuleRetriever;
     use crate::session_summary::SessionSummaryStrategy;
     use crate::task_store::{MemoryType, TaskStore};
     use serde_json::{json, Value};
@@ -6381,6 +6552,7 @@ mod tests {
             Some(db_path.as_path()),
             &trace,
             MemoryBudget::default(),
+            &RuleRetriever::new(&db_path),
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -6416,6 +6588,7 @@ mod tests {
             Some(db_path.as_path()),
             &trace,
             MemoryBudget::default(),
+            &RuleRetriever::new(&db_path),
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -6519,6 +6692,7 @@ mod tests {
             Some(db_path.as_path()),
             &trace,
             MemoryBudget::default(),
+            &RuleRetriever::new(&db_path),
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -6557,6 +6731,7 @@ mod tests {
             Some(db_path.as_path()),
             &trace,
             MemoryBudget::default(),
+            &RuleRetriever::new(&db_path),
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -6590,6 +6765,7 @@ mod tests {
             Some(db_path.as_path()),
             &trace,
             MemoryBudget::default(),
+            &RuleRetriever::new(&db_path),
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -6614,6 +6790,7 @@ mod tests {
             Some(db_path.as_path()),
             &trace,
             MemoryBudget::default(),
+            &RuleRetriever::new(&db_path),
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -6641,6 +6818,7 @@ mod tests {
             Some(db_path.as_path()),
             &trace,
             MemoryBudget::default(),
+            &RuleRetriever::new(&db_path),
         )
         .expect("读取业务上下文失败");
         // 1 injected, 1 dropped (dedup)
@@ -6668,6 +6846,7 @@ mod tests {
             Some(db_path.as_path()),
             &trace,
             MemoryBudget::default(),
+            &RuleRetriever::new(&db_path),
         )
         .expect("读取业务上下文失败");
         // max_items=5, 7 条 → 5 injected, 2 dropped (budget exceeded)
@@ -6698,6 +6877,7 @@ mod tests {
             Some(db_path.as_path()),
             &trace,
             MemoryBudget::default(),
+            &RuleRetriever::new(&db_path),
         )
         .expect("读取业务上下文失败");
         // 1 injected (短记忆), 1 dropped (too long)
@@ -6727,6 +6907,7 @@ mod tests {
             Some(db_path.as_path()),
             &trace1,
             MemoryBudget::default(),
+            &RuleRetriever::new(&db_path),
         )
         .expect("读取业务上下文失败");
         // 第二轮（同一用户，不同 run）
@@ -6739,6 +6920,7 @@ mod tests {
             Some(db_path.as_path()),
             &trace2,
             MemoryBudget::default(),
+            &RuleRetriever::new(&db_path),
         )
         .expect("读取业务上下文失败");
         // 两轮独立，互不泄漏
@@ -6775,6 +6957,7 @@ mod tests {
             Some(db_path.as_path()),
             &trace,
             MemoryBudget::default(),
+            &RuleRetriever::new(&db_path),
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -6816,6 +6999,7 @@ mod tests {
             Some(db_path.as_path()),
             &trace,
             MemoryBudget::default(),
+            &RuleRetriever::new(&db_path),
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -6849,6 +7033,7 @@ mod tests {
             Some(db_path.as_path()),
             &trace,
             MemoryBudget::default(),
+            &RuleRetriever::new(&db_path),
         )
         .expect("读取业务上下文失败");
 
@@ -6891,6 +7076,7 @@ mod tests {
             Some(db_path.as_path()),
             &trace,
             MemoryBudget::default(),
+            &RuleRetriever::new(&db_path),
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -6920,6 +7106,7 @@ mod tests {
             Some(db_path.as_path()),
             &trace,
             MemoryBudget::default(),
+            &RuleRetriever::new(&db_path),
         )
         .expect("读取业务上下文失败");
 
@@ -6943,6 +7130,136 @@ mod tests {
         assert!(rendered.contains("memory_hit_count"));
         assert!(rendered.contains("memory_retrieved_count"));
         assert!(rendered.contains("memory_dropped_count"));
+    }
+
+    #[test]
+    fn agent_core_uses_retriever_trait_not_store_directly() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        store
+            .add_user_memory_typed("user-mock", "mock 记忆", MemoryType::UserPreference, 80)
+            .expect("写入失败");
+
+        // Mock retriever：固定返回一条自定义内容
+        struct MockRetriever;
+        impl crate::retriever::Retriever for MockRetriever {
+            fn retrieve(
+                &self,
+                _query: &crate::retriever::RetrieveQuery,
+            ) -> anyhow::Result<crate::retriever::RetrieveResult> {
+                let mut metadata = std::collections::BTreeMap::new();
+                metadata.insert("memory_type".to_string(), "user_preference".to_string());
+                metadata.insert("priority".to_string(), "80".to_string());
+                metadata.insert("status".to_string(), "active".to_string());
+                Ok(crate::retriever::RetrieveResult {
+                    candidates: vec![crate::retriever::RetrievedItem {
+                        id: "mock-id".to_string(),
+                        content: "mock 检索结果".to_string(),
+                        score: Some(0.8),
+                        source_type: "user_preference".to_string(),
+                        metadata,
+                    }],
+                    hit_count: 1,
+                    dropped_count: 0,
+                    latency_ms: 42,
+                    retriever_name: "mock_test".to_string(),
+                })
+            }
+        }
+
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "帮我总结",
+            AgentRunContext::wechat_chat("user-mock", "commit", vec![]),
+        );
+        let (business, session_state) = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace,
+            MemoryBudget::default(),
+            &MockRetriever,
+        )
+        .expect("读取业务上下文失败");
+        let business = business.expect("应存在业务上下文");
+
+        // Mock retriever 的结果被注入
+        assert_eq!(business.user_memories.len(), 1);
+        assert_eq!(business.user_memories[0].content, "mock 检索结果");
+        assert_eq!(session_state.retriever_name, "mock_test");
+        assert_eq!(session_state.retrieval_latency_ms, 42);
+    }
+
+    #[test]
+    fn retrieval_observability_fields_present_in_trace() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        store
+            .add_user_memory_typed("user-obs", "观测测试", MemoryType::ProjectFact, 85)
+            .expect("写入失败");
+
+        let mut trace = AgentRunTrace::new(
+            &workspace,
+            "帮我总结",
+            AgentRunContext::wechat_chat("user-obs", "commit", vec![]),
+        );
+        let (_, session_state) = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace,
+            MemoryBudget::default(),
+            &RuleRetriever::new(&db_path),
+        )
+        .expect("读取业务上下文失败");
+
+        project_session_state_to_trace(&mut trace, &session_state);
+
+        assert_eq!(trace.retriever_name, "rule_v1");
+        assert!(trace.retrieval_latency_ms > 0);
+        assert_eq!(trace.retrieval_candidate_count, 1);
+        assert_eq!(trace.retrieval_hit_count, 1);
+
+        let rendered = trace.to_markdown();
+        assert!(
+            rendered.contains("rule_v1"),
+            "trace markdown 应包含 retriever 名称"
+        );
+        assert!(
+            rendered.contains("latency="),
+            "trace markdown 应包含 latency"
+        );
+    }
+
+    #[test]
+    fn legacy_flow_no_regression_with_default_rule_retriever() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        store
+            .add_user_memory("user-legacy", "旧流程记忆")
+            .expect("写入失败");
+
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "帮我总结",
+            AgentRunContext::wechat_chat("user-legacy", "commit", vec![]),
+        );
+        let retriever = RuleRetriever::new(&db_path);
+        let (business, session_state) = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace,
+            MemoryBudget::default(),
+            &retriever,
+        )
+        .expect("读取业务上下文失败");
+        let business = business.expect("应存在业务上下文");
+
+        // 与修改前完全一致的断言
+        assert_eq!(business.user_memories.len(), 1);
+        assert_eq!(business.user_memories[0].content, "旧流程记忆");
+        assert_eq!(session_state.injected_count(), 1);
+        assert_eq!(session_state.retrieved_count(), 1);
+        assert_eq!(session_state.dropped.len(), 0);
+        assert_eq!(session_state.retriever_name, "rule_v1");
     }
 
     #[test]

@@ -329,6 +329,8 @@ pub enum SkipReason {
     LowerPriorityWouldDowngradeHigher,
     /// user_id 或内容格式无效
     Invalid,
+    /// 内容被判定为噪声（过短、黑名单短句等）
+    Noise,
     /// 存储写入失败
     StorageError,
 }
@@ -343,6 +345,7 @@ impl std::fmt::Display for SkipReason {
                 write!(f, "lower_priority_would_downgrade_higher")
             }
             Self::Invalid => write!(f, "invalid"),
+            Self::Noise => write!(f, "noise"),
             Self::StorageError => write!(f, "storage_error"),
         }
     }
@@ -484,6 +487,58 @@ impl MemoryFeedbackState {
 
 /// 最大单条内容长度（写入时校验）
 const MAX_MEMORY_WRITE_CHARS: usize = 500;
+/// 写入门槛：过短内容的最小字符数（3 字符以下视为噪声）
+const MIN_MEMORY_WRITE_CHARS: usize = 3;
+
+/// 检查内容是否为噪声（过短或命中黑名单短句）。
+/// 黑名单覆盖中文/英文常见无意义短回复。
+fn is_memory_noise(content: &str) -> bool {
+    let trimmed = content.trim();
+    if trimmed.chars().count() < MIN_MEMORY_WRITE_CHARS {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    let blacklist: &[&str] = &[
+        "好的",
+        "收到",
+        "嗯嗯",
+        "嗯",
+        "哦",
+        "啊",
+        "行",
+        "可以",
+        "没问题",
+        "知道了",
+        "明白",
+        "了解",
+        "清楚",
+        "ok",
+        "yes",
+        "no",
+        "okay",
+        "sure",
+        "got it",
+        "roger",
+        "copy",
+        "thx",
+        "thanks",
+        "thank you",
+        "1",
+        "111",
+        "6",
+        "666",
+        "多谢",
+        "谢谢",
+        "不客气",
+        "客气",
+        "再见",
+        "拜拜",
+        "hello",
+        "hi",
+        "hey",
+    ];
+    blacklist.iter().any(|phrase| lower == *phrase)
+}
 
 #[derive(Debug)]
 pub struct TaskStore {
@@ -852,7 +907,17 @@ impl TaskStore {
             return decision;
         }
 
-        // 3. Validate: user_id
+        // 3. Validate: 噪声过滤（过短 / 黑名单短句）
+        if is_memory_noise(content) {
+            let decision = WriteDecision::Skipped {
+                content_preview,
+                reason: SkipReason::Noise,
+            };
+            write_state.record(decision.clone());
+            return decision;
+        }
+
+        // 4. Validate: user_id
         if user_id.trim().is_empty() {
             let decision = WriteDecision::Skipped {
                 content_preview,
@@ -862,15 +927,23 @@ impl TaskStore {
             return decision;
         }
 
-        // 4. Dedup: 检查已有记忆（normalize 后比较）
-        let normalized: String = content.split_whitespace().collect::<Vec<_>>().join(" ");
+        // 4. Dedup: 检查已有记忆（normalize 后比较：trim + 大小写归一 + 多空格压缩）
+        let normalized: String = content
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         let existing = self.search_user_memories(user_id, 50);
 
         match existing {
             Ok(memories) => {
                 for mem in &memories {
-                    let existing_normalized: String =
-                        mem.content.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let existing_normalized: String = mem
+                        .content
+                        .to_lowercase()
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     if existing_normalized != normalized {
                         continue;
                     }
@@ -3686,6 +3759,100 @@ mod tests {
         assert_eq!(MemoryType::UserPreference.label_prefix(), "[偏好]");
         assert_eq!(MemoryType::ProjectFact.label_prefix(), "[项目]");
         assert_eq!(MemoryType::Lesson.label_prefix(), "[经验]");
+    }
+
+    #[test]
+    fn memory_write_threshold_skips_noise() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        let mut ws = MemoryWriteState::default();
+
+        // 过短内容被跳过
+        let d1 =
+            store.govern_memory_write("user-a", "好的", MemoryType::UserPreference, 80, &mut ws);
+        assert!(
+            matches!(
+                d1,
+                WriteDecision::Skipped {
+                    reason: SkipReason::Noise,
+                    ..
+                }
+            ),
+            "黑名单短句应被跳过: {:?}",
+            d1
+        );
+
+        // 另一个黑名单
+        let d2 = store.govern_memory_write("user-a", "OK", MemoryType::UserPreference, 80, &mut ws);
+        assert!(
+            matches!(
+                d2,
+                WriteDecision::Skipped {
+                    reason: SkipReason::Noise,
+                    ..
+                }
+            ),
+            "ok 应被跳过: {:?}",
+            d2
+        );
+
+        // 少于 6 字符被跳过
+        let d3 = store.govern_memory_write("user-a", "短", MemoryType::UserPreference, 80, &mut ws);
+        assert!(
+            matches!(
+                d3,
+                WriteDecision::Skipped {
+                    reason: SkipReason::Noise,
+                    ..
+                }
+            ),
+            "过短内容应被跳过: {:?}",
+            d3
+        );
+
+        // 正常内容可通过
+        let d4 = store.govern_memory_write(
+            "user-a",
+            "我喜欢在晚上看技术文章",
+            MemoryType::UserPreference,
+            80,
+            &mut ws,
+        );
+        assert!(
+            matches!(d4, WriteDecision::Written(_)),
+            "正常内容应写入: {:?}",
+            d4
+        );
+
+        // 查询确认只写入了正常内容
+        let memories = store.list_user_memories("user-a", 10).expect("查询失败");
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].content, "我喜欢在晚上看技术文章");
+    }
+
+    #[test]
+    fn memory_type_user_isolation() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+
+        store
+            .add_user_memory_typed("user-a", "A 的偏好", MemoryType::UserPreference, 80)
+            .expect("写入失败");
+        store
+            .add_user_memory_typed("user-a", "A 的项目事实", MemoryType::ProjectFact, 85)
+            .expect("写入失败");
+        store
+            .add_user_memory_typed("user-b", "B 的经验", MemoryType::Lesson, 75)
+            .expect("写入失败");
+
+        let a_memories = store.list_user_memories("user-a", 10).expect("查询失败");
+        assert_eq!(a_memories.len(), 2);
+        assert!(a_memories.iter().all(|m| m.user_id == "user-a"));
+
+        let b_memories = store.list_user_memories("user-b", 10).expect("查询失败");
+        assert_eq!(b_memories.len(), 1);
+        assert_eq!(b_memories[0].memory_type, MemoryType::Lesson);
+        assert_eq!(b_memories[0].content, "B 的经验");
     }
 
     // ——— UserSessionState 测试 ———

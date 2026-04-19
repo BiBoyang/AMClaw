@@ -717,7 +717,12 @@ impl SessionState {
         let mut total_chars = 0;
 
         for mem in &retrieved {
-            let normalized: String = mem.content.split_whitespace().collect::<Vec<_>>().join(" ");
+            let normalized: String = mem
+                .content
+                .to_lowercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             if seen_normalized.contains(&normalized) {
                 dropped.push(DroppedMemory {
                     id: mem.id.clone(),
@@ -5047,7 +5052,7 @@ mod tests {
     };
     use crate::context_pack::{ContextSectionChangeReason, ContextSectionKind};
     use crate::session_summary::SessionSummaryStrategy;
-    use crate::task_store::TaskStore;
+    use crate::task_store::{MemoryType, TaskStore};
     use serde_json::{json, Value};
     use uuid::Uuid;
 
@@ -6743,6 +6748,201 @@ mod tests {
         assert!(ss2.dropped.is_empty());
         // SessionState 不持有可变共享状态
         assert_ne!(ss1.injected_ids()[0], ""); // 只是验证非空
+    }
+
+    #[test]
+    fn memory_v1_types_are_injected_with_labels() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        store
+            .add_user_memory_typed("user-v1", "我喜欢短回复", MemoryType::UserPreference, 80)
+            .expect("写入失败");
+        store
+            .add_user_memory_typed("user-v1", "AMClaw 使用 Rust", MemoryType::ProjectFact, 85)
+            .expect("写入失败");
+        store
+            .add_user_memory_typed("user-v1", "抓取失败时应提示用户", MemoryType::Lesson, 75)
+            .expect("写入失败");
+
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "帮我总结",
+            AgentRunContext::wechat_chat("user-v1", "commit", vec![]),
+        );
+        let (business, _) = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace,
+            MemoryBudget::default(),
+        )
+        .expect("读取业务上下文失败");
+        let business = business.expect("应存在业务上下文");
+
+        assert_eq!(business.user_memories.len(), 3);
+        let labels: Vec<&str> = business
+            .user_memories
+            .iter()
+            .map(|m| m.memory_type.label_prefix())
+            .collect();
+        assert!(labels.contains(&"[偏好]"));
+        assert!(labels.contains(&"[项目]"));
+        assert!(labels.contains(&"[经验]"));
+    }
+
+    #[test]
+    fn memory_budget_trimming_for_typed_memories() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        // 写入 6 条不同类型 memory，max_items=5 应裁剪到 5 条
+        for i in 0..6 {
+            let (content, mtype, priority) = match i % 3 {
+                0 => (format!("偏好 {}", i), MemoryType::UserPreference, 80i64),
+                1 => (format!("项目事实 {}", i), MemoryType::ProjectFact, 85i64),
+                _ => (format!("经验 {}", i), MemoryType::Lesson, 75i64),
+            };
+            store
+                .add_user_memory_typed("user-trim-v1", &content, mtype, priority)
+                .expect("写入失败");
+        }
+
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "帮我总结",
+            AgentRunContext::wechat_chat("user-trim-v1", "commit", vec![]),
+        );
+        let (business, session_state) = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace,
+            MemoryBudget::default(),
+        )
+        .expect("读取业务上下文失败");
+        let business = business.expect("应存在业务上下文");
+
+        assert_eq!(business.user_memories.len(), 5);
+        assert_eq!(session_state.retrieved_count(), 6);
+        assert_eq!(session_state.injected_count(), 5);
+        assert_eq!(session_state.dropped.len(), 1);
+        // project_fact(85) 优先级最高，应被保留
+        assert!(business
+            .user_memories
+            .iter()
+            .any(|m| m.memory_type == MemoryType::ProjectFact));
+    }
+
+    #[test]
+    fn memory_feedback_retrieved_and_injected_are_recorded() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        let created = store
+            .add_user_memory_typed("user-fb", "这是测试记忆", MemoryType::UserPreference, 80)
+            .expect("写入失败");
+
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "帮我总结",
+            AgentRunContext::wechat_chat("user-fb", "commit", vec![]),
+        );
+        let _ = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace,
+            MemoryBudget::default(),
+        )
+        .expect("读取业务上下文失败");
+
+        // 重新打开 DB 验证 feedback 已回写
+        let store2 = TaskStore::open(&db_path).expect("重新打开失败");
+        let memories = store2.list_user_memories("user-fb", 10).expect("查询失败");
+        assert_eq!(memories.len(), 1);
+        let mem = &memories[0];
+        assert_eq!(mem.id, created.id);
+        assert!(
+            mem.retrieved_count > 0,
+            "retrieved_count 应被累加，当前={}",
+            mem.retrieved_count
+        );
+        assert!(
+            mem.injected_count > 0,
+            "injected_count 应被累加，当前={}",
+            mem.injected_count
+        );
+    }
+
+    #[test]
+    fn suppressed_typed_memory_not_injected() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        let created = store
+            .add_user_memory_typed("user-sup", "将被抑制的偏好", MemoryType::UserPreference, 80)
+            .expect("写入失败");
+        store
+            .suppress_memory("user-sup", &created.id)
+            .expect("抑制失败");
+
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "帮我总结",
+            AgentRunContext::wechat_chat("user-sup", "commit", vec![]),
+        );
+        let (business, session_state) = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace,
+            MemoryBudget::default(),
+        )
+        .expect("读取业务上下文失败");
+        let business = business.expect("应存在业务上下文");
+        assert!(business.user_memories.is_empty());
+        assert_eq!(session_state.injected_count(), 0);
+        assert_eq!(session_state.retrieved_count(), 0);
+    }
+
+    #[test]
+    fn trace_contains_typed_memory_observability_fields() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        store
+            .add_user_memory_typed("user-trace", "用户偏好内容", MemoryType::UserPreference, 80)
+            .expect("写入失败");
+        store
+            .add_user_memory_typed("user-trace", "项目事实内容", MemoryType::ProjectFact, 85)
+            .expect("写入失败");
+
+        let mut trace = AgentRunTrace::new(
+            &workspace,
+            "帮我总结",
+            AgentRunContext::wechat_chat("user-trace", "commit", vec![]),
+        );
+        let (_, session_state) = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace,
+            MemoryBudget::default(),
+        )
+        .expect("读取业务上下文失败");
+
+        // 模拟 agent_core 中对 trace 的赋值
+        if session_state.has_memory_activity() {
+            trace.memory_hit_count = session_state.injected_count();
+            trace.memory_retrieved_count = session_state.retrieved_count();
+            trace.memory_total_chars = session_state.injected_total_chars();
+            trace.memory_dropped_count = session_state.dropped.len();
+            trace.memory_ids = session_state.injected_ids();
+        }
+
+        assert_eq!(trace.memory_hit_count, 2);
+        assert_eq!(trace.memory_retrieved_count, 2);
+        assert_eq!(trace.memory_dropped_count, 0);
+        assert_eq!(trace.memory_ids.len(), 2);
+        assert!(trace.memory_total_chars > 0);
+
+        // 验证 trace 渲染包含 memory 字段
+        let rendered = trace.to_markdown();
+        assert!(rendered.contains("memory_hit_count"));
+        assert!(rendered.contains("memory_retrieved_count"));
+        assert!(rendered.contains("memory_dropped_count"));
     }
 
     #[test]

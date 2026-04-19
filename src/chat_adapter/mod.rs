@@ -3,7 +3,7 @@ use crate::command_router;
 use crate::config::{AppConfig, ResolvedBrowserConfig};
 use crate::pipeline::Pipeline;
 use crate::reporter::DailyReporter;
-use crate::scheduler::DailyReportSchedule;
+use crate::scheduler::{DailyReportSchedule, WeeklyReportSchedule};
 use crate::session_router::{FlushReason, SessionEvent, SessionRouter};
 use crate::task_store::{MarkTaskArchivedInput, TaskStore};
 use anyhow::{bail, Context, Result};
@@ -406,6 +406,8 @@ struct WeChatBot {
     context_token_map: HashMap<String, String>,
     daily_report_schedule: Option<DailyReportSchedule>,
     last_daily_report_push_day: Option<String>,
+    weekly_report_schedule: Option<WeeklyReportSchedule>,
+    last_weekly_report_push_week: Option<String>,
     cursor: String,
     seen_ids: HashSet<String>,
     seen_order: VecDeque<String>,
@@ -435,6 +437,8 @@ impl WeChatBot {
             context_token_map: HashMap::new(),
             daily_report_schedule: DailyReportSchedule::from_config(&config)?,
             last_daily_report_push_day: None,
+            weekly_report_schedule: WeeklyReportSchedule::from_config(&config)?,
+            last_weekly_report_push_week: None,
             cursor: String::new(),
             seen_ids: HashSet::new(),
             seen_order: VecDeque::new(),
@@ -458,6 +462,7 @@ impl WeChatBot {
             self.flush_expired_sessions();
             self.process_pending_tasks();
             self.process_scheduled_daily_report_push();
+            self.process_scheduled_weekly_report_push();
 
             let poll_timeout = self.next_poll_timeout();
             match self.client.get_updates(&self.cursor, poll_timeout) {
@@ -584,6 +589,9 @@ impl WeChatBot {
             }
             command_router::RouteIntent::DailyReportQuery { day } => {
                 self.handle_daily_report_query(from_user_id, day.as_deref());
+            }
+            command_router::RouteIntent::WeeklyReportQuery { week } => {
+                self.handle_weekly_report_query(from_user_id, week.as_deref());
             }
             command_router::RouteIntent::TaskStatusQuery { task_id } => {
                 self.handle_task_status_query(from_user_id, &task_id);
@@ -770,7 +778,7 @@ impl WeChatBot {
         }
         if user_text == "帮助" || user_text == "help" {
             return (
-                "可用命令:\n- hello / 你好\n- 时间\n- 帮助 / help\n- 发送链接或 收藏 <url>\n- 状态 <task_id>\n- 最近任务\n- 日报 [YYYY-MM-DD] / 今日整理\n- 记住 <content>\n- 我的记忆\n- 有用 <memory_id>\n- 重试 <task_id>\n- /context [text]\n- /context verbose [text]\n- 其他文字我会 echo 回复"
+                "可用命令:\n- hello / 你好\n- 时间\n- 帮助 / help\n- 发送链接或 收藏 <url>\n- 状态 <task_id>\n- 最近任务\n- 日报 [YYYY-MM-DD] / 今日整理\n- 周报 [YYYY-WW]\n- 记住 <content>\n- 我的记忆\n- 有用 <memory_id>\n- 重试 <task_id>\n- /context [text]\n- /context verbose [text]\n- 其他文字我会 echo 回复"
                     .to_string(),
                 None,
                 None,
@@ -857,6 +865,11 @@ impl WeChatBot {
 
     fn handle_daily_report_query(&self, user_id: &str, day: Option<&str>) {
         let reply = self.build_daily_report_query_reply(day);
+        self.send_reply_text(user_id, &reply);
+    }
+
+    fn handle_weekly_report_query(&self, user_id: &str, week: Option<&str>) {
+        let reply = self.build_weekly_report_query_reply(week);
         self.send_reply_text(user_id, &reply);
     }
 
@@ -961,6 +974,35 @@ impl WeChatBot {
                 }
             }
             Err(err) => format!("生成日报失败: {err}"),
+        }
+    }
+
+    fn build_weekly_report_query_reply(&self, week: Option<&str>) -> String {
+        let week = week
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| self.reporter.current_week());
+        match self.reporter.generate_weekly_for_week(&week) {
+            Ok(report) => {
+                let detailed = std::fs::read_to_string(&report.markdown_path)
+                    .ok()
+                    .map(|content| sanitize_report_markdown_for_wechat(&content));
+                if let Some(content) = detailed {
+                    if content.chars().count() > 3800 {
+                        let truncated: String = content.chars().take(3800).collect();
+                        format!(
+                            "{truncated}\n\n...(已截断，共 {item_count} 条)",
+                            item_count = report.item_count
+                        )
+                    } else {
+                        content
+                    }
+                } else {
+                    report.summary
+                }
+            }
+            Err(err) => format!("生成周报失败: {err}"),
         }
     }
 
@@ -1473,6 +1515,88 @@ impl WeChatBot {
                 "scheduler_daily_report_sent",
                 vec![
                     ("day", json!(day)),
+                    ("user_id", json!(target_user_id)),
+                    ("reply_chars", json!(reply.chars().count())),
+                    ("chunk_total", json!(chunk_total)),
+                ],
+            );
+        }
+    }
+
+    fn process_scheduled_weekly_report_push(&mut self) {
+        let Some(schedule) = &self.weekly_report_schedule else {
+            return;
+        };
+        let Some(week) =
+            schedule.should_run_now(Utc::now(), self.last_weekly_report_push_week.as_deref())
+        else {
+            return;
+        };
+        let reply = self.build_weekly_report_query_reply(Some(&week));
+        let target_user_id = schedule.report_to_user_id().to_string();
+        let token = self
+            .context_token_map
+            .get(&target_user_id)
+            .cloned()
+            .or_else(|| {
+                self.task_store
+                    .get_context_token(&target_user_id)
+                    .ok()
+                    .flatten()
+            });
+        let Some(token) = token else {
+            log_chat_warn(
+                "scheduler_weekly_report_skipped",
+                vec![
+                    ("week", json!(week)),
+                    ("user_id", json!(target_user_id)),
+                    ("error_kind", json!("missing_context_token")),
+                ],
+            );
+            return;
+        };
+
+        let chunks = split_reply_into_chunks(&reply, WECHAT_REPLY_CHUNK_MAX_CHARS);
+        let chunk_total = chunks.len();
+        let mut all_ok = true;
+        for (idx, chunk) in chunks.iter().enumerate() {
+            match self
+                .client
+                .send_text_message(&target_user_id, chunk, &token)
+            {
+                Ok(()) => log_chat_info(
+                    "scheduler_weekly_report_chunk_sent",
+                    vec![
+                        ("week", json!(&week)),
+                        ("user_id", json!(&target_user_id)),
+                        ("chunk_index", json!(idx + 1)),
+                        ("chunk_total", json!(chunk_total)),
+                        ("chunk_chars", json!(chunk.chars().count())),
+                    ],
+                ),
+                Err(err) => {
+                    all_ok = false;
+                    log_chat_error(
+                        "scheduler_weekly_report_send_failed",
+                        vec![
+                            ("week", json!(&week)),
+                            ("user_id", json!(&target_user_id)),
+                            ("chunk_index", json!(idx + 1)),
+                            ("chunk_total", json!(chunk_total)),
+                            ("error_kind", json!("scheduler_weekly_report_send_failed")),
+                            ("detail", json!(err.to_string())),
+                        ],
+                    );
+                    break;
+                }
+            }
+        }
+        if all_ok {
+            self.last_weekly_report_push_week = Some(week.clone());
+            log_chat_info(
+                "scheduler_weekly_report_sent",
+                vec![
+                    ("week", json!(week)),
                     ("user_id", json!(target_user_id)),
                     ("reply_chars", json!(reply.chars().count())),
                     ("chunk_total", json!(chunk_total)),
@@ -2100,6 +2224,8 @@ mod tests {
             context_token_map: HashMap::new(),
             daily_report_schedule: None,
             last_daily_report_push_day: None,
+            weekly_report_schedule: None,
+            last_weekly_report_push_week: None,
             cursor: String::new(),
             seen_ids: HashSet::new(),
             seen_order: VecDeque::new(),
@@ -2611,6 +2737,37 @@ mod tests {
         assert!(reply.contains("Daily Report") || reply.contains("日报"));
         assert!(reply.contains("archived_count: 1"));
         // 不应暴露服务器路径
+        assert!(!reply.contains("markdown_path:"));
+        assert!(!reply.contains("output_path:"));
+    }
+
+    #[test]
+    fn weekly_report_query_builds_reply() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+        let created = bot
+            .task_store
+            .record_link_submission("https://example.com/weekly-query")
+            .expect("写入任务失败");
+        bot.task_store
+            .mark_task_archived(
+                &created.task_id,
+                MarkTaskArchivedInput {
+                    output_path: "/tmp/weekly-query.md",
+                    title: Some("Weekly Query Title"),
+                    page_kind: Some("article"),
+                    snapshot_path: None,
+                    content_source: Some("http"),
+                    summary: Some("weekly summary"),
+                },
+            )
+            .expect("更新 archived 状态失败");
+
+        let week = bot.reporter.current_week();
+        let reply = bot.build_weekly_report_query_reply(Some(&week));
+
+        assert!(reply.contains("Weekly Report") || reply.contains("周报"));
+        assert!(reply.contains("archived_count: 1"));
         assert!(!reply.contains("markdown_path:"));
         assert!(!reply.contains("output_path:"));
     }

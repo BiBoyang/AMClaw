@@ -12,6 +12,7 @@ pub enum RouteIntent {
     UserMemoriesQuery,
     ContextDebugQuery { text: Option<String>, verbose: bool },
     DailyReportQuery { day: Option<String> },
+    WeeklyReportQuery { week: Option<String> },
     TaskStatusQuery { task_id: String },
     LinkSubmission { urls: Vec<String> },
     ChatContinue { text: String },
@@ -60,6 +61,10 @@ pub fn route_text(input: &str) -> RouteIntent {
 
     if let Some(day) = parse_daily_report_query(text) {
         return RouteIntent::DailyReportQuery { day };
+    }
+
+    if let Some(week) = parse_weekly_report_query(text) {
+        return RouteIntent::WeeklyReportQuery { week };
     }
 
     if let Some(task_id) = parse_retry_query(text) {
@@ -144,6 +149,20 @@ fn parse_daily_report_query(input: &str) -> Option<Option<String>> {
         return Some(None);
     }
     Some(Some(day.to_string()))
+}
+
+fn parse_weekly_report_query(input: &str) -> Option<Option<String>> {
+    if matches!(input, "周报" | "weekly report" | "weekly digest") {
+        return Some(None);
+    }
+    let rest = input
+        .strip_prefix("周报 ")
+        .or_else(|| input.strip_prefix("weekly report "))?;
+    let week = rest.trim();
+    if week.is_empty() {
+        return Some(None);
+    }
+    Some(Some(week.to_string()))
 }
 
 fn parse_user_memory_write(input: &str) -> Option<String> {
@@ -383,6 +402,24 @@ mod tests {
             route_text("日报 2026-04-10"),
             RouteIntent::DailyReportQuery {
                 day: Some("2026-04-10".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn weekly_report_command_is_supported() {
+        assert_eq!(
+            route_text("周报"),
+            RouteIntent::WeeklyReportQuery { week: None }
+        );
+        assert_eq!(
+            route_text("weekly report"),
+            RouteIntent::WeeklyReportQuery { week: None }
+        );
+        assert_eq!(
+            route_text("周报 2026-16"),
+            RouteIntent::WeeklyReportQuery {
+                week: Some("2026-16".to_string())
             }
         );
     }

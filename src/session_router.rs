@@ -91,6 +91,7 @@ impl SessionRouter {
             | RouteIntent::UserMemoriesQuery
             | RouteIntent::ContextDebugQuery { .. }
             | RouteIntent::DailyReportQuery { .. }
+            | RouteIntent::WeeklyReportQuery { .. }
             | RouteIntent::TaskStatusQuery { .. }
             | RouteIntent::TaskRetryRequest { .. }
             | RouteIntent::RecentTasksQuery => SessionEvent::Noop,

@@ -1,7 +1,7 @@
 use crate::config::AppConfig;
 use crate::task_store::{ArchivedTaskRecord, TaskStore};
-use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Datelike, Utc};
 use chrono_tz::Tz;
 use serde_json::{json, Value};
 use std::fs;
@@ -10,6 +10,14 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DailyReportOutput {
     pub day: String,
+    pub markdown_path: PathBuf,
+    pub item_count: usize,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeeklyReportOutput {
+    pub week: String,
     pub markdown_path: PathBuf,
     pub item_count: usize,
     pub summary: String,
@@ -46,6 +54,11 @@ impl DailyReporter {
             .to_string()
     }
 
+    pub fn current_week(&self) -> String {
+        let now = Utc::now().with_timezone(&self.timezone);
+        format_week_key(now.iso_week().year(), now.iso_week().week())
+    }
+
     pub fn generate_for_day(&self, day: &str) -> Result<DailyReportOutput> {
         let store = TaskStore::open(&self.db_path)?;
         let archived = store.list_archived_tasks(500)?;
@@ -80,6 +93,43 @@ impl DailyReporter {
             summary,
         })
     }
+
+    pub fn generate_weekly_for_week(&self, week: &str) -> Result<WeeklyReportOutput> {
+        let week = normalize_week_key(week)?;
+        let store = TaskStore::open(&self.db_path)?;
+        let archived = store.list_archived_tasks(2000)?;
+        let entries = archived
+            .into_iter()
+            .filter(|record| {
+                report_week_for_timestamp(&record.updated_at, self.timezone).as_deref()
+                    == Some(week.as_str())
+            })
+            .collect::<Vec<_>>();
+
+        let reports_dir = self.root_dir.join("reports");
+        fs::create_dir_all(&reports_dir)
+            .with_context(|| format!("创建报告目录失败: {}", reports_dir.display()))?;
+        let markdown_path = reports_dir.join(format!("weekly-{week}.md"));
+        let content = render_weekly_report_markdown(&week, &entries);
+        fs::write(&markdown_path, content)
+            .with_context(|| format!("写入周报失败: {}", markdown_path.display()))?;
+
+        let summary = build_weekly_summary(&week, &entries);
+        log_reporter_info(
+            "weekly_report_generated",
+            vec![
+                ("week", json!(week)),
+                ("item_count", json!(entries.len())),
+                ("markdown_path", json!(markdown_path.display().to_string())),
+            ],
+        );
+        Ok(WeeklyReportOutput {
+            week,
+            markdown_path,
+            item_count: entries.len(),
+            summary,
+        })
+    }
 }
 
 fn parse_timezone(raw: &str) -> Result<Tz> {
@@ -95,6 +145,33 @@ fn report_day_for_timestamp(timestamp: &str, timezone: Tz) -> Option<String> {
             .format("%Y-%m-%d")
             .to_string(),
     )
+}
+
+fn report_week_for_timestamp(timestamp: &str, timezone: Tz) -> Option<String> {
+    let parsed = DateTime::parse_from_rfc3339(timestamp).ok()?;
+    let local = parsed.with_timezone(&timezone);
+    Some(format_week_key(
+        local.iso_week().year(),
+        local.iso_week().week(),
+    ))
+}
+
+fn normalize_week_key(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    let (year_raw, week_raw) = raw.split_once('-').context("周报 week 格式应为 YYYY-WW")?;
+    if year_raw.len() != 4 || week_raw.len() != 2 {
+        bail!("周报 week 格式应为 YYYY-WW: {raw}");
+    }
+    let year: i32 = year_raw.parse().context("解析周报年份失败")?;
+    let week: u32 = week_raw.parse().context("解析周报周数失败")?;
+    if !(1..=53).contains(&week) {
+        bail!("周报周数超出范围: {raw}");
+    }
+    Ok(format_week_key(year, week))
+}
+
+fn format_week_key(year: i32, week: u32) -> String {
+    format!("{year:04}-{week:02}")
 }
 
 fn build_daily_summary(day: &str, entries: &[ArchivedTaskRecord]) -> String {
@@ -117,9 +194,76 @@ fn build_daily_summary(day: &str, entries: &[ArchivedTaskRecord]) -> String {
     lines.join("\n")
 }
 
+fn build_weekly_summary(week: &str, entries: &[ArchivedTaskRecord]) -> String {
+    if entries.is_empty() {
+        return format!("周报 {week}\n- 当周没有新的 archived 任务");
+    }
+
+    let mut lines = vec![
+        format!("周报 {week}"),
+        format!("- archived_count: {}", entries.len()),
+    ];
+    for entry in entries.iter().take(8) {
+        let label = entry.title.as_deref().unwrap_or(&entry.normalized_url);
+        if let Some(summary) = &entry.summary {
+            lines.push(format!("- {label} | {}", flatten_summary(summary)));
+        } else {
+            lines.push(format!("- {} | {label}", entry.task_id));
+        }
+    }
+    lines.join("\n")
+}
+
 fn render_daily_report_markdown(day: &str, entries: &[ArchivedTaskRecord]) -> String {
     let mut lines = vec![
         format!("# AMClaw Daily Report {}", day),
+        String::new(),
+        format!("- archived_count: {}", entries.len()),
+        String::new(),
+        "## Archived Tasks".to_string(),
+        String::new(),
+    ];
+
+    if entries.is_empty() {
+        lines.push("- (none)".to_string());
+        lines.push(String::new());
+        return lines.join("\n");
+    }
+
+    for entry in entries {
+        lines.push(format!(
+            "### {}",
+            entry.title.as_deref().unwrap_or(&entry.task_id)
+        ));
+        lines.push(String::new());
+        lines.push(format!("- task_id: {}", entry.task_id));
+        lines.push(format!("- article_id: {}", entry.article_id));
+        lines.push(format!("- url: {}", entry.normalized_url));
+        lines.push(format!(
+            "- content_source: {}",
+            entry.content_source.as_deref().unwrap_or("(none)")
+        ));
+        lines.push(format!(
+            "- page_kind: {}",
+            entry.page_kind.as_deref().unwrap_or("(none)")
+        ));
+        if let Some(summary) = &entry.summary {
+            lines.push(format!("- summary: {}", flatten_summary(summary)));
+        }
+        lines.push(format!(
+            "- output_path: {}",
+            entry.output_path.as_deref().unwrap_or("(none)")
+        ));
+        lines.push(format!("- updated_at: {}", entry.updated_at));
+        lines.push(String::new());
+    }
+
+    lines.join("\n")
+}
+
+fn render_weekly_report_markdown(week: &str, entries: &[ArchivedTaskRecord]) -> String {
+    let mut lines = vec![
+        format!("# AMClaw Weekly Report {}", week),
         String::new(),
         format!("- archived_count: {}", entries.len()),
         String::new(),
@@ -312,5 +456,56 @@ timezone = "Asia/Shanghai"
         ));
         assert!(output.summary.contains("No Summary Article"));
         assert!(!markdown.contains("summary: None"));
+    }
+
+    #[test]
+    fn weekly_report_is_generated_for_archived_tasks() {
+        let root = temp_root();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[storage]
+root_dir = "./data"
+
+[agent]
+timezone = "Asia/Shanghai"
+"#,
+        )
+        .expect("写入配置失败");
+        let config = AppConfig::load_or_create(&config_path).expect("加载配置失败");
+        let db_path = config.db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        let created = store
+            .record_link_submission("https://example.com/weekly-report-item")
+            .expect("写入链接失败");
+        store
+            .mark_task_archived(
+                &created.task_id,
+                MarkTaskArchivedInput {
+                    output_path: "/tmp/weekly-report-item.md",
+                    title: Some("Weekly Item"),
+                    page_kind: Some("article"),
+                    snapshot_path: None,
+                    content_source: Some("http"),
+                    summary: Some("weekly summary"),
+                },
+            )
+            .expect("更新 archived 状态失败");
+
+        let reporter = DailyReporter::from_config(&config).expect("初始化 reporter 失败");
+        let week = reporter.current_week();
+        let output = reporter
+            .generate_weekly_for_week(&week)
+            .expect("生成周报失败");
+        let markdown = fs::read_to_string(&output.markdown_path).expect("读取周报失败");
+
+        assert_eq!(output.week, week);
+        assert_eq!(output.item_count, 1);
+        assert!(markdown.contains("# AMClaw Weekly Report"));
+        assert!(markdown.contains("Weekly Item"));
+        assert!(output.summary.contains("周报"));
+        assert!(output.summary.contains("archived_count: 1"));
     }
 }

@@ -1,7 +1,7 @@
 use crate::config::AppConfig;
-use crate::reporter::{DailyReportOutput, DailyReporter};
+use crate::reporter::{DailyReportOutput, DailyReporter, WeeklyReportOutput};
 use anyhow::{bail, Context, Result};
-use chrono::{Timelike, Utc};
+use chrono::{Datelike, Timelike, Utc};
 use chrono_tz::Tz;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +13,15 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct DailyReportSchedule {
     timezone: Tz,
+    hour: u32,
+    minute: u32,
+    report_to_user_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WeeklyReportSchedule {
+    timezone: Tz,
+    weekday_monday_based: u32,
     hour: u32,
     minute: u32,
     report_to_user_id: String,
@@ -61,6 +70,57 @@ impl DailyReportSchedule {
     }
 }
 
+impl WeeklyReportSchedule {
+    pub fn from_config(config: &AppConfig) -> Result<Option<Self>> {
+        if !config.scheduler.enabled {
+            return Ok(None);
+        }
+        let Some(report_to_user_id) = config
+            .scheduler
+            .report_to_user_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        let timezone = parse_timezone(&config.agent.timezone)?;
+        let (hour, minute) = parse_daily_run_time(&config.scheduler.daily_run_time)?;
+        Ok(Some(Self {
+            timezone,
+            weekday_monday_based: 1,
+            hour,
+            minute,
+            report_to_user_id: report_to_user_id.to_string(),
+        }))
+    }
+
+    pub fn report_to_user_id(&self) -> &str {
+        &self.report_to_user_id
+    }
+
+    pub fn should_run_now(
+        &self,
+        now_utc: chrono::DateTime<Utc>,
+        last_run_week: Option<&str>,
+    ) -> Option<String> {
+        let now = now_utc.with_timezone(&self.timezone);
+        let iso = now.iso_week();
+        let week = format!("{:04}-{:02}", iso.year(), iso.week());
+        if should_run_for_week(
+            &now,
+            self.weekday_monday_based,
+            self.hour,
+            self.minute,
+            last_run_week,
+        ) {
+            Some(week)
+        } else {
+            None
+        }
+    }
+}
+
 pub fn spawn_daily_scheduler(
     config: AppConfig,
     running: Arc<AtomicBool>,
@@ -76,6 +136,7 @@ pub fn spawn_daily_scheduler(
         .name("amclaw-daily-scheduler".to_string())
         .spawn(move || {
             let mut last_run_day: Option<String> = None;
+            let mut last_run_week: Option<String> = None;
             while running.load(Ordering::Relaxed) {
                 let now = Utc::now().with_timezone(&timezone);
                 let day = now.format("%Y-%m-%d").to_string();
@@ -107,6 +168,37 @@ pub fn spawn_daily_scheduler(
                         }
                     }
                 }
+
+                let iso = now.iso_week();
+                let week = format!("{:04}-{:02}", iso.year(), iso.week());
+                if should_run_for_week(&now, 1, hour, minute, last_run_week.as_deref()) {
+                    match reporter.generate_weekly_for_week(&week) {
+                        Ok(output) => {
+                            log_scheduler_info(
+                                "scheduler_weekly_report_generated",
+                                vec![
+                                    ("week", json!(output.week)),
+                                    ("item_count", json!(output.item_count)),
+                                    (
+                                        "markdown_path",
+                                        json!(output.markdown_path.display().to_string()),
+                                    ),
+                                ],
+                            );
+                            last_run_week = Some(week);
+                        }
+                        Err(err) => {
+                            log_scheduler_error(
+                                "scheduler_weekly_report_failed",
+                                vec![
+                                    ("week", json!(week)),
+                                    ("error_kind", json!("scheduler_weekly_report_failed")),
+                                    ("detail", json!(err.to_string())),
+                                ],
+                            );
+                        }
+                    }
+                }
                 thread::sleep(Duration::from_secs(30));
             }
         })
@@ -116,6 +208,10 @@ pub fn spawn_daily_scheduler(
 
 pub fn generate_daily_report_once(config: &AppConfig, day: &str) -> Result<DailyReportOutput> {
     DailyReporter::from_config(config)?.generate_for_day(day)
+}
+
+pub fn generate_weekly_report_once(config: &AppConfig, week: &str) -> Result<WeeklyReportOutput> {
+    DailyReporter::from_config(config)?.generate_weekly_for_week(week)
 }
 
 fn parse_timezone(raw: &str) -> Result<Tz> {
@@ -149,6 +245,28 @@ fn should_run_for_now(
     now.hour() > hour || (now.hour() == hour && now.minute() >= minute)
 }
 
+fn should_run_for_week(
+    now: &chrono::DateTime<Tz>,
+    weekday_monday_based: u32,
+    hour: u32,
+    minute: u32,
+    last_run_week: Option<&str>,
+) -> bool {
+    let iso = now.iso_week();
+    let week = format!("{:04}-{:02}", iso.year(), iso.week());
+    if last_run_week == Some(week.as_str()) {
+        return false;
+    }
+    let now_weekday = now.weekday().number_from_monday();
+    if now_weekday > weekday_monday_based {
+        return true;
+    }
+    if now_weekday < weekday_monday_based {
+        return false;
+    }
+    now.hour() > hour || (now.hour() == hour && now.minute() >= minute)
+}
+
 fn log_scheduler_info(event: &str, fields: Vec<(&str, Value)>) {
     crate::logging::emit_structured_log("info", event, fields);
 }
@@ -159,7 +277,10 @@ fn log_scheduler_error(event: &str, fields: Vec<(&str, Value)>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_daily_run_time, should_run_for_now, DailyReportSchedule};
+    use super::{
+        parse_daily_run_time, should_run_for_now, should_run_for_week, DailyReportSchedule,
+        WeeklyReportSchedule,
+    };
     use crate::config::AppConfig;
     use chrono::TimeZone;
     use chrono_tz::Asia::Shanghai;
@@ -223,6 +344,49 @@ report_to_user_id = "user-a"
         assert_eq!(
             schedule.should_run_now(now, None),
             Some("2026-04-10".to_string())
+        );
+    }
+
+    #[test]
+    fn should_run_weekly_after_target_weekday_and_once_per_week() {
+        let now = Shanghai
+            .with_ymd_and_hms(2026, 4, 13, 9, 31, 0)
+            .single()
+            .expect("构造时间失败");
+        assert!(should_run_for_week(&now, 1, 9, 30, None));
+        assert!(!should_run_for_week(&now, 1, 9, 30, Some("2026-16")));
+    }
+
+    #[test]
+    fn weekly_report_schedule_is_built_from_config() {
+        let root = temp_dir();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[agent]
+timezone = "Asia/Shanghai"
+
+[scheduler]
+enabled = true
+daily_run_time = "09:30"
+report_to_user_id = "user-a"
+"#,
+        )
+        .expect("写入配置失败");
+        let config = AppConfig::load_or_create(&config_path).expect("加载配置失败");
+        let schedule = WeeklyReportSchedule::from_config(&config)
+            .expect("构造 weekly schedule 失败")
+            .expect("应存在 weekly schedule");
+
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 4, 13, 1, 31, 0)
+            .single()
+            .expect("构造 UTC 时间失败");
+        assert_eq!(schedule.report_to_user_id(), "user-a");
+        assert_eq!(
+            schedule.should_run_now(now, None),
+            Some("2026-16".to_string())
         );
     }
 }

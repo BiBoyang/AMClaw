@@ -181,6 +181,9 @@ struct RuntimeSessionStateSnapshot {
     done_items: Vec<String>,
     next_step: Option<String>,
     open_questions: Vec<String>,
+    /// goal 信号来源标记，仅运行时用于 low-signal 判定
+    #[serde(skip)]
+    goal_signal: GoalSignal,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -200,15 +203,21 @@ impl RuntimeSessionStateSnapshot {
             && self.open_questions.is_empty()
     }
 
-    /// 仅有默认 goal、且无其他高信号字段时视为低价值，不注入 prompt
+    /// 仅有默认 goal、且无其他高信号字段时视为低价值，不注入 prompt。
+    /// 判定依据改为 goal_signal 来源标记，不再依赖中文前缀字符串。
     fn is_low_signal(&self) -> bool {
-        self.goal.is_some()
-            && self.current_subtask.is_none()
-            && self.constraints.is_empty()
-            && self.confirmed_facts.is_empty()
-            && self.done_items.is_empty()
-            && self.next_step.is_none()
-            && self.open_questions.is_empty()
+        // 若存在任何数组槽位内容，或 next_step/current_subtask 有值，则非低信号
+        if self.current_subtask.is_some()
+            || self.next_step.is_some()
+            || !self.constraints.is_empty()
+            || !self.confirmed_facts.is_empty()
+            || !self.done_items.is_empty()
+            || !self.open_questions.is_empty()
+        {
+            return false;
+        }
+        // 只剩 goal：按来源标记判定
+        self.goal_signal == GoalSignal::RuntimeDefault
     }
 
     fn to_lines(&self) -> Vec<String> {
@@ -1064,6 +1073,71 @@ fn build_context_pack(
     )
 }
 
+/// goal 信号来源，用于 low-signal 判定（不进 prompt，仅运行时标记）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum GoalSignal {
+    /// 来自持久化 v2 goal（用户或之前 agent 显式写入）
+    PersistentHigh,
+    /// 来自持久化 last_user_intent 的 fallback
+    PersistentFallback,
+    /// 运行时默认模板（无历史状态时的兜底）
+    #[default]
+    RuntimeDefault,
+}
+
+/// 合并持久化数组字段与运行时推导数组，去重并裁剪长度。
+///
+/// 关键改进：保证 runtime 信号至少保留 `runtime_min_keep` 条，
+/// 避免 persistent 项占满预算后 runtime 高价值信号全丢。
+fn merge_string_arrays_with_runtime_reserve(
+    persistent: Vec<String>,
+    runtime: Vec<String>,
+    max_total: usize,
+    runtime_min_keep: usize,
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut merged = Vec::new();
+
+    // 第 1 步：去重收集 runtime 项（内部去重）
+    let mut runtime_unique = Vec::new();
+    for item in runtime {
+        let key = item.trim().to_lowercase();
+        if key.is_empty() || seen.contains(&key) {
+            continue;
+        }
+        seen.insert(key);
+        runtime_unique.push(item);
+    }
+
+    // 第 2 步：保底保留 runtime_min_keep 条 runtime 信号
+    let runtime_keep = runtime_min_keep.min(runtime_unique.len());
+    for item in runtime_unique.drain(..runtime_keep) {
+        merged.push(item);
+    }
+
+    // 第 3 步：填充 persistent 项（已去重于 runtime）
+    for item in persistent {
+        let key = item.trim().to_lowercase();
+        if key.is_empty() || seen.contains(&key) {
+            continue;
+        }
+        seen.insert(key);
+        merged.push(item);
+    }
+
+    // 第 4 步：若仍有空间，补充剩余 runtime 项
+    for item in runtime_unique {
+        if merged.len() >= max_total {
+            break;
+        }
+        merged.push(item);
+    }
+
+    // 第 5 步：兜底截断
+    merged.truncate(max_total);
+    merged
+}
+
 fn derive_runtime_session_state(
     trace: &AgentRunTrace,
     user_input: &str,
@@ -1077,7 +1151,7 @@ fn derive_runtime_session_state(
             PlanStepStatus::Running | PlanStepStatus::Pending | PlanStepStatus::Failed
         )
     });
-    let done_items = trace
+    let runtime_done_items = trace
         .active_plan_steps
         .iter()
         .filter(|step| step.status == PlanStepStatus::Done)
@@ -1085,36 +1159,49 @@ fn derive_runtime_session_state(
         .take(3)
         .collect::<Vec<_>>();
 
-    // 优先从持久化 session_state 推导 goal
-    let goal = if let Some(pss) = persistent_session_state {
-        if let Some(ref intent) = pss.last_user_intent {
-            Some(format!(
-                "响应当前用户请求（基于历史意图）：{}",
-                summarize_for_markdown(intent, 120)
-            ))
+    // goal: 优先从持久化 v2 goal，fallback 到 last_user_intent / 运行时推导
+    // 同时记录来源标记，供 is_low_signal 判定
+    let (goal, goal_signal) =
+        if let Some(g) = persistent_session_state.and_then(|pss| pss.goal.clone()) {
+            (Some(g), GoalSignal::PersistentHigh)
+        } else if let Some(g) = persistent_session_state.and_then(|pss| {
+            pss.last_user_intent.as_ref().map(|intent| {
+                format!(
+                    "响应当前用户请求（基于历史意图）：{}",
+                    summarize_for_markdown(intent, 120)
+                )
+            })
+        }) {
+            (Some(g), GoalSignal::PersistentFallback)
+        } else if let Some(task) = business_context.and_then(|ctx| ctx.current_task.as_ref()) {
+            (
+                Some(format!("推进任务 {} 到下一可收敛状态", task.task_id)),
+                GoalSignal::PersistentFallback,
+            )
+        } else if let Some(current_step) = current_step {
+            (
+                Some(format!("完成当前计划：{}", current_step.description)),
+                GoalSignal::PersistentFallback,
+            )
         } else {
-            Some(format!(
-                "响应当前用户请求：{}",
-                summarize_for_markdown(user_input.trim(), 120)
-            ))
-        }
-    } else if let Some(task) = business_context.and_then(|ctx| ctx.current_task.as_ref()) {
-        Some(format!("推进任务 {} 到下一可收敛状态", task.task_id))
-    } else if let Some(current_step) = current_step {
-        Some(format!("完成当前计划：{}", current_step.description))
-    } else {
-        Some(format!(
-            "响应当前用户请求：{}",
-            summarize_for_markdown(user_input.trim(), 120)
-        ))
-    };
+            (
+                Some(format!(
+                    "响应当前用户请求：{}",
+                    summarize_for_markdown(user_input.trim(), 120)
+                )),
+                GoalSignal::RuntimeDefault,
+            )
+        };
 
-    // 持久化 session_state 的 current_task / next_step 优先
+    // current_subtask: 优先从持久化 v2，fallback 到 current_task / 运行时推导
     let current_subtask = persistent_session_state
-        .and_then(|pss| {
-            pss.current_task
-                .as_ref()
-                .map(|t| format!("当前关注任务: {}", t))
+        .and_then(|pss| pss.current_subtask.clone())
+        .or_else(|| {
+            persistent_session_state.and_then(|pss| {
+                pss.current_task
+                    .as_ref()
+                    .map(|t| format!("当前关注任务: {}", t))
+            })
         })
         .or_else(|| current_step.map(|step| step.description.clone()))
         .or_else(|| {
@@ -1123,49 +1210,61 @@ fn derive_runtime_session_state(
                 .map(|task| format!("处理当前任务状态 {}", task.status))
         });
 
-    let mut constraints = Vec::new();
-    // 持久化 blocked_reason 作为硬约束注入
+    // constraints: 合并持久化 + 运行时推导，去重，最多 4 条，runtime 至少保底 1 条
+    let persistent_constraints = persistent_session_state
+        .map(|pss| pss.constraints())
+        .unwrap_or_default();
+    let mut runtime_constraints = Vec::new();
     if let Some(pss) = persistent_session_state {
         if let Some(ref reason) = pss.blocked_reason {
-            constraints.push(format!("当前阻塞原因（来自历史状态）：{}", reason));
+            runtime_constraints.push(format!("当前阻塞原因（来自历史状态）：{}", reason));
         }
     }
     if trace.controller_state.remaining_replans() == 0 {
-        constraints.push("replan budget 已耗尽，应优先收敛或 ask_user".to_string());
+        runtime_constraints.push("replan budget 已耗尽，应优先收敛或 ask_user".to_string());
     }
     if trace.controller_state.failure_count > 0 {
-        constraints.push(format!(
+        runtime_constraints.push(format!(
             "已有 {} 次失败，避免重复低价值动作",
             trace.controller_state.failure_count
         ));
     }
     if let Some(task) = business_context.and_then(|ctx| ctx.current_task.as_ref()) {
         if task.status == "awaiting_manual_input" {
-            constraints.push("当前任务等待人工补录，不能假装正文已可用".to_string());
+            runtime_constraints.push("当前任务等待人工补录，不能假装正文已可用".to_string());
         }
     }
+    let constraints =
+        merge_string_arrays_with_runtime_reserve(persistent_constraints, runtime_constraints, 4, 1);
 
-    let mut confirmed_facts = Vec::new();
+    // confirmed_facts: 合并持久化 + 运行时推导，去重，最多 5 条，runtime 至少保底 1 条
+    let persistent_facts = persistent_session_state
+        .map(|pss| pss.confirmed_facts())
+        .unwrap_or_default();
+    let mut runtime_facts = Vec::new();
     if let Some(task) = business_context.and_then(|ctx| ctx.current_task.as_ref()) {
-        confirmed_facts.push(format!(
+        runtime_facts.push(format!(
             "current_task={} status={}",
             task.task_id, task.status
         ));
         if let Some(page_kind) = &task.page_kind {
-            confirmed_facts.push(format!("page_kind={}", page_kind));
+            runtime_facts.push(format!("page_kind={}", page_kind));
         }
     }
     if let Some(observation) = observation {
-        confirmed_facts.push(format!(
+        runtime_facts.push(format!(
             "latest_observation={} {}",
             observation.source,
             truncate_for_trace(&observation.content, 80)
         ));
     }
     if trace.memory_hit_count > 0 {
-        confirmed_facts.push(format!("memory_injected={}", trace.memory_hit_count));
+        runtime_facts.push(format!("memory_injected={}", trace.memory_hit_count));
     }
+    let confirmed_facts =
+        merge_string_arrays_with_runtime_reserve(persistent_facts, runtime_facts, 5, 1);
 
+    // next_step: 优先从持久化 v2 next_step，fallback 到现有推导
     let next_step = persistent_session_state
         .and_then(|pss| pss.next_step.clone())
         .or_else(|| current_step.map(|step| step.description.clone()))
@@ -1188,10 +1287,21 @@ fn derive_runtime_session_state(
                 })
         });
 
-    let mut open_questions = Vec::new();
+    // done_items: 合并持久化 + 运行时推导，去重，最多 3 条，runtime 不保底
+    let persistent_done = persistent_session_state
+        .map(|pss| pss.done_items())
+        .unwrap_or_default();
+    let done_items =
+        merge_string_arrays_with_runtime_reserve(persistent_done, runtime_done_items, 3, 0);
+
+    // open_questions: 合并持久化 + 运行时推导，去重，最多 3 条，runtime 至少保底 1 条
+    let persistent_questions = persistent_session_state
+        .map(|pss| pss.open_questions())
+        .unwrap_or_default();
+    let mut runtime_questions = Vec::new();
     if let Some(task) = business_context.and_then(|ctx| ctx.current_task.as_ref()) {
         if let Some(last_error) = &task.last_error {
-            open_questions.push(format!(
+            runtime_questions.push(format!(
                 "是否需要处理最近错误：{}",
                 summarize_for_markdown(last_error, 120)
             ));
@@ -1199,12 +1309,14 @@ fn derive_runtime_session_state(
     }
     if let Some(current_step) = current_step {
         if let Some(expected) = &current_step.expected_observation {
-            open_questions.push(format!(
+            runtime_questions.push(format!(
                 "当前 step 期待的 observation 是否已满足：{}",
                 expected.summary()
             ));
         }
     }
+    let open_questions =
+        merge_string_arrays_with_runtime_reserve(persistent_questions, runtime_questions, 3, 1);
 
     RuntimeSessionStateSnapshot {
         goal,
@@ -1214,6 +1326,7 @@ fn derive_runtime_session_state(
         done_items,
         next_step,
         open_questions,
+        goal_signal,
     }
 }
 
@@ -2216,6 +2329,8 @@ struct AgentRunTrace {
     persistent_state_present: bool,
     persistent_state_source: Option<String>,
     persistent_state_updated: bool,
+    persistent_state_slot_count: usize,
+    persistent_state_preview: Option<String>,
     // --- ContextPack-level observability (C3/C4) ---
     context_pack_present: bool,
     context_pack_section_count: usize,
@@ -2425,6 +2540,28 @@ impl AgentRunTrace {
                 None
             },
             persistent_state_updated: false,
+            persistent_state_slot_count: context
+                .user_session_state
+                .as_ref()
+                .map(|s| s.populated_slot_count())
+                .unwrap_or(0),
+            persistent_state_preview: context
+                .user_session_state
+                .as_ref()
+                .map(|s| {
+                    let mut parts = Vec::new();
+                    if let Some(g) = &s.goal {
+                        parts.push(format!("goal={}", summarize_for_markdown(g, 40)));
+                    }
+                    if let Some(st) = &s.current_subtask {
+                        parts.push(format!("subtask={}", summarize_for_markdown(st, 40)));
+                    }
+                    if s.next_step.is_some() {
+                        parts.push("has_next_step".to_string());
+                    }
+                    parts.join(", ")
+                })
+                .filter(|p| !p.is_empty()),
             context_pack_present: false,
             context_pack_section_count: 0,
             context_pack_total_chars: 0,
@@ -4767,8 +4904,8 @@ mod tests {
         parse_llm_plan, select_previous_observations, validate_expected_observation, AgentCore,
         AgentObservation, AgentRunContext, AgentRunTrace, BusinessContextSnapshot,
         ContextAssembler, ContextPreviewMode, DoneRule, DropReason, ExecutionPlan,
-        ExpectedObservation, FailureAction, FailureDecision, LlmPlan, MemoryBudget, MinimumNovelty,
-        ObservationKind, PlannedDecision, RecoveryOutcome, ReplanScope,
+        ExpectedObservation, FailureAction, FailureDecision, GoalSignal, LlmPlan, MemoryBudget,
+        MinimumNovelty, ObservationKind, PlannedDecision, RecoveryOutcome, ReplanScope,
         RuntimeSessionStateSnapshot, StepFailureKind,
     };
     use crate::context_pack::{ContextSectionChangeReason, ContextSectionKind};
@@ -5969,6 +6106,7 @@ mod tests {
             done_items: vec!["已完成初步读取".to_string(); 3],
             next_step: Some("优先收敛上下文而不是继续膨胀 prompt".to_string()),
             open_questions: vec!["哪些 section 可以先被丢弃".to_string(); 3],
+            goal_signal: GoalSignal::PersistentHigh,
         };
         let mut pack = ContextAssembler::default().build_pack(
             &trace,
@@ -6695,6 +6833,7 @@ mod tests {
             done_items: vec!["已完成初步读取".to_string(); 3],
             next_step: Some("优先收敛上下文而不是继续膨胀 prompt".to_string()),
             open_questions: vec!["哪些 section 可以先被丢弃".to_string(); 3],
+            goal_signal: GoalSignal::PersistentHigh,
         };
         let mut pack = build_context_pack(
             &trace,
@@ -6714,5 +6853,330 @@ mod tests {
 
         assert!(pack.budget_summary().final_total_chars <= 1500);
         assert!(!pack.drop_reasons().is_empty());
+    }
+
+    #[test]
+    fn session_state_v2_all_slots_injected_into_prompt() {
+        let workspace = temp_workspace();
+        let mut trace = AgentRunTrace::new(
+            &workspace,
+            "帮我整理任务",
+            AgentRunContext::wechat_chat("user-v2", "commit", vec![]).with_user_session_state(
+                Some(crate::task_store::UserSessionStateRecord {
+                    user_id: "user-v2".to_string(),
+                    goal: Some("整理待办任务".to_string()),
+                    current_subtask: Some("读取最近任务".to_string()),
+                    next_step: Some("确认是否需要重试".to_string()),
+                    constraints_json: Some(r#"["时间有限","优先高优先级"]"#.to_string()),
+                    confirmed_facts_json: Some(r#"["有3个pending任务"]"#.to_string()),
+                    done_items_json: Some(r#"["已登录"]"#.to_string()),
+                    open_questions_json: Some(r#"["是否需要通知用户"]"#.to_string()),
+                    ..Default::default()
+                }),
+            ),
+        );
+
+        let runtime_session_state =
+            derive_runtime_session_state(&trace, "帮我整理任务", None, None);
+
+        // 7 槽位都应存在
+        assert!(runtime_session_state.goal.is_some());
+        assert!(runtime_session_state.current_subtask.is_some());
+        assert!(!runtime_session_state.constraints.is_empty());
+        assert!(!runtime_session_state.confirmed_facts.is_empty());
+        assert!(!runtime_session_state.done_items.is_empty());
+        assert!(runtime_session_state.next_step.is_some());
+        assert!(!runtime_session_state.open_questions.is_empty());
+        assert!(!runtime_session_state.is_empty());
+        assert!(!runtime_session_state.is_low_signal());
+
+        trace.record_session_state_snapshot(runtime_session_state.clone());
+
+        // 验证 prompt 中确实包含 session state section
+        let pack = build_context_pack(
+            &trace,
+            "帮我整理任务",
+            None,
+            Some(&runtime_session_state),
+            &[],
+            None,
+            SessionSummaryStrategy::Semantic,
+            false,
+        );
+        let rendered = pack.render();
+        assert!(
+            rendered.contains("Session State"),
+            "prompt 应包含 Session State section"
+        );
+        assert!(rendered.contains("goal:"), "prompt 应包含 goal");
+        assert!(
+            rendered.contains("current_subtask:"),
+            "prompt 应包含 current_subtask"
+        );
+    }
+
+    #[test]
+    fn session_state_low_signal_only_for_runtime_default_goal() {
+        let workspace = temp_workspace();
+        // 不设置 persistent goal，让 derive 走 RuntimeDefault 路径
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "你好",
+            AgentRunContext::wechat_chat("user-low", "commit", vec![]),
+        );
+
+        let runtime_session_state = derive_runtime_session_state(&trace, "你好", None, None);
+
+        assert!(!runtime_session_state.is_empty());
+        assert_eq!(
+            runtime_session_state.goal_signal,
+            GoalSignal::RuntimeDefault,
+            "无 persistent state 时应为 RuntimeDefault"
+        );
+        assert!(runtime_session_state.is_low_signal());
+
+        // prompt 中不应出现 Session State section
+        let pack = build_context_pack(
+            &trace,
+            "你好",
+            None,
+            Some(&runtime_session_state),
+            &[],
+            None,
+            SessionSummaryStrategy::Semantic,
+            false,
+        );
+        assert!(
+            !pack.render().contains("Session State"),
+            "低信号 state 不应注入 prompt"
+        );
+    }
+
+    #[test]
+    fn session_state_persistent_goal_not_filtered_even_if_template_like_text() {
+        let workspace = temp_workspace();
+        // persistent goal 是模板类文本，但因来源是 PersistentHigh，不应被过滤
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "你好",
+            AgentRunContext::wechat_chat("user-goal", "commit", vec![]).with_user_session_state(
+                Some(crate::task_store::UserSessionStateRecord {
+                    user_id: "user-goal".to_string(),
+                    goal: Some("响应当前用户请求：你好".to_string()),
+                    ..Default::default()
+                }),
+            ),
+        );
+
+        let runtime_session_state = derive_runtime_session_state(&trace, "你好", None, None);
+
+        assert_eq!(
+            runtime_session_state.goal_signal,
+            GoalSignal::PersistentHigh,
+            "persistent goal 应为 PersistentHigh"
+        );
+        assert!(
+            !runtime_session_state.is_low_signal(),
+            "PersistentHigh 不应被过滤，即使文本像模板"
+        );
+
+        let pack = build_context_pack(
+            &trace,
+            "你好",
+            None,
+            Some(&runtime_session_state),
+            &[],
+            None,
+            SessionSummaryStrategy::Semantic,
+            false,
+        );
+        assert!(pack.render().contains("Session State"));
+    }
+
+    #[test]
+    fn session_state_persistent_fallback_goal_is_not_low_signal() {
+        let workspace = temp_workspace();
+        // 有 last_user_intent 但无 goal，derive 走 PersistentFallback
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "你好",
+            AgentRunContext::wechat_chat("user-fb", "commit", vec![]).with_user_session_state(
+                Some(crate::task_store::UserSessionStateRecord {
+                    user_id: "user-fb".to_string(),
+                    last_user_intent: Some("整理本周待办".to_string()),
+                    ..Default::default()
+                }),
+            ),
+        );
+
+        let runtime_session_state = derive_runtime_session_state(&trace, "你好", None, None);
+
+        assert_eq!(
+            runtime_session_state.goal_signal,
+            GoalSignal::PersistentFallback,
+        );
+        assert!(!runtime_session_state.is_low_signal());
+    }
+
+    #[test]
+    fn trace_contains_session_state_observability_fields() {
+        let workspace = temp_workspace();
+        let trace = AgentRunTrace::new(
+            &workspace,
+            "测试",
+            AgentRunContext::wechat_chat("user-obs", "commit", vec![]).with_user_session_state(
+                Some(crate::task_store::UserSessionStateRecord {
+                    user_id: "user-obs".to_string(),
+                    goal: Some("目标A".to_string()),
+                    current_subtask: Some("子任务B".to_string()),
+                    next_step: Some("下一步C".to_string()),
+                    constraints_json: Some(r#"["约束1"]"#.to_string()),
+                    ..Default::default()
+                }),
+            ),
+        );
+
+        let json = serde_json::to_string_pretty(&trace).expect("序列化失败");
+        let payload: Value = serde_json::from_str(&json).expect("JSON 应合法");
+
+        assert_eq!(payload["persistent_state_present"], true);
+        assert_eq!(payload["persistent_state_source"], "db");
+        assert_eq!(payload["persistent_state_updated"], false);
+        assert_eq!(
+            payload["persistent_state_slot_count"].as_u64().unwrap_or(0),
+            4,
+            "应有 4 个填充槽位"
+        );
+        let preview = payload["persistent_state_preview"]
+            .as_str()
+            .expect("应有 preview");
+        assert!(preview.contains("goal="), "preview 应包含 goal");
+        assert!(preview.contains("subtask="), "preview 应包含 subtask");
+    }
+
+    #[test]
+    fn merge_string_arrays_deduplicates_and_caps_length() {
+        let persistent = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let runtime = vec!["b".to_string(), "d".to_string(), "e".to_string()];
+        let merged = super::merge_string_arrays_with_runtime_reserve(persistent, runtime, 3, 0);
+        assert_eq!(merged.len(), 3);
+        assert!(merged.contains(&"a".to_string()));
+        assert!(merged.contains(&"b".to_string()));
+        assert!(merged.contains(&"c".to_string()));
+        // d 和 e 因长度限制被截断（无 runtime 保底时 persistent 优先）
+    }
+
+    #[test]
+    fn merge_string_arrays_is_case_insensitive_dedup() {
+        let persistent = vec!["Hello".to_string()];
+        let runtime = vec!["hello".to_string(), "HELLO".to_string()];
+        let merged = super::merge_string_arrays_with_runtime_reserve(persistent, runtime, 10, 0);
+        assert_eq!(merged.len(), 1);
+        // runtime 先处理 dedup，保留 runtime 侧的 "hello"
+        assert_eq!(merged[0], "hello");
+    }
+
+    #[test]
+    fn merge_string_arrays_runtime_signal_is_reserved_when_capacity_full() {
+        // persistent 填满预算，runtime 有唯一高价值信号，应保底保留
+        let persistent = vec![
+            "p1".to_string(),
+            "p2".to_string(),
+            "p3".to_string(),
+            "p4".to_string(),
+        ];
+        let runtime = vec!["r1".to_string()];
+        let merged = super::merge_string_arrays_with_runtime_reserve(persistent, runtime, 3, 1);
+        // runtime 保底 1 条，再填 persistent
+        assert_eq!(merged.len(), 3);
+        assert!(
+            merged.contains(&"r1".to_string()),
+            "runtime 信号 r1 应被保底保留"
+        );
+        assert!(
+            merged.contains(&"p1".to_string()),
+            "persistent p1 应在剩余空间中保留"
+        );
+        assert!(
+            merged.contains(&"p2".to_string()),
+            "persistent p2 应在剩余空间中保留"
+        );
+        // p3, p4 因容量限制被截断
+    }
+
+    #[test]
+    fn merge_string_arrays_dedup_still_works_with_reserve() {
+        // runtime 和 persistent 有重复项，去重后 runtime 保底仍应生效
+        let persistent = vec!["shared".to_string(), "p1".to_string(), "p2".to_string()];
+        let runtime = vec!["shared".to_string(), "r1".to_string()];
+        let merged = super::merge_string_arrays_with_runtime_reserve(persistent, runtime, 2, 1);
+        assert_eq!(merged.len(), 2);
+        // runtime 先 dedup：shared 和 r1 进入 runtime_unique
+        // 保底 drain 1 条：shared（runtime 侧首次出现）
+        // persistent 去重后填剩余：p1（shared 被 dedup）
+        assert!(
+            merged.contains(&"shared".to_string()),
+            "runtime 侧的 shared 应被保底保留"
+        );
+        assert!(
+            merged.contains(&"p1".to_string()),
+            "persistent p1 应在剩余空间保留"
+        );
+    }
+
+    #[test]
+    fn derive_runtime_session_state_merges_persistent_and_runtime() {
+        let workspace = temp_workspace();
+        let mut trace = AgentRunTrace::new(
+            &workspace,
+            "测试",
+            AgentRunContext::wechat_chat("user-merge", "commit", vec![]).with_user_session_state(
+                Some(crate::task_store::UserSessionStateRecord {
+                    user_id: "user-merge".to_string(),
+                    goal: Some("持久化目标".to_string()),
+                    current_subtask: Some("持久化子任务".to_string()),
+                    next_step: Some("持久化下一步".to_string()),
+                    constraints_json: Some(r#"["持久化约束"]"#.to_string()),
+                    confirmed_facts_json: Some(r#"["持久化事实"]"#.to_string()),
+                    done_items_json: Some(r#"["持久化完成"]"#.to_string()),
+                    open_questions_json: Some(r#"["持久化问题"]"#.to_string()),
+                    ..Default::default()
+                }),
+            ),
+        );
+        // 添加一个 done step 来测试合并
+        trace.active_plan_steps.push(super::RuntimePlanStep {
+            description: "运行时完成项".to_string(),
+            status: super::PlanStepStatus::Done,
+            expected_observation: None,
+            retry_count: 0,
+        });
+
+        let snapshot = derive_runtime_session_state(&trace, "测试", None, None);
+
+        assert_eq!(snapshot.goal, Some("持久化目标".to_string()));
+        assert_eq!(snapshot.current_subtask, Some("持久化子任务".to_string()));
+        assert_eq!(snapshot.next_step, Some("持久化下一步".to_string()));
+        assert!(
+            snapshot.constraints.contains(&"持久化约束".to_string()),
+            "constraints 应包含持久化值"
+        );
+        assert!(
+            snapshot.confirmed_facts.contains(&"持久化事实".to_string()),
+            "confirmed_facts 应包含持久化值"
+        );
+        assert!(
+            snapshot.done_items.contains(&"持久化完成".to_string()),
+            "done_items 应包含持久化值"
+        );
+        assert!(
+            snapshot.open_questions.contains(&"持久化问题".to_string()),
+            "open_questions 应包含持久化值"
+        );
+        // 运行时 done step 也应合并进来
+        assert!(
+            snapshot.done_items.contains(&"运行时完成项".to_string()),
+            "done_items 应包含运行时值"
+        );
     }
 }

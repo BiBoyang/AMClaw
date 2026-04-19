@@ -847,9 +847,18 @@ impl WeChatBot {
         } else {
             crate::agent_core::ContextPreviewMode::Summary
         };
+
+        // 加载持久化 session state 供预览（只读，不破坏已持久化 state）
+        let session_state = self
+            .task_store
+            .load_user_session_state(user_id)
+            .ok()
+            .flatten();
         let context = AgentRunContext::wechat_chat(user_id, "context_debug", message_ids)
             .with_session_text(&merged_text)
-            .with_context_token_present(self.context_token_map.contains_key(user_id));
+            .with_context_token_present(self.context_token_map.contains_key(user_id))
+            .with_user_session_state(session_state);
+
         let reply = match if matches!(mode, crate::agent_core::ContextPreviewMode::Summary) {
             self.agent_core
                 .preview_context_with_context(&merged_text, context)
@@ -1131,7 +1140,14 @@ impl WeChatBot {
         }
     }
 
-    /// C2: 在 session flush 时更新 last_user_intent
+    /// C2: 在 session flush 时更新 session state（v2，保守更新策略）
+    ///
+    /// 更新规则（宁缺毋滥）：
+    /// - goal: 来自最近用户意图（截断到 120 字符）
+    /// - current_subtask: 来自当前意图或保留已有值
+    /// - next_step: 保留已有值（由 agent 运行时推导更新）
+    /// - 数组槽位（constraints/confirmed_facts/done_items/open_questions）：
+    ///   只在有明确来源时更新，不强行猜测
     fn update_session_state_intent(&mut self, user_id: &str, merged_text: &str) {
         let now = Utc::now().to_rfc3339();
         let intent_preview = if merged_text.chars().count() > 120 {
@@ -1140,22 +1156,22 @@ impl WeChatBot {
         } else {
             merged_text.to_string()
         };
-        let record = match self.task_store.load_user_session_state(user_id) {
-            Ok(Some(existing)) => crate::task_store::UserSessionStateRecord {
-                user_id: user_id.to_string(),
-                last_user_intent: Some(intent_preview),
-                current_task: existing.current_task,
-                next_step: existing.next_step,
-                blocked_reason: existing.blocked_reason,
-                updated_at: now,
-            },
+
+        let mut record = match self.task_store.load_user_session_state(user_id) {
+            Ok(Some(existing)) => existing,
             Ok(None) => crate::task_store::UserSessionStateRecord {
                 user_id: user_id.to_string(),
-                last_user_intent: Some(intent_preview),
+                last_user_intent: None,
                 current_task: None,
                 next_step: None,
                 blocked_reason: None,
-                updated_at: now,
+                goal: None,
+                current_subtask: None,
+                constraints_json: None,
+                confirmed_facts_json: None,
+                done_items_json: None,
+                open_questions_json: None,
+                updated_at: now.clone(),
             },
             Err(err) => {
                 log_chat_warn(
@@ -1169,6 +1185,16 @@ impl WeChatBot {
                 return;
             }
         };
+
+        // 保守更新：只更新有明确来源的字段
+        record.last_user_intent = Some(intent_preview.clone());
+        record.goal = Some(format!("响应当前用户请求：{}", intent_preview));
+        // current_subtask: 若已有则保留，否则设为用户意图
+        if record.current_subtask.is_none() {
+            record.current_subtask = Some(intent_preview.clone());
+        }
+        record.updated_at = now;
+
         if let Err(err) = self.task_store.upsert_user_session_state(&record) {
             log_chat_warn(
                 "session_state_intent_update_failed",
@@ -1183,10 +1209,8 @@ impl WeChatBot {
                 "session_state_upserted",
                 vec![
                     ("user_id", json!(user_id)),
-                    (
-                        "intent_preview",
-                        json!(record.last_user_intent.unwrap_or_default()),
-                    ),
+                    ("intent_preview", json!(intent_preview)),
+                    ("v2_slots_populated", json!(record.populated_slot_count())),
                 ],
             );
         }
@@ -1281,7 +1305,7 @@ impl WeChatBot {
         let (reply, run_id, trace_json_path) =
             self.generate_reply(user_id, merged_text, message_ids, reason, context);
 
-        // C2: agent 完成后回写 updated_at（最小回写，不推导深状态）
+        // C2: agent 完成后刷新 updated_at（最小回写，不推导深状态）
         let mut state_updated = false;
         match self.task_store.load_user_session_state(user_id) {
             Ok(Some(state)) => {
@@ -1299,8 +1323,12 @@ impl WeChatBot {
                 } else {
                     state_updated = true;
                     log_chat_info(
-                        "session_state_upserted",
-                        vec![("user_id", json!(user_id)), ("state_updated", json!(true))],
+                        "session_state_refreshed",
+                        vec![
+                            ("user_id", json!(user_id)),
+                            ("state_updated", json!(true)),
+                            ("v2_slots_populated", json!(updated.populated_slot_count())),
+                        ],
                     );
                 }
             }
@@ -3123,6 +3151,7 @@ mod tests {
             next_step: Some("等待回复".to_string()),
             blocked_reason: None,
             updated_at: "2026-04-17T10:00:00Z".to_string(),
+            ..Default::default()
         };
         bot.task_store
             .upsert_user_session_state(&record)
@@ -3173,6 +3202,7 @@ mod tests {
             next_step: None,
             blocked_reason: None,
             updated_at: "2026-04-01T00:00:00Z".to_string(),
+            ..Default::default()
         };
         bot.task_store
             .upsert_user_session_state(&old)
@@ -3216,6 +3246,83 @@ mod tests {
             .expect("应存在");
         assert_eq!(state_a.last_user_intent, Some("A 的消息".to_string()));
         assert_eq!(state_b.last_user_intent, Some("B 的消息".to_string()));
+    }
+
+    #[test]
+    fn session_state_v2_fields_written_on_flush() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        bot.update_session_state_intent("user-a", "帮我整理本周待办");
+
+        let state = bot
+            .task_store
+            .load_user_session_state("user-a")
+            .expect("加载失败")
+            .expect("应存在");
+        assert_eq!(state.last_user_intent, Some("帮我整理本周待办".to_string()));
+        assert_eq!(
+            state.goal,
+            Some("响应当前用户请求：帮我整理本周待办".to_string())
+        );
+        assert_eq!(state.current_subtask, Some("帮我整理本周待办".to_string()));
+        assert!(!state.is_v2_empty() || state.goal.is_some());
+    }
+
+    #[test]
+    fn context_debug_does_not_corrupt_persistent_state() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        // 预写入一条带 v2 字段的 session state
+        let record = crate::task_store::UserSessionStateRecord {
+            user_id: "user-a".to_string(),
+            goal: Some("整理任务".to_string()),
+            current_subtask: Some("读取任务".to_string()),
+            next_step: Some("确认状态".to_string()),
+            constraints_json: Some(r#"["时间有限"]"#.to_string()),
+            confirmed_facts_json: Some(r#"["有3个pending"]"#.to_string()),
+            ..Default::default()
+        };
+        bot.task_store
+            .upsert_user_session_state(&record)
+            .expect("预写入失败");
+
+        // 通过 handle_message 触发 /context 查询
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "/context 测试".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-cd-1".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        // 验证持久化 state 未被破坏
+        let after = bot
+            .task_store
+            .load_user_session_state("user-a")
+            .expect("加载失败")
+            .expect("应存在");
+        assert_eq!(after.goal, Some("整理任务".to_string()));
+        assert_eq!(after.current_subtask, Some("读取任务".to_string()));
+        assert_eq!(after.next_step, Some("确认状态".to_string()));
+        assert_eq!(after.constraints(), vec!["时间有限"]);
+        assert_eq!(after.confirmed_facts(), vec!["有3个pending"]);
+    }
+
+    #[test]
+    fn no_session_state_does_not_panic() {
+        let db_path = temp_db_path();
+        let bot = test_bot(&db_path);
+
+        // 无持久化 state 时调用 send_generated_reply 不应 panic
+        // 使用一个不需要 agent 运行的命令来避免实际调用 LLM
+        // 这里只验证 load_user_session_state 返回 None 时不会崩溃
+        let state = bot
+            .task_store
+            .load_user_session_state("user-a")
+            .expect("查询不应失败");
+        assert!(state.is_none());
     }
 
     // ===== 分段发送与处理中回执测试 =====

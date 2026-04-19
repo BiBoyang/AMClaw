@@ -203,14 +203,118 @@ pub struct UserMemoryRecord {
 }
 
 /// 用户会话结构化状态（跨会话持久化）
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// v2 新增 7-slot 完整 session state 字段：
+/// - goal, current_subtask, next_step: Option<String>
+/// - constraints, confirmed_facts, done_items, open_questions: JSON TEXT 数组
+///
+/// 旧字段（last_user_intent, current_task, blocked_reason）保留兼容。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UserSessionStateRecord {
     pub user_id: String,
     pub last_user_intent: Option<String>,
     pub current_task: Option<String>,
     pub next_step: Option<String>,
     pub blocked_reason: Option<String>,
+    // v2: 7-slot session state
+    pub goal: Option<String>,
+    pub current_subtask: Option<String>,
+    pub constraints_json: Option<String>,
+    pub confirmed_facts_json: Option<String>,
+    pub done_items_json: Option<String>,
+    pub open_questions_json: Option<String>,
     pub updated_at: String,
+}
+
+impl UserSessionStateRecord {
+    /// 从 JSON 字符串解析字符串数组（内部辅助）
+    fn parse_json_array(json_str: &Option<String>) -> Vec<String> {
+        match json_str {
+            Some(s) if !s.trim().is_empty() => {
+                serde_json::from_str::<Vec<String>>(s).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// 将字符串数组序列化为 JSON（内部辅助）
+    fn serialize_json_array(items: &[String]) -> Option<String> {
+        if items.is_empty() {
+            None
+        } else {
+            serde_json::to_string(items).ok()
+        }
+    }
+
+    pub fn constraints(&self) -> Vec<String> {
+        Self::parse_json_array(&self.constraints_json)
+    }
+
+    pub fn set_constraints(&mut self, items: Vec<String>) {
+        self.constraints_json = Self::serialize_json_array(&items);
+    }
+
+    pub fn confirmed_facts(&self) -> Vec<String> {
+        Self::parse_json_array(&self.confirmed_facts_json)
+    }
+
+    pub fn set_confirmed_facts(&mut self, items: Vec<String>) {
+        self.confirmed_facts_json = Self::serialize_json_array(&items);
+    }
+
+    pub fn done_items(&self) -> Vec<String> {
+        Self::parse_json_array(&self.done_items_json)
+    }
+
+    pub fn set_done_items(&mut self, items: Vec<String>) {
+        self.done_items_json = Self::serialize_json_array(&items);
+    }
+
+    pub fn open_questions(&self) -> Vec<String> {
+        Self::parse_json_array(&self.open_questions_json)
+    }
+
+    pub fn set_open_questions(&mut self, items: Vec<String>) {
+        self.open_questions_json = Self::serialize_json_array(&items);
+    }
+
+    /// 返回 7 槽位中非空字段的数量（用于 trace 观测）
+    pub fn populated_slot_count(&self) -> usize {
+        let mut count = 0;
+        if self.goal.is_some() {
+            count += 1;
+        }
+        if self.current_subtask.is_some() {
+            count += 1;
+        }
+        if self.constraints_json.is_some() {
+            count += 1;
+        }
+        if self.confirmed_facts_json.is_some() {
+            count += 1;
+        }
+        if self.done_items_json.is_some() {
+            count += 1;
+        }
+        if self.next_step.is_some() {
+            count += 1;
+        }
+        if self.open_questions_json.is_some() {
+            count += 1;
+        }
+        count
+    }
+
+    /// 7 槽位是否全部为空
+    pub fn is_v2_empty(&self) -> bool {
+        self.goal.is_none()
+            && self.current_subtask.is_none()
+            && self.constraints_json.is_none()
+            && self.confirmed_facts_json.is_none()
+            && self.done_items_json.is_none()
+            && self.next_step.is_none()
+            && self.open_questions_json.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -554,12 +658,24 @@ impl TaskStore {
 
     // ---- UserSessionState API ----
 
-    /// 加载用户会话结构化状态
+    /// 加载用户会话结构化状态（v2，含 7-slot 完整字段）
     pub fn load_user_session_state(&self, user_id: &str) -> Result<Option<UserSessionStateRecord>> {
         self.conn
             .query_row(
                 r#"
-                SELECT user_id, last_user_intent, current_task, next_step, blocked_reason, updated_at
+                SELECT
+                    user_id,
+                    last_user_intent,
+                    current_task,
+                    next_step,
+                    blocked_reason,
+                    goal,
+                    current_subtask,
+                    constraints_json,
+                    confirmed_facts_json,
+                    done_items_json,
+                    open_questions_json,
+                    updated_at
                 FROM user_session_states WHERE user_id = ?1
                 "#,
                 [user_id],
@@ -570,7 +686,13 @@ impl TaskStore {
                         current_task: row.get(2)?,
                         next_step: row.get(3)?,
                         blocked_reason: row.get(4)?,
-                        updated_at: row.get(5)?,
+                        goal: row.get(5)?,
+                        current_subtask: row.get(6)?,
+                        constraints_json: row.get(7)?,
+                        confirmed_facts_json: row.get(8)?,
+                        done_items_json: row.get(9)?,
+                        open_questions_json: row.get(10)?,
+                        updated_at: row.get(11)?,
                     })
                 },
             )
@@ -578,7 +700,7 @@ impl TaskStore {
             .context("加载 user_session_state 失败")
     }
 
-    /// 覆盖写入用户会话结构化状态
+    /// 覆盖写入用户会话结构化状态（v2，含 7-slot 完整字段）
     pub fn upsert_user_session_state(&mut self, record: &UserSessionStateRecord) -> Result<()> {
         let user_id = record.user_id.trim();
         if user_id.is_empty() {
@@ -587,13 +709,23 @@ impl TaskStore {
         self.conn
             .execute(
                 r#"
-                INSERT INTO user_session_states (user_id, last_user_intent, current_task, next_step, blocked_reason, updated_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                INSERT INTO user_session_states (
+                    user_id, last_user_intent, current_task, next_step, blocked_reason,
+                    goal, current_subtask, constraints_json, confirmed_facts_json,
+                    done_items_json, open_questions_json, updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                 ON CONFLICT(user_id) DO UPDATE SET
                     last_user_intent = excluded.last_user_intent,
                     current_task = excluded.current_task,
                     next_step = excluded.next_step,
                     blocked_reason = excluded.blocked_reason,
+                    goal = excluded.goal,
+                    current_subtask = excluded.current_subtask,
+                    constraints_json = excluded.constraints_json,
+                    confirmed_facts_json = excluded.confirmed_facts_json,
+                    done_items_json = excluded.done_items_json,
+                    open_questions_json = excluded.open_questions_json,
                     updated_at = excluded.updated_at
                 "#,
                 params![
@@ -602,6 +734,12 @@ impl TaskStore {
                     record.current_task,
                     record.next_step,
                     record.blocked_reason,
+                    record.goal,
+                    record.current_subtask,
+                    record.constraints_json,
+                    record.confirmed_facts_json,
+                    record.done_items_json,
+                    record.open_questions_json,
                     record.updated_at,
                 ],
             )
@@ -1616,6 +1754,12 @@ impl TaskStore {
                 current_task     TEXT,
                 next_step        TEXT,
                 blocked_reason   TEXT,
+                goal             TEXT,
+                current_subtask  TEXT,
+                constraints_json TEXT,
+                confirmed_facts_json TEXT,
+                done_items_json  TEXT,
+                open_questions_json TEXT,
                 updated_at       DATETIME NOT NULL
             );
 
@@ -1687,6 +1831,28 @@ impl TaskStore {
             "user_memories",
             "useful",
             "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        // v2 session state 字段迁移
+        ensure_column_exists(&self.conn, "user_session_states", "goal", "TEXT")?;
+        ensure_column_exists(&self.conn, "user_session_states", "current_subtask", "TEXT")?;
+        ensure_column_exists(
+            &self.conn,
+            "user_session_states",
+            "constraints_json",
+            "TEXT",
+        )?;
+        ensure_column_exists(
+            &self.conn,
+            "user_session_states",
+            "confirmed_facts_json",
+            "TEXT",
+        )?;
+        ensure_column_exists(&self.conn, "user_session_states", "done_items_json", "TEXT")?;
+        ensure_column_exists(
+            &self.conn,
+            "user_session_states",
+            "open_questions_json",
+            "TEXT",
         )?;
         Ok(())
     }
@@ -3544,6 +3710,7 @@ mod tests {
             next_step: Some("等待用户确认".to_string()),
             blocked_reason: None,
             updated_at: "2026-04-17T10:00:00Z".to_string(),
+            ..Default::default()
         };
         store.upsert_user_session_state(&record).expect("写入失败");
 
@@ -3570,6 +3737,7 @@ mod tests {
             next_step: Some("步骤1".to_string()),
             blocked_reason: None,
             updated_at: "2026-04-17T10:00:00Z".to_string(),
+            ..Default::default()
         };
         store.upsert_user_session_state(&first).expect("写入失败");
 
@@ -3580,6 +3748,7 @@ mod tests {
             next_step: Some("步骤2".to_string()),
             blocked_reason: Some("等待人工输入".to_string()),
             updated_at: "2026-04-17T11:00:00Z".to_string(),
+            ..Default::default()
         };
         store.upsert_user_session_state(&second).expect("更新失败");
 
@@ -3606,6 +3775,7 @@ mod tests {
             next_step: None,
             blocked_reason: None,
             updated_at: "2026-04-17T10:00:00Z".to_string(),
+            ..Default::default()
         };
         let record_b = UserSessionStateRecord {
             user_id: "user-b".to_string(),
@@ -3614,6 +3784,7 @@ mod tests {
             next_step: None,
             blocked_reason: None,
             updated_at: "2026-04-17T10:00:00Z".to_string(),
+            ..Default::default()
         };
         store
             .upsert_user_session_state(&record_a)
@@ -3646,6 +3817,7 @@ mod tests {
             next_step: None,
             blocked_reason: None,
             updated_at: "2026-04-17T10:00:00Z".to_string(),
+            ..Default::default()
         };
         store.upsert_user_session_state(&record).expect("写入失败");
         assert!(store.load_user_session_state("user-a").unwrap().is_some());
@@ -3666,6 +3838,7 @@ mod tests {
             next_step: None,
             blocked_reason: None,
             updated_at: "2026-04-17T10:00:00Z".to_string(),
+            ..Default::default()
         };
         let err = store
             .upsert_user_session_state(&record)
@@ -3685,6 +3858,7 @@ mod tests {
             next_step: None,
             blocked_reason: None,
             updated_at: "2026-04-17T10:00:00Z".to_string(),
+            ..Default::default()
         };
         store.upsert_user_session_state(&record).expect("写入失败");
 
@@ -3710,6 +3884,7 @@ mod tests {
                 next_step: None,
                 blocked_reason: Some("blocked".to_string()),
                 updated_at: "2026-04-17T12:00:00Z".to_string(),
+                ..Default::default()
             };
             store.upsert_user_session_state(&record).expect("写入失败");
         }
@@ -3722,5 +3897,109 @@ mod tests {
         assert_eq!(loaded.last_user_intent, Some("持久化测试".to_string()));
         assert_eq!(loaded.current_task, Some("task-xyz".to_string()));
         assert_eq!(loaded.blocked_reason, Some("blocked".to_string()));
+    }
+
+    #[test]
+    fn user_session_state_v2_fields_round_trip() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+
+        let mut record = UserSessionStateRecord {
+            user_id: "user-a".to_string(),
+            last_user_intent: Some("测试意图".to_string()),
+            current_task: Some("task-v2".to_string()),
+            next_step: Some("下一步".to_string()),
+            blocked_reason: None,
+            goal: Some("完成目标".to_string()),
+            current_subtask: Some("当前子任务".to_string()),
+            constraints_json: Some(r#"["约束1","约束2"]"#.to_string()),
+            confirmed_facts_json: Some(r#"["事实A","事实B"]"#.to_string()),
+            done_items_json: Some(r#"["完成1"]"#.to_string()),
+            open_questions_json: Some(r#"["问题1","问题2"]"#.to_string()),
+            updated_at: "2026-04-17T10:00:00Z".to_string(),
+        };
+        store.upsert_user_session_state(&record).expect("写入失败");
+
+        let loaded = store
+            .load_user_session_state("user-a")
+            .expect("加载失败")
+            .expect("应存在");
+        assert_eq!(loaded.goal, Some("完成目标".to_string()));
+        assert_eq!(loaded.current_subtask, Some("当前子任务".to_string()));
+        assert_eq!(loaded.constraints(), vec!["约束1", "约束2"]);
+        assert_eq!(loaded.confirmed_facts(), vec!["事实A", "事实B"]);
+        assert_eq!(loaded.done_items(), vec!["完成1"]);
+        assert_eq!(loaded.open_questions(), vec!["问题1", "问题2"]);
+        assert_eq!(loaded.populated_slot_count(), 7);
+        assert!(!loaded.is_v2_empty());
+
+        // 测试 set_ 方法
+        record.set_constraints(vec!["新约束".to_string()]);
+        record.set_confirmed_facts(vec![]);
+        record.set_done_items(vec!["完成A".to_string(), "完成B".to_string()]);
+        record.set_open_questions(vec![]);
+        store.upsert_user_session_state(&record).expect("更新失败");
+
+        let loaded2 = store
+            .load_user_session_state("user-a")
+            .expect("加载失败")
+            .expect("应存在");
+        assert_eq!(loaded2.constraints(), vec!["新约束"]);
+        assert!(loaded2.confirmed_facts_json.is_none());
+        assert_eq!(loaded2.done_items(), vec!["完成A", "完成B"]);
+        assert!(loaded2.open_questions_json.is_none());
+    }
+
+    #[test]
+    fn user_session_state_v2_migration_on_existing_db() {
+        // 模拟旧 DB（无 v2 字段），重新打开应自动迁移
+        let db_path = temp_db_path();
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("打开失败");
+            conn.execute(
+                "CREATE TABLE user_session_states (
+                    user_id TEXT PRIMARY KEY,
+                    last_user_intent TEXT,
+                    current_task TEXT,
+                    next_step TEXT,
+                    blocked_reason TEXT,
+                    updated_at DATETIME NOT NULL
+                )",
+                [],
+            )
+            .expect("建旧表失败");
+            conn.execute(
+                "INSERT INTO user_session_states (user_id, last_user_intent, updated_at)
+                 VALUES ('user-a', '旧意图', '2026-04-01T00:00:00Z')",
+                [],
+            )
+            .expect("插入旧数据失败");
+        }
+
+        let store = TaskStore::open(&db_path).expect("重新打开失败");
+        let loaded = store
+            .load_user_session_state("user-a")
+            .expect("加载失败")
+            .expect("应存在");
+        assert_eq!(loaded.last_user_intent, Some("旧意图".to_string()));
+        assert_eq!(loaded.goal, None);
+        assert_eq!(loaded.constraints_json, None);
+        assert!(loaded.is_v2_empty());
+
+        // 写入 v2 数据应成功
+        let mut store = TaskStore::open(&db_path).expect("重新打开失败");
+        let mut record = loaded.clone();
+        record.goal = Some("新目标".to_string());
+        record.set_constraints(vec!["约束".to_string()]);
+        store
+            .upsert_user_session_state(&record)
+            .expect("v2 写入失败");
+
+        let loaded2 = store
+            .load_user_session_state("user-a")
+            .expect("加载失败")
+            .expect("应存在");
+        assert_eq!(loaded2.goal, Some("新目标".to_string()));
+        assert_eq!(loaded2.constraints(), vec!["约束"]);
     }
 }

@@ -29,6 +29,13 @@ const TRIM_SEEN_IDS_TO: usize = 500;
 const DEFAULT_GET_UPDATES_TIMEOUT: Duration = Duration::from_secs(70);
 const MIN_GET_UPDATES_TIMEOUT: Duration = Duration::from_millis(200);
 
+/// 微信单条消息最大字符数（超过则自动分段）
+const WECHAT_REPLY_CHUNK_MAX_CHARS: usize = 1200;
+/// 触发“处理中”回执的最小输入长度
+const PROCESSING_ACK_MIN_INPUT_CHARS: usize = 180;
+/// 长任务处理中回执文案
+const PROCESSING_ACK_TEXT: &str = "收到，处理中，稍后给你完整回复。";
+
 pub fn run(
     config: AppConfig,
     browser: Option<ResolvedBrowserConfig>,
@@ -693,9 +700,11 @@ impl WeChatBot {
         message_ids: &[String],
         reason: FlushReason,
         trace_context: AgentRunContext,
-    ) -> (String, Option<String>) {
+    ) -> (String, Option<String>, Option<std::path::PathBuf>) {
         match self.agent_core.run_with_context(user_text, trace_context) {
-            Ok(result) => return (result.output, Some(result.run_id)),
+            Ok(result) => {
+                return (result.output, Some(result.run_id), result.trace_json_path);
+            }
             Err(err) => {
                 let err_text = err.to_string();
                 if is_agent_command(user_text) {
@@ -710,7 +719,7 @@ impl WeChatBot {
                             ("detail", json!(err_text.clone())),
                         ],
                     );
-                    return (format!("执行失败: {err_text}"), None);
+                    return (format!("执行失败: {err_text}"), None, None);
                 }
                 if is_llm_auth_error(&err_text) {
                     log_chat_warn(
@@ -727,6 +736,7 @@ impl WeChatBot {
                     return (
                         "LLM 鉴权失败（401），请检查 MOONSHOT_* / DEEPSEEK_* / OPENAI_* 配置"
                             .to_string(),
+                        None,
                         None,
                     );
                 }
@@ -747,20 +757,26 @@ impl WeChatBot {
             return (
                 "你好！我是 iLink Bot Demo（Rust版），有什么可以帮你的？".to_string(),
                 None,
+                None,
             );
         }
         if user_text == "时间" || user_text == "几点了" {
             let now = Utc::now().with_timezone(&Shanghai);
-            return (format!("现在是 {}", now.format("%Y-%m-%d %H:%M:%S")), None);
+            return (
+                format!("现在是 {}", now.format("%Y-%m-%d %H:%M:%S")),
+                None,
+                None,
+            );
         }
         if user_text == "帮助" || user_text == "help" {
             return (
                 "可用命令:\n- hello / 你好\n- 时间\n- 帮助 / help\n- 发送链接或 收藏 <url>\n- 状态 <task_id>\n- 最近任务\n- 日报 [YYYY-MM-DD] / 今日整理\n- 记住 <content>\n- 我的记忆\n- 有用 <memory_id>\n- 重试 <task_id>\n- /context [text]\n- /context verbose [text]\n- 其他文字我会 echo 回复"
                     .to_string(),
                 None,
+                None,
             );
         }
-        (format!("Echo: {user_text}"), None)
+        (format!("Echo: {user_text}"), None, None)
     }
 
     fn handle_link_submission(&mut self, user_id: &str, urls: Vec<String>) {
@@ -1181,6 +1197,11 @@ impl WeChatBot {
             ],
         );
 
+        // 长输入先发“处理中”回执，避免用户空等
+        if should_send_processing_ack(merged_text) {
+            self.send_reply_text(user_id, PROCESSING_ACK_TEXT);
+        }
+
         // C2: 加载持久化 SessionState
         let session_state = match self.task_store.load_user_session_state(user_id) {
             Ok(state) => {
@@ -1215,7 +1236,7 @@ impl WeChatBot {
             .with_context_token_present(self.context_token_map.contains_key(user_id))
             .with_user_session_state(session_state);
 
-        let (reply, run_id) =
+        let (reply, run_id, trace_json_path) =
             self.generate_reply(user_id, merged_text, message_ids, reason, context);
 
         // C2: agent 完成后回写 updated_at（最小回写，不推导深状态）
@@ -1262,12 +1283,12 @@ impl WeChatBot {
             }
         }
 
-        // 补更新 trace 中的 persistent_state_updated
+        // 补更新 trace 中的 persistent_state_updated（按路径 patch，不再扫描目录）
         if state_updated {
-            if let Some(run_id) = run_id {
+            if let Some(path) = trace_json_path {
                 if let Err(err) = self
                     .agent_core
-                    .patch_trace_persistent_state_updated(&run_id, true)
+                    .patch_trace_persistent_state_updated(&path, true)
                 {
                     log_chat_warn(
                         "trace_patch_state_updated_failed",
@@ -1314,23 +1335,66 @@ impl WeChatBot {
             return;
         };
 
-        match self.client.send_text_message(user_id, reply, &token) {
-            Ok(()) => log_chat_info(
+        let chunks = split_reply_into_chunks(reply, WECHAT_REPLY_CHUNK_MAX_CHARS);
+        let chunk_total = chunks.len();
+        let mut sent_chunk_count = 0usize;
+        let mut all_sent = true;
+        for (idx, chunk) in chunks.iter().enumerate() {
+            match self.client.send_text_message(user_id, chunk, &token) {
+                Ok(()) => {
+                    sent_chunk_count += 1;
+                    log_chat_info(
+                        "reply_chunk_sent",
+                        vec![
+                            ("user_id", json!(user_id)),
+                            ("chunk_index", json!(idx + 1)),
+                            ("chunk_total", json!(chunk_total)),
+                            ("chunk_chars", json!(chunk.chars().count())),
+                        ],
+                    )
+                }
+                Err(err) => {
+                    all_sent = false;
+                    log_chat_error(
+                        "reply_send_failed",
+                        vec![
+                            ("user_id", json!(user_id)),
+                            ("chunk_index", json!(idx + 1)),
+                            ("chunk_total", json!(chunk_total)),
+                            ("error_kind", json!("wechat_send_failed")),
+                            ("detail", json!(err.to_string())),
+                        ],
+                    );
+                    // 一旦某段发送失败，停止后续段，避免乱序
+                    break;
+                }
+            }
+        }
+
+        if all_sent {
+            log_chat_info(
                 "reply_sent",
                 vec![
                     ("user_id", json!(user_id)),
                     ("reply_chars", json!(reply.chars().count())),
+                    ("chunk_total", json!(chunk_total)),
+                    ("sent_chunk_count", json!(sent_chunk_count)),
+                    ("all_sent", json!(true)),
                     ("reply_preview", json!(summarize_text_for_log(reply, 120))),
                 ],
-            ),
-            Err(err) => log_chat_error(
-                "reply_send_failed",
+            );
+        } else {
+            log_chat_warn(
+                "reply_partially_sent",
                 vec![
                     ("user_id", json!(user_id)),
-                    ("error_kind", json!("wechat_send_failed")),
-                    ("detail", json!(err.to_string())),
+                    ("reply_chars", json!(reply.chars().count())),
+                    ("chunk_total", json!(chunk_total)),
+                    ("sent_chunk_count", json!(sent_chunk_count)),
+                    ("all_sent", json!(false)),
+                    ("reply_preview", json!(summarize_text_for_log(reply, 120))),
                 ],
-            ),
+            );
         }
     }
 
@@ -1367,32 +1431,53 @@ impl WeChatBot {
             return;
         };
 
-        match self
-            .client
-            .send_text_message(&target_user_id, &reply, &token)
-        {
-            Ok(()) => {
-                self.last_daily_report_push_day = Some(day.clone());
-                log_chat_info(
-                    "scheduler_daily_report_sent",
+        // 日报正文可能较长，复用分段发送
+        let chunks = split_reply_into_chunks(&reply, WECHAT_REPLY_CHUNK_MAX_CHARS);
+        let chunk_total = chunks.len();
+        let mut all_ok = true;
+        for (idx, chunk) in chunks.iter().enumerate() {
+            match self
+                .client
+                .send_text_message(&target_user_id, chunk, &token)
+            {
+                Ok(()) => log_chat_info(
+                    "scheduler_daily_report_chunk_sent",
                     vec![
-                        ("day", json!(day)),
-                        ("user_id", json!(target_user_id)),
-                        ("reply_chars", json!(reply.chars().count())),
+                        ("day", json!(&day)),
+                        ("user_id", json!(&target_user_id)),
+                        ("chunk_index", json!(idx + 1)),
+                        ("chunk_total", json!(chunk_total)),
+                        ("chunk_chars", json!(chunk.chars().count())),
                     ],
-                );
+                ),
+                Err(err) => {
+                    all_ok = false;
+                    log_chat_error(
+                        "scheduler_daily_report_send_failed",
+                        vec![
+                            ("day", json!(&day)),
+                            ("user_id", json!(&target_user_id)),
+                            ("chunk_index", json!(idx + 1)),
+                            ("chunk_total", json!(chunk_total)),
+                            ("error_kind", json!("scheduler_daily_report_send_failed")),
+                            ("detail", json!(err.to_string())),
+                        ],
+                    );
+                    break;
+                }
             }
-            Err(err) => {
-                log_chat_error(
-                    "scheduler_daily_report_send_failed",
-                    vec![
-                        ("day", json!(day)),
-                        ("user_id", json!(target_user_id)),
-                        ("error_kind", json!("scheduler_daily_report_send_failed")),
-                        ("detail", json!(err.to_string())),
-                    ],
-                );
-            }
+        }
+        if all_ok {
+            self.last_daily_report_push_day = Some(day.clone());
+            log_chat_info(
+                "scheduler_daily_report_sent",
+                vec![
+                    ("day", json!(day)),
+                    ("user_id", json!(target_user_id)),
+                    ("reply_chars", json!(reply.chars().count())),
+                    ("chunk_total", json!(chunk_total)),
+                ],
+            );
         }
     }
 
@@ -1832,6 +1917,79 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
 
 fn summarize_text_for_log(input: &str, max_chars: usize) -> String {
     truncate_for_log(&input.replace('\n', "\\n"), max_chars)
+}
+
+/// 将长回复按 max_chars 安全切分为多段，短文本返回单段。
+/// 多段时每段加前缀 "（i/n）"。
+fn split_reply_into_chunks(reply: &str, max_chars: usize) -> Vec<String> {
+    let total_chars = reply.chars().count();
+    if total_chars <= max_chars {
+        return vec![reply.to_string()];
+    }
+
+    // 递归收敛：先按 max_chars 切内容，得到总段数 n；
+    // 再用实际前缀长度（i/n 前缀）重新切分，直到稳定。
+    let mut prev_count = 0usize;
+    let mut segments: Vec<String> = Vec::new();
+
+    for _ in 0..5 {
+        // 保守预算：max_chars 减去最长前缀的字符数（最后一段前缀最长）
+        let longest_prefix = if segments.is_empty() {
+            "（1/2）".chars().count()
+        } else {
+            format!("（{}/{}）", segments.len(), segments.len())
+                .chars()
+                .count()
+        };
+        let content_budget = max_chars.saturating_sub(longest_prefix);
+        if content_budget == 0 {
+            break;
+        }
+
+        segments = split_content_only(reply, content_budget);
+        if segments.len() == prev_count {
+            break; // 已收敛
+        }
+        prev_count = segments.len();
+    }
+
+    let total = segments.len();
+    segments
+        .into_iter()
+        .enumerate()
+        .map(|(i, content)| format!("（{}/{}）{}", i + 1, total, content))
+        .collect()
+}
+
+/// 仅按 content_budget 切分内容，不添加前缀。返回每段内容的 Vec<String>。
+fn split_content_only(reply: &str, content_budget: usize) -> Vec<String> {
+    if reply.is_empty() {
+        return Vec::new();
+    }
+    let mut result = Vec::new();
+    let mut char_indices = reply.char_indices().peekable();
+    let mut start_byte = 0usize;
+
+    while char_indices.peek().is_some() {
+        let mut chars_count = 0usize;
+        let mut end_byte = reply.len();
+        while let Some((byte_idx, _)) = char_indices.peek() {
+            if chars_count >= content_budget {
+                end_byte = *byte_idx;
+                break;
+            }
+            chars_count += 1;
+            char_indices.next();
+        }
+        result.push(reply[start_byte..end_byte].to_string());
+        start_byte = end_byte;
+    }
+    result
+}
+
+/// 判断是否应该发送“处理中”回执：trim 后长度达到阈值才回执。
+fn should_send_processing_ack(user_text: &str) -> bool {
+    user_text.trim().chars().count() >= PROCESSING_ACK_MIN_INPUT_CHARS
 }
 
 fn value_to_string(value: &Value) -> Option<String> {
@@ -2901,5 +3059,78 @@ mod tests {
             .expect("应存在");
         assert_eq!(state_a.last_user_intent, Some("A 的消息".to_string()));
         assert_eq!(state_b.last_user_intent, Some("B 的消息".to_string()));
+    }
+
+    // ===== 分段发送与处理中回执测试 =====
+
+    #[test]
+    fn split_reply_into_chunks_short_text_single_chunk() {
+        let reply = "短文本，直接单条发送。";
+        let chunks = super::split_reply_into_chunks(reply, 1200);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], reply);
+    }
+
+    #[test]
+    fn split_reply_into_chunks_long_text_multi_chunks() {
+        // 构造超过 max_chars 的长文本
+        let reply = "一段很长的测试内容。".repeat(100);
+        let chunks = super::split_reply_into_chunks(&reply, 120);
+        assert!(chunks.len() > 1, "应切分为多段");
+        // 每段都应包含（i/n）前缀
+        for (i, chunk) in chunks.iter().enumerate() {
+            let expected_prefix = format!("（{}/{}）", i + 1, chunks.len());
+            assert!(
+                chunk.starts_with(&expected_prefix),
+                "第 {} 段应以前缀 {} 开头,实际为: {}",
+                i,
+                expected_prefix,
+                chunk
+            );
+        }
+        // 每段字符数不超过 max_chars
+        for chunk in &chunks {
+            assert!(
+                chunk.chars().count() <= 120,
+                "每段不应超过 120 字符: {}",
+                chunk
+            );
+        }
+    }
+
+    #[test]
+    fn split_reply_into_chunks_preserves_full_content_when_joined() {
+        let reply = "测试内容".repeat(80); // 320 字符
+        let chunks = super::split_reply_into_chunks(&reply, 120);
+        assert!(chunks.len() > 1);
+        // 去掉每段的（i/n）前缀，拼接后应与原文一致
+        let reassembled: String = chunks
+            .iter()
+            .map(|c| {
+                if let Some(pos) = c.find('）') {
+                    c[pos..].chars().skip(1).collect::<String>()
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect();
+        assert_eq!(reassembled, reply, "去掉前缀后拼接应与原文完全一致");
+    }
+
+    #[test]
+    fn should_send_processing_ack_threshold_behavior() {
+        // 短输入：不应触发
+        assert!(!super::should_send_processing_ack("你好"));
+        assert!(!super::should_send_processing_ack("短消息"));
+        assert!(!super::should_send_processing_ack("   "));
+        // 刚好达到阈值：应触发
+        let at_threshold = "a".repeat(super::PROCESSING_ACK_MIN_INPUT_CHARS);
+        assert!(super::should_send_processing_ack(&at_threshold));
+        // 超过阈值：应触发
+        let above_threshold = "b".repeat(super::PROCESSING_ACK_MIN_INPUT_CHARS + 1);
+        assert!(super::should_send_processing_ack(&above_threshold));
+        // 刚好低于阈值：不应触发
+        let below_threshold = "c".repeat(super::PROCESSING_ACK_MIN_INPUT_CHARS - 1);
+        assert!(!super::should_send_processing_ack(&below_threshold));
     }
 }

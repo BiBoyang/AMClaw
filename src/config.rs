@@ -25,6 +25,10 @@ pub struct AgentConfig {
     pub mode: String,
     pub timezone: String,
     pub session_summary_strategy: String,
+    pub include_previous_observations: bool,
+    pub memory_max_items: usize,
+    pub memory_max_total_chars: usize,
+    pub memory_max_single_chars: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +106,10 @@ impl Default for AgentConfig {
             mode: "restricted".to_string(),
             timezone: "Asia/Shanghai".to_string(),
             session_summary_strategy: "semantic".to_string(),
+            include_previous_observations: false,
+            memory_max_items: 5,
+            memory_max_total_chars: 500,
+            memory_max_single_chars: 160,
         }
     }
 }

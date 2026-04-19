@@ -7,7 +7,7 @@
 use crate::session_summary::summarize_for_markdown;
 use serde::Serialize;
 
-pub const DEFAULT_CONTEXT_MAX_TOTAL_CHARS: usize = 2600;
+pub const DEFAULT_CONTEXT_MAX_TOTAL_CHARS: usize = 3200;
 
 /// A full context pack composed of sections, with total budget enforcement.
 #[derive(Debug, Clone)]
@@ -314,7 +314,7 @@ impl ContextSectionKind {
                 required: false,
             },
             Self::SessionText => ContextSectionPolicy {
-                priority: 60,
+                priority: 65,
                 max_chars: 460,
                 pinned_lines: 6,
                 required: false,
@@ -350,7 +350,7 @@ impl ContextSectionKind {
                 required: false,
             },
             Self::UserMemories => ContextSectionPolicy {
-                priority: 84,
+                priority: 86,
                 max_chars: 420,
                 pinned_lines: 2,
                 required: false,
@@ -558,6 +558,9 @@ mod tests {
         // The tiny section (smallest) should be the first dropped at same priority.
         let snapshots = pack.snapshot();
         let tiny = snapshots.iter().find(|s| s.content == "tiny").unwrap();
-        assert!(!tiny.included, "tiny section should be dropped first on tie-break");
+        assert!(
+            !tiny.included,
+            "tiny section should be dropped first on tie-break"
+        );
     }
 }

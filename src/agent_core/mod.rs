@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -32,12 +32,16 @@ const LLM_PROVIDER_PRIORITY: [&str; 3] = ["DEEPSEEK", "MOONSHOT", "OPENAI"];
 #[derive(Debug, Clone, Copy)]
 struct ContextCompactionConfig {
     session_summary_strategy: SessionSummaryStrategy,
+    include_previous_observations: bool,
+    memory_budget: MemoryBudget,
 }
 
 impl Default for ContextCompactionConfig {
     fn default() -> Self {
         Self {
             session_summary_strategy: SessionSummaryStrategy::Semantic,
+            include_previous_observations: false,
+            memory_budget: MemoryBudget::default(),
         }
     }
 }
@@ -48,6 +52,8 @@ impl ContextCompactionConfig {
             session_summary_strategy: SessionSummaryStrategy::from_config_text(
                 &agent_config.session_summary_strategy,
             ),
+            include_previous_observations: agent_config.include_previous_observations,
+            memory_budget: MemoryBudget::from_agent_config(agent_config),
         }
     }
 }
@@ -147,14 +153,21 @@ struct AgentObservation {
     step: usize,
     source: String,
     content: String,
+    kind: Option<ObservationKind>,
 }
 
 impl AgentObservation {
-    fn tool_result(step: usize, tool_name: &str, output: &str) -> Self {
+    fn tool_result(
+        step: usize,
+        tool_name: &str,
+        output: &str,
+        kind: Option<ObservationKind>,
+    ) -> Self {
         Self {
             step,
             source: format!("tool:{tool_name}"),
             content: output.to_string(),
+            kind,
         }
     }
 }
@@ -179,6 +192,17 @@ pub enum ContextPreviewMode {
 impl RuntimeSessionStateSnapshot {
     fn is_empty(&self) -> bool {
         self.goal.is_none()
+            && self.current_subtask.is_none()
+            && self.constraints.is_empty()
+            && self.confirmed_facts.is_empty()
+            && self.done_items.is_empty()
+            && self.next_step.is_none()
+            && self.open_questions.is_empty()
+    }
+
+    /// 仅有默认 goal、且无其他高信号字段时视为低价值，不注入 prompt
+    fn is_low_signal(&self) -> bool {
+        self.goal.is_some()
             && self.current_subtask.is_none()
             && self.constraints.is_empty()
             && self.confirmed_facts.is_empty()
@@ -523,6 +547,28 @@ impl Default for MemoryBudget {
     }
 }
 
+impl MemoryBudget {
+    fn from_agent_config(agent_config: &AgentConfig) -> Self {
+        Self {
+            max_items: agent_config.memory_max_items,
+            max_total_chars: agent_config.memory_max_total_chars,
+            max_single_chars: agent_config.memory_max_single_chars,
+        }
+    }
+
+    /// 轻量动态上调：有 current_task 或计划步较多时上调 20%
+    fn with_dynamic_adjustment(self, has_current_task: bool, plan_step_count: usize) -> Self {
+        if !has_current_task && plan_step_count <= 3 {
+            return self;
+        }
+        Self {
+            max_items: (self.max_items * 12) / 10,
+            max_total_chars: (self.max_total_chars * 12) / 10,
+            max_single_chars: self.max_single_chars,
+        }
+    }
+}
+
 /// 被裁剪掉的记忆及其原因
 #[derive(Debug, Clone)]
 struct DroppedMemory {
@@ -664,8 +710,18 @@ impl PlanningPolicy {
     }
 }
 
-#[derive(Debug, Default)]
-struct ContextAssembler;
+#[derive(Debug)]
+struct ContextAssembler {
+    include_previous_observations: bool,
+}
+
+impl Default for ContextAssembler {
+    fn default() -> Self {
+        Self {
+            include_previous_observations: false,
+        }
+    }
+}
 
 impl ContextAssembler {
     #[cfg(test)]
@@ -818,7 +874,8 @@ impl ContextAssembler {
             runtime_lines,
         ));
 
-        if let Some(runtime_session_state) = runtime_session_state.filter(|state| !state.is_empty())
+        if let Some(runtime_session_state) =
+            runtime_session_state.filter(|state| !state.is_empty() && !state.is_low_signal())
         {
             pack.push(ContextSection::new(
                 ContextSectionKind::SessionState,
@@ -833,50 +890,25 @@ impl ContextAssembler {
             ));
         }
 
-        let previous_observations = select_previous_observations(trace, observation);
-        if !previous_observations.is_empty() {
-            let mut lines = vec![String::new(), "## Previous Observations".to_string()];
-            for item in previous_observations {
-                lines.push(format!(
-                    "- step={} source={} chars={} summary={}",
-                    item.step, item.source, item.content_chars, item.summary
+        if self.include_previous_observations {
+            let previous_observations = select_previous_observations(trace, observation);
+            if !previous_observations.is_empty() {
+                let mut lines = vec![String::new(), "## Previous Observations".to_string()];
+                for item in previous_observations {
+                    lines.push(format!(
+                        "- step={} source={} chars={} summary={}",
+                        item.step, item.source, item.content_chars, item.summary
+                    ));
+                }
+                pack.push(ContextSection::new(
+                    ContextSectionKind::PreviousObservations,
+                    lines,
                 ));
             }
-            pack.push(ContextSection::new(
-                ContextSectionKind::PreviousObservations,
-                lines,
-            ));
         }
 
         if let Some(observation) = observation {
-            let section_max = ContextSectionKind::LatestObservation.policy().max_chars;
-            let step_line = format!("- step: {}", observation.step);
-            let source_line = format!("- source: {}", observation.source);
-            // 7 lines total → 6 "\n" separators; frame = everything except content
-            let frame_chars = "".chars().count()
-                + "## Latest Observation".chars().count()
-                + step_line.chars().count()
-                + source_line.chars().count()
-                + "```text".chars().count()
-                + "```".chars().count()
-                + 6;
-            let content_budget = section_max.saturating_sub(frame_chars).max(24);
-            let content = summarize_for_markdown(&observation.content, content_budget);
-            let section_lines = vec![
-                String::new(),
-                "## Latest Observation".to_string(),
-                step_line,
-                source_line,
-                "```text".to_string(),
-                content,
-                "```".to_string(),
-            ];
-            debug_assert!(
-                section_lines.join("\n").chars().count() <= section_max,
-                "LatestObservation section exceeds budget: {} > {}",
-                section_lines.join("\n").chars().count(),
-                section_max
-            );
+            let section_lines = build_latest_observation_lines(observation);
             pack.push(ContextSection::new(
                 ContextSectionKind::LatestObservation,
                 section_lines,
@@ -1016,8 +1048,12 @@ fn build_context_pack(
     available_tools: &[String],
     business_context: Option<&BusinessContextSnapshot>,
     session_summary_strategy: SessionSummaryStrategy,
+    include_previous_observations: bool,
 ) -> ContextPack {
-    ContextAssembler.build_pack_with_summary_strategy(
+    ContextAssembler {
+        include_previous_observations,
+    }
+    .build_pack_with_summary_strategy(
         trace,
         user_input,
         observation,
@@ -1185,6 +1221,7 @@ fn derive_runtime_session_state(
 pub struct AgentRunResult {
     pub output: String,
     pub run_id: String,
+    pub trace_json_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -1367,53 +1404,40 @@ impl AgentCore {
             Err(err) => trace.finish_error(&err.to_string(), started.elapsed()),
         }
 
-        if let Err(err) = trace.persist() {
-            log_agent_warn(
-                "agent_trace_persist_failed",
-                vec![
-                    ("error_kind", json!("agent_trace_persist_failed")),
-                    ("detail", json!(err.to_string())),
-                ],
-            );
-        }
+        let trace_json_path = match trace.persist() {
+            Ok(path) => Some(path),
+            Err(err) => {
+                log_agent_warn(
+                    "agent_trace_persist_failed",
+                    vec![
+                        ("error_kind", json!("agent_trace_persist_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
+                None
+            }
+        };
 
-        result.map(|output| AgentRunResult { output, run_id })
+        result.map(|output| AgentRunResult {
+            output,
+            run_id,
+            trace_json_path,
+        })
     }
 
     /// 事后补更新 trace 中的 persistent_state_updated 字段
-    pub fn patch_trace_persistent_state_updated(&self, run_id: &str, updated: bool) -> Result<()> {
-        let day = Utc::now()
-            .with_timezone(&Shanghai)
-            .format("%Y-%m-%d")
-            .to_string();
-        let dir = self
-            .workspace_root
-            .join("data")
-            .join("agent_traces")
-            .join(&day);
-
-        let entries = fs::read_dir(&dir)
-            .with_context(|| format!("读取 trace 目录失败: {}", dir.display()))?;
-        let mut found = None;
-        for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.ends_with(".json") && name_str.contains(run_id) {
-                found = Some(entry.path());
-                break;
-            }
-        }
-        let json_path =
-            found.ok_or_else(|| anyhow!("未找到对应 run_id 的 trace 文件: {run_id}"))?;
-
-        let content = fs::read_to_string(&json_path)
+    pub fn patch_trace_persistent_state_updated(
+        &self,
+        json_path: &Path,
+        updated: bool,
+    ) -> Result<()> {
+        let content = fs::read_to_string(json_path)
             .with_context(|| format!("读取 trace 文件失败: {}", json_path.display()))?;
         let mut payload: Value = serde_json::from_str(&content).context("解析 trace JSON 失败")?;
         payload["persistent_state_updated"] = json!(updated);
         let updated_content =
             serde_json::to_string_pretty(&payload).context("序列化更新后的 trace 失败")?;
-        fs::write(&json_path, format!("{updated_content}\n"))
+        fs::write(json_path, format!("{updated_content}\n"))
             .with_context(|| format!("写入更新后的 trace 失败: {}", json_path.display()))?;
         Ok(())
     }
@@ -1435,8 +1459,11 @@ impl AgentCore {
         let mut trace = AgentRunTrace::new(&self.workspace_root, user_input, context);
         trace.configure_controller_limits(self.max_steps, self.max_replans);
 
-        let (business_context, session_state) =
-            load_business_context_snapshot(self.task_store_db_path.as_deref(), &trace)?;
+        let (business_context, session_state) = load_business_context_snapshot(
+            self.task_store_db_path.as_deref(),
+            &trace,
+            self.context_compaction.memory_budget,
+        )?;
         if session_state.has_memory_activity() {
             trace.memory_hit_count = session_state.injected_count();
             trace.memory_retrieved_count = session_state.retrieved_count();
@@ -1446,7 +1473,10 @@ impl AgentCore {
         }
         let runtime_session_state =
             derive_runtime_session_state(&trace, user_input, None, business_context.as_ref());
-        let planner_input = ContextAssembler.assemble_with_summary_strategy(
+        let planner_input = ContextAssembler {
+            include_previous_observations: self.context_compaction.include_previous_observations,
+        }
+        .assemble_with_summary_strategy(
             &trace,
             user_input,
             None,
@@ -1518,8 +1548,9 @@ impl AgentCore {
             let tool_trace = trace.start_tool_call(step, &action);
             match self.tool_registry.execute(action.clone()) {
                 Ok(result) => {
+                    let kind = observation_kind_for_action(&action);
                     let observation =
-                        AgentObservation::tool_result(step, result.tool, &result.output);
+                        AgentObservation::tool_result(step, result.tool, &result.output, kind);
                     if let Err(err) = validate_expected_observation(
                         trace.running_plan_expected_observation(),
                         &observation,
@@ -1655,21 +1686,24 @@ impl AgentCore {
         step: usize,
         trace: &mut AgentRunTrace,
     ) -> Result<PlannedDecision> {
-        let (business_context, session_state) =
-            match load_business_context_snapshot(self.task_store_db_path.as_deref(), trace) {
-                Ok(result) => result,
-                Err(err) => {
-                    log_agent_warn(
-                        "agent_context_snapshot_failed",
-                        vec![
-                            ("step", json!(step)),
-                            ("error_kind", json!("agent_context_snapshot_failed")),
-                            ("detail", json!(err.to_string())),
-                        ],
-                    );
-                    (None, SessionState::default())
-                }
-            };
+        let (business_context, session_state) = match load_business_context_snapshot(
+            self.task_store_db_path.as_deref(),
+            trace,
+            self.context_compaction.memory_budget,
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                log_agent_warn(
+                    "agent_context_snapshot_failed",
+                    vec![
+                        ("step", json!(step)),
+                        ("error_kind", json!("agent_context_snapshot_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
+                (None, SessionState::default())
+            }
+        };
         // 从 SessionState 投影到 trace（仅在 step 0 写入，后续 step 不重复）
         if step == 0 && session_state.has_memory_activity() {
             trace.memory_hit_count = session_state.injected_count();
@@ -1691,6 +1725,7 @@ impl AgentCore {
             &self.tool_registry.available_tool_descriptions(),
             business_context.as_ref(),
             self.context_compaction.session_summary_strategy,
+            self.context_compaction.include_previous_observations,
         );
 
         // 记录 ContextPack 级可观测字段（仅在 step 0 写入）
@@ -2776,7 +2811,7 @@ impl AgentRunTrace {
         }
     }
 
-    fn persist(&self) -> Result<()> {
+    fn persist(&self) -> Result<PathBuf> {
         let day = Utc::now()
             .with_timezone(&Shanghai)
             .format("%Y-%m-%d")
@@ -2876,7 +2911,7 @@ impl AgentRunTrace {
         fs::write(&index_path, existing)
             .with_context(|| format!("写入 agent trace index 失败: {}", index_path.display()))?;
         self.write_daily_index_markdown(&dir, &day)?;
-        Ok(())
+        Ok(json_path)
     }
 
     fn write_daily_index_markdown(&self, dir: &std::path::Path, day: &str) -> Result<()> {
@@ -3521,6 +3556,7 @@ fn normalize_optional_text(input: String) -> Option<String> {
 fn load_business_context_snapshot(
     task_store_db_path: Option<&std::path::Path>,
     trace: &AgentRunTrace,
+    memory_budget: MemoryBudget,
 ) -> Result<(Option<BusinessContextSnapshot>, SessionState)> {
     let Some(db_path) = task_store_db_path else {
         return Ok((None, SessionState::default()));
@@ -3542,7 +3578,10 @@ fn load_business_context_snapshot(
     let user_memories = if let Some(user_id) = &trace.user_id {
         match store.search_user_memories(user_id, 15) {
             Ok(retrieved) => {
-                let budget = MemoryBudget::default();
+                let has_current_task = current_task.is_some();
+                let plan_step_count = trace.active_plan_steps.len();
+                let budget =
+                    memory_budget.with_dynamic_adjustment(has_current_task, plan_step_count);
                 session_state = SessionState::from_retrieved(retrieved, budget);
                 let mut feedback_state = MemoryFeedbackState::default();
                 for memory in &session_state.retrieved {
@@ -3606,6 +3645,90 @@ fn load_business_context_snapshot(
         }),
         session_state,
     ))
+}
+
+/// 根据 ObservationKind 类型感知地构建 LatestObservation section 的行。
+/// ArchiveContent 大幅压缩（摘要 + 引用），TaskList 保留总数 + 前 N 项，
+/// 其余类型保持全文。
+fn build_latest_observation_lines(observation: &AgentObservation) -> Vec<String> {
+    let section_max = ContextSectionKind::LatestObservation.policy().max_chars;
+    let step_line = format!("- step: {}", observation.step);
+    let source_line = format!("- source: {}", observation.source);
+    let frame_chars = "\n## Latest Observation\n".chars().count()
+        + step_line.chars().count()
+        + source_line.chars().count()
+        + "\n```text\n\n```".chars().count();
+
+    match observation.kind {
+        Some(ObservationKind::ArchiveContent) => {
+            // 长非结构化正文：大幅压缩，只保留摘要 + 引用提示
+            let content_budget = 80;
+            let preview = summarize_for_markdown(&observation.content, content_budget);
+            let content_hint = format!(
+                "{} （长正文已摘要，如需全文可再次调用 {}）",
+                preview, observation.source
+            );
+            vec![
+                String::new(),
+                "## Latest Observation".to_string(),
+                step_line,
+                source_line,
+                content_hint,
+            ]
+        }
+        Some(ObservationKind::TaskList) => {
+            // 结构化列表：保留总数 + 前 3 项核心字段
+            let content_budget = section_max.saturating_sub(frame_chars).max(24);
+            let content = summarize_for_markdown(&observation.content, content_budget);
+            // 尝试提取列表长度提示
+            let count_hint = extract_task_list_count_hint(&observation.content);
+            vec![
+                String::new(),
+                "## Latest Observation".to_string(),
+                step_line,
+                source_line,
+                count_hint,
+                "```text".to_string(),
+                content,
+                "```".to_string(),
+            ]
+        }
+        _ => {
+            // Short Structured / Text / FileMutation：保持现有行为
+            let content_budget = section_max.saturating_sub(frame_chars).max(24);
+            let content = summarize_for_markdown(&observation.content, content_budget);
+            vec![
+                String::new(),
+                "## Latest Observation".to_string(),
+                step_line,
+                source_line,
+                "```text".to_string(),
+                content,
+                "```".to_string(),
+            ]
+        }
+    }
+}
+
+/// 从 TaskList JSON 中提取数量提示（尽量提取 count 或数组长度）
+fn extract_task_list_count_hint(content: &str) -> String {
+    // 优先提取 JSON 数组长度
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
+        if let Some(arr) = val.as_array() {
+            return format!("- total_count: {}（仅展示前若干项）", arr.len());
+        }
+        if let Some(obj) = val.as_object() {
+            if let Some(count) = obj.get("count").and_then(|v| v.as_u64()) {
+                return format!("- total_count: {}", count);
+            }
+            if let Some(tasks) = obj.get("tasks").and_then(|v| v.as_array()) {
+                return format!("- total_count: {}（仅展示前若干项）", tasks.len());
+            }
+        }
+    }
+    // 回退：按行数估算
+    let line_count = content.lines().count();
+    format!("- approx_line_count: {}", line_count)
 }
 
 fn build_context_summary(trace: &AgentRunTrace, observation: Option<&AgentObservation>) -> String {
@@ -4093,6 +4216,7 @@ fn failure_to_observation(step: usize, failure: &FailureDecision) -> AgentObserv
             "user_message": failure.user_message,
         }))
         .unwrap_or_else(|_| "{\"failure_kind\":\"unknown\"}".to_string()),
+        kind: Some(ObservationKind::Text),
     }
 }
 
@@ -4201,6 +4325,18 @@ impl RecoveryOutcome {
 
 fn resulting_source_name(action: &ToolAction) -> String {
     format!("tool:{}", action.name())
+}
+
+fn observation_kind_for_action(action: &ToolAction) -> Option<ObservationKind> {
+    match action {
+        ToolAction::Read { .. } => Some(ObservationKind::Text),
+        ToolAction::Write { .. } | ToolAction::Create { .. } => Some(ObservationKind::FileMutation),
+        ToolAction::GetTaskStatus { .. } => Some(ObservationKind::TaskStatus),
+        ToolAction::ListRecentTasks { .. } | ToolAction::ListManualTasks { .. } => {
+            Some(ObservationKind::TaskList)
+        }
+        ToolAction::ReadArticleArchive { .. } => Some(ObservationKind::ArchiveContent),
+    }
 }
 
 fn build_system_prompt(planning_policy: PlanningPolicy) -> &'static str {
@@ -4631,7 +4767,7 @@ mod tests {
         parse_llm_plan, select_previous_observations, validate_expected_observation, AgentCore,
         AgentObservation, AgentRunContext, AgentRunTrace, BusinessContextSnapshot,
         ContextAssembler, ContextPreviewMode, DoneRule, DropReason, ExecutionPlan,
-        ExpectedObservation, FailureAction, FailureDecision, LlmPlan, MinimumNovelty,
+        ExpectedObservation, FailureAction, FailureDecision, LlmPlan, MemoryBudget, MinimumNovelty,
         ObservationKind, PlannedDecision, RecoveryOutcome, ReplanScope,
         RuntimeSessionStateSnapshot, StepFailureKind,
     };
@@ -5532,7 +5668,12 @@ mod tests {
                 steps: vec!["读取 demo.txt".to_string(), "总结内容".to_string()],
             })),
         );
-        let observation = AgentObservation::tool_result(1, "read_file", "hello from tool");
+        let observation = AgentObservation::tool_result(
+            1,
+            "read_file",
+            "hello from tool",
+            Some(ObservationKind::Text),
+        );
         let business_context = BusinessContextSnapshot {
             current_task: None,
             recent_tasks: Vec::new(),
@@ -5540,7 +5681,7 @@ mod tests {
         };
         let runtime_session_state =
             derive_runtime_session_state(&trace, "读文件 demo.txt", Some(&observation), None);
-        let planner_input = ContextAssembler.assemble(
+        let planner_input = ContextAssembler::default().assemble(
             &trace,
             "读文件 demo.txt",
             Some(&observation),
@@ -5603,10 +5744,15 @@ mod tests {
             AgentRunContext::wechat_chat("user-context", "commit", vec![])
                 .with_session_text("session merged text"),
         );
-        let observation = AgentObservation::tool_result(1, "read_file", "hello from tool");
+        let observation = AgentObservation::tool_result(
+            1,
+            "read_file",
+            "hello from tool",
+            Some(ObservationKind::Text),
+        );
         let runtime_session_state =
             derive_runtime_session_state(&trace, "读文件 demo.txt", Some(&observation), None);
-        let pack = ContextAssembler.build_pack(
+        let pack = ContextAssembler::default().build_pack(
             &trace,
             "读文件 demo.txt",
             Some(&observation),
@@ -5640,10 +5786,15 @@ mod tests {
         );
         // Content far exceeds both old 800-limit and new section max (560)
         let long_content = "observation content ".repeat(100);
-        let observation = AgentObservation::tool_result(1, "read_file", &long_content);
+        let observation = AgentObservation::tool_result(
+            1,
+            "read_file",
+            &long_content,
+            Some(ObservationKind::Text),
+        );
         let runtime_session_state =
             derive_runtime_session_state(&trace, "读文件 demo.txt", Some(&observation), None);
-        let pack = ContextAssembler.build_pack(
+        let pack = ContextAssembler::default().build_pack(
             &trace,
             "读文件 demo.txt",
             Some(&observation),
@@ -5680,7 +5831,7 @@ mod tests {
                 .with_session_text("短会话文本"),
         );
         let runtime_session_state = derive_runtime_session_state(&trace, "继续处理", None, None);
-        let pack = ContextAssembler.build_pack(
+        let pack = ContextAssembler::default().build_pack(
             &trace,
             "继续处理",
             None,
@@ -5713,7 +5864,7 @@ mod tests {
                 .with_session_text(session_text),
         );
         let runtime_session_state = derive_runtime_session_state(&trace, "继续处理", None, None);
-        let pack = ContextAssembler.build_pack(
+        let pack = ContextAssembler::default().build_pack(
             &trace,
             "继续处理",
             None,
@@ -5801,8 +5952,12 @@ mod tests {
             AgentRunContext::wechat_chat("user-budget", "commit", vec![])
                 .with_session_text("session ".repeat(240)),
         );
-        let observation =
-            AgentObservation::tool_result(1, "read_file", &"observation ".repeat(240));
+        let observation = AgentObservation::tool_result(
+            1,
+            "read_file",
+            &"observation ".repeat(240),
+            Some(ObservationKind::Text),
+        );
         let runtime_session_state = RuntimeSessionStateSnapshot {
             goal: Some("推进一个需要大量上下文的信息整理任务".to_string()),
             current_subtask: Some("先整理线索，再决定是否继续调工具".to_string()),
@@ -5815,7 +5970,7 @@ mod tests {
             next_step: Some("优先收敛上下文而不是继续膨胀 prompt".to_string()),
             open_questions: vec!["哪些 section 可以先被丢弃".to_string(); 3],
         };
-        let mut pack = ContextAssembler.build_pack(
+        let mut pack = ContextAssembler::default().build_pack(
             &trace,
             "请帮我处理一个很长的上下文请求",
             Some(&observation),
@@ -5849,14 +6004,27 @@ mod tests {
             "继续处理",
             AgentRunContext::wechat_chat("user-obs", "commit", vec![]),
         );
-        let older = AgentObservation::tool_result(0, "read_file", "older observation payload");
-        let latest = AgentObservation::tool_result(1, "write_file", "latest observation payload");
+        let older = AgentObservation::tool_result(
+            0,
+            "read_file",
+            "older observation payload",
+            Some(ObservationKind::Text),
+        );
+        let latest = AgentObservation::tool_result(
+            1,
+            "write_file",
+            "latest observation payload",
+            Some(ObservationKind::FileMutation),
+        );
         trace.record_observation(&older);
         trace.record_observation(&latest);
 
         let runtime_session_state =
             derive_runtime_session_state(&trace, "继续处理", Some(&latest), None);
-        let pack = ContextAssembler.build_pack(
+        let pack = ContextAssembler {
+            include_previous_observations: true,
+        }
+        .build_pack(
             &trace,
             "继续处理",
             Some(&latest),
@@ -5881,9 +6049,24 @@ mod tests {
             "继续处理",
             AgentRunContext::wechat_chat("user-obs", "commit", vec![]),
         );
-        let repeated = AgentObservation::tool_result(0, "read_file", "same payload");
-        let repeated_again = AgentObservation::tool_result(1, "read_file", "same payload");
-        let latest = AgentObservation::tool_result(2, "write_file", "different payload");
+        let repeated = AgentObservation::tool_result(
+            0,
+            "read_file",
+            "same payload",
+            Some(ObservationKind::Text),
+        );
+        let repeated_again = AgentObservation::tool_result(
+            1,
+            "read_file",
+            "same payload",
+            Some(ObservationKind::Text),
+        );
+        let latest = AgentObservation::tool_result(
+            2,
+            "write_file",
+            "different payload",
+            Some(ObservationKind::FileMutation),
+        );
         trace.record_observation(&repeated);
         trace.record_observation(&repeated_again);
         trace.record_observation(&latest);
@@ -5911,8 +6094,12 @@ mod tests {
                 .with_task_id(current.task_id.clone()),
         );
 
-        let (business, _) = load_business_context_snapshot(Some(db_path.as_path()), &trace)
-            .expect("读取业务上下文失败");
+        let (business, _) = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace,
+            MemoryBudget::default(),
+        )
+        .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
 
         assert_eq!(
@@ -5942,13 +6129,17 @@ mod tests {
             AgentRunContext::wechat_chat("user-biz-ctx", "commit", vec![])
                 .with_task_id(current.task_id.clone()),
         );
-        let (business, _) = load_business_context_snapshot(Some(db_path.as_path()), &trace)
-            .expect("读取业务上下文失败");
+        let (business, _) = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace,
+            MemoryBudget::default(),
+        )
+        .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
         let runtime_session_state =
             derive_runtime_session_state(&trace, "帮我看任务", None, Some(&business));
 
-        let planner_input = ContextAssembler.assemble(
+        let planner_input = ContextAssembler::default().assemble(
             &trace,
             "帮我看任务",
             None,
@@ -6024,7 +6215,7 @@ mod tests {
         assert!(preview.contains("## Memory Dropped"));
         assert!(preview.contains("single_item_too_long"));
         assert!(preview.contains("## Section Content Preview"));
-        assert!(preview.contains("### session_state"));
+        // 低价值 SessionState（仅有默认 goal）已被过滤，不再断言 session_state section
     }
 
     #[test]
@@ -6041,9 +6232,12 @@ mod tests {
             AgentRunContext::wechat_chat("user-memory", "commit", vec![]),
         );
 
-        let (business, session_state) =
-            load_business_context_snapshot(Some(db_path.as_path()), &trace)
-                .expect("读取业务上下文失败");
+        let (business, session_state) = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace,
+            MemoryBudget::default(),
+        )
+        .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
 
         assert_eq!(business.user_memories.len(), 1);
@@ -6076,9 +6270,12 @@ mod tests {
             "帮我总结",
             AgentRunContext::wechat_chat("user-b", "commit", vec![]),
         );
-        let (business, session_state) =
-            load_business_context_snapshot(Some(db_path.as_path()), &trace)
-                .expect("读取业务上下文失败");
+        let (business, session_state) = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace,
+            MemoryBudget::default(),
+        )
+        .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
         assert_eq!(business.user_memories.len(), 1);
         assert_eq!(business.user_memories[0].content, "用户B的偏好");
@@ -6106,9 +6303,12 @@ mod tests {
             "帮我总结",
             AgentRunContext::wechat_chat("user-budget", "commit", vec![]),
         );
-        let (business, session_state) =
-            load_business_context_snapshot(Some(db_path.as_path()), &trace)
-                .expect("读取业务上下文失败");
+        let (business, session_state) = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace,
+            MemoryBudget::default(),
+        )
+        .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
         // injected = 5（max_items），retrieved = 6
         assert_eq!(business.user_memories.len(), 5);
@@ -6127,9 +6327,12 @@ mod tests {
             .expect("写入 memory 失败");
         // 没有 user_id 的 trace（agent_demo）
         let trace = AgentRunTrace::new(&workspace, "帮我总结", AgentRunContext::agent_demo());
-        let (business, session_state) =
-            load_business_context_snapshot(Some(db_path.as_path()), &trace)
-                .expect("读取业务上下文失败");
+        let (business, session_state) = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace,
+            MemoryBudget::default(),
+        )
+        .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
         assert!(business.user_memories.is_empty());
         assert_eq!(session_state.injected_count(), 0);
@@ -6151,8 +6354,12 @@ mod tests {
             "帮我总结",
             AgentRunContext::wechat_chat("user-dedup", "commit", vec![]),
         );
-        let (_, session_state) = load_business_context_snapshot(Some(db_path.as_path()), &trace)
-            .expect("读取业务上下文失败");
+        let (_, session_state) = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace,
+            MemoryBudget::default(),
+        )
+        .expect("读取业务上下文失败");
         // 1 injected, 1 dropped (dedup)
         assert_eq!(session_state.injected_count(), 1);
         assert_eq!(session_state.dropped.len(), 1);
@@ -6174,8 +6381,12 @@ mod tests {
             "帮我总结",
             AgentRunContext::wechat_chat("user-trim", "commit", vec![]),
         );
-        let (_, session_state) = load_business_context_snapshot(Some(db_path.as_path()), &trace)
-            .expect("读取业务上下文失败");
+        let (_, session_state) = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace,
+            MemoryBudget::default(),
+        )
+        .expect("读取业务上下文失败");
         // max_items=5, 7 条 → 5 injected, 2 dropped (budget exceeded)
         assert_eq!(session_state.injected_count(), 5);
         assert_eq!(session_state.dropped.len(), 2);
@@ -6200,8 +6411,12 @@ mod tests {
             "帮我总结",
             AgentRunContext::wechat_chat("user-long", "commit", vec![]),
         );
-        let (_, session_state) = load_business_context_snapshot(Some(db_path.as_path()), &trace)
-            .expect("读取业务上下文失败");
+        let (_, session_state) = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace,
+            MemoryBudget::default(),
+        )
+        .expect("读取业务上下文失败");
         // 1 injected (短记忆), 1 dropped (too long)
         assert_eq!(session_state.injected_count(), 1);
         assert_eq!(session_state.dropped.len(), 1);
@@ -6225,16 +6440,24 @@ mod tests {
             "帮我总结",
             AgentRunContext::wechat_chat("user-iso", "commit", vec![]),
         );
-        let (_, ss1) = load_business_context_snapshot(Some(db_path.as_path()), &trace1)
-            .expect("读取业务上下文失败");
+        let (_, ss1) = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace1,
+            MemoryBudget::default(),
+        )
+        .expect("读取业务上下文失败");
         // 第二轮（同一用户，不同 run）
         let trace2 = AgentRunTrace::new(
             &workspace,
             "再帮我总结",
             AgentRunContext::wechat_chat("user-iso", "commit", vec![]),
         );
-        let (_, ss2) = load_business_context_snapshot(Some(db_path.as_path()), &trace2)
-            .expect("读取业务上下文失败");
+        let (_, ss2) = load_business_context_snapshot(
+            Some(db_path.as_path()),
+            &trace2,
+            MemoryBudget::default(),
+        )
+        .expect("读取业务上下文失败");
         // 两轮独立，互不泄漏
         assert_eq!(ss1.injected_count(), 1);
         assert_eq!(ss2.injected_count(), 1);
@@ -6264,7 +6487,12 @@ mod tests {
                 steps: vec!["读取 demo.txt".to_string()],
             })),
         );
-        let observation = AgentObservation::tool_result(2, "read_file", "summary text");
+        let observation = AgentObservation::tool_result(
+            2,
+            "read_file",
+            "summary text",
+            Some(ObservationKind::Text),
+        );
         let summary = build_context_summary(&trace, Some(&observation));
 
         assert!(summary.contains("source=wechat_chat"));
@@ -6380,8 +6608,12 @@ mod tests {
 
     #[test]
     fn validate_expected_observation_checks_expected_fields() {
-        let observation =
-            AgentObservation::tool_result(1, "tool:get_task_status", r#"{"found":true}"#);
+        let observation = AgentObservation::tool_result(
+            1,
+            "tool:get_task_status",
+            r#"{"found":true}"#,
+            Some(ObservationKind::TaskStatus),
+        );
 
         let err = validate_expected_observation(
             Some(&ExpectedObservation {
@@ -6446,8 +6678,12 @@ mod tests {
             AgentRunContext::wechat_chat("user-budget", "commit", vec![])
                 .with_session_text("session ".repeat(240)),
         );
-        let observation =
-            AgentObservation::tool_result(1, "read_file", &"observation ".repeat(240));
+        let observation = AgentObservation::tool_result(
+            1,
+            "read_file",
+            &"observation ".repeat(240),
+            Some(ObservationKind::Text),
+        );
         let runtime_session_state = RuntimeSessionStateSnapshot {
             goal: Some("推进一个需要大量上下文的信息整理任务".to_string()),
             current_subtask: Some("先整理线索，再决定是否继续调工具".to_string()),
@@ -6471,6 +6707,7 @@ mod tests {
             ],
             None,
             SessionSummaryStrategy::Semantic,
+            false,
         );
         pack.set_max_total_chars(1500);
         pack.apply_total_budget();

@@ -49,13 +49,13 @@ pub struct ContextSection {
 | CurrentIntent | 100 | 用户输入，required |
 | RuntimeContext | 95 | 运行时元信息，required |
 | SessionState | 94 | 持久化会话状态投影 |
-| SessionText | 55 | 合并后的 session 文本 |
-| PreviousObservations | 70 | 历史 observation 摘要 |
+| SessionText | 65 | 合并后的 session 文本 |
+| PreviousObservations | 70 | 历史 observation 摘要（默认不注入，需 `agent.include_previous_observations = true` 开启） |
 | LatestObservation | 92 | 当前 step observation |
 | RuntimePlan | 93 | 活跃计划步骤 |
 | CurrentTask | 94 | 当前关注任务 |
 | RecentTasks | 50 | 最近任务列表 |
-| UserMemories | 75 | 注入的用户记忆 |
+| UserMemories | 86 | 注入的用户记忆 |
 | ToolDescriptions | 40 | 可用工具描述，required |
 | ResponseContract | 100 | 响应格式约束，required |
 

@@ -88,4 +88,8 @@ pub trait Retriever {
     fn retrieve(&self, query: &RetrieveQuery) -> Result<RetrieveResult>;
 }
 
+pub mod cached_embedding;
+pub mod embedding;
+pub mod hybrid;
 pub mod rule;
+pub mod shadow;

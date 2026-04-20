@@ -6,3 +6,4 @@ target/
 config.toml
 data/
 tools/browser_worker/node_modules/
+.env.moonshot

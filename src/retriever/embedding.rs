@@ -144,10 +144,13 @@ impl OpenAiEmbeddingProvider {
         let payload: EmbeddingResponse = serde_json::from_str(&text)
             .with_context(|| format!("解析 embedding 响应 JSON 失败: {}", text))?;
 
-        let mut vectors = Vec::with_capacity(payload.data.len());
-        for item in payload.data {
-            vectors.push(item.embedding);
-        }
+        let mut indexed: Vec<_> = payload
+            .data
+            .into_iter()
+            .map(|item| (item.index, item.embedding))
+            .collect();
+        indexed.sort_by_key(|(idx, _)| *idx);
+        let vectors: Vec<_> = indexed.into_iter().map(|(_, v)| v).collect();
 
         if vectors.len() != texts.len() {
             bail!(

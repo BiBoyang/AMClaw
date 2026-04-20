@@ -4,6 +4,7 @@ use crate::retriever::{RetrieveQuery, RetrieveResult, Retriever};
 use anyhow::Result;
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Shadow 检索器：对外始终返回 rule 结果，可选并行计算 hybrid 仅用于日志/trace 比较。
@@ -14,7 +15,7 @@ use std::time::Instant;
 /// - 保持一键回退 rule（shadow 即 rule + 可选观测）
 pub struct ShadowRetriever {
     rule_retriever: RuleRetriever,
-    hybrid_retriever: Option<Box<dyn Retriever + Send + Sync>>,
+    hybrid_retriever: Option<Arc<dyn Retriever + Send + Sync>>,
     name: String,
 }
 
@@ -25,7 +26,7 @@ impl ShadowRetriever {
     ) -> Self {
         Self {
             rule_retriever: RuleRetriever::new(db_path),
-            hybrid_retriever,
+            hybrid_retriever: hybrid_retriever.map(Arc::from),
             name: "shadow_v1".to_string(),
         }
     }
@@ -36,43 +37,43 @@ impl ShadowRetriever {
         self
     }
 
-    /// 结构化日志记录 shadow 与 hybrid 的对比结果。
-    fn log_shadow_comparison(
-        &self,
-        query: &RetrieveQuery,
-        rule_result: &RetrieveResult,
-        hybrid_result: &RetrieveResult,
-    ) {
-        let rule_ids: Vec<&str> = rule_result
-            .candidates
-            .iter()
-            .map(|c| c.id.as_str())
-            .collect();
-        let hybrid_ids: Vec<&str> = hybrid_result
-            .candidates
-            .iter()
-            .map(|c| c.id.as_str())
-            .collect();
+}
 
-        let overlap_count = rule_ids.iter().filter(|id| hybrid_ids.contains(id)).count();
+/// 结构化日志记录 shadow 与 hybrid 的对比结果。
+fn log_shadow_comparison(
+    query: &RetrieveQuery,
+    rule_result: &RetrieveResult,
+    hybrid_result: &RetrieveResult,
+) {
+    let rule_ids: Vec<&str> = rule_result
+        .candidates
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
+    let hybrid_ids: Vec<&str> = hybrid_result
+        .candidates
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
 
-        let order_same = rule_ids.len() == hybrid_ids.len()
-            && rule_ids.iter().zip(hybrid_ids.iter()).all(|(a, b)| a == b);
+    let overlap_count = rule_ids.iter().filter(|id| hybrid_ids.contains(id)).count();
 
-        emit_structured_log(
-            "info",
-            "shadow_compare",
-            vec![
-                ("user_id", json!(&query.user_id)),
-                ("rule_count", json!(rule_result.candidates.len())),
-                ("hybrid_count", json!(hybrid_result.candidates.len())),
-                ("overlap", json!(overlap_count)),
-                ("order_same", json!(order_same)),
-                ("rule_latency_ms", json!(rule_result.latency_ms)),
-                ("hybrid_latency_ms", json!(hybrid_result.latency_ms)),
-            ],
-        );
-    }
+    let order_same = rule_ids.len() == hybrid_ids.len()
+        && rule_ids.iter().zip(hybrid_ids.iter()).all(|(a, b)| a == b);
+
+    emit_structured_log(
+        "info",
+        "shadow_compare",
+        vec![
+            ("user_id", json!(&query.user_id)),
+            ("rule_count", json!(rule_result.candidates.len())),
+            ("hybrid_count", json!(hybrid_result.candidates.len())),
+            ("overlap", json!(overlap_count)),
+            ("order_same", json!(order_same)),
+            ("rule_latency_ms", json!(rule_result.latency_ms)),
+            ("hybrid_latency_ms", json!(hybrid_result.latency_ms)),
+        ],
+    );
 }
 
 impl Retriever for ShadowRetriever {
@@ -82,7 +83,7 @@ impl Retriever for ShadowRetriever {
         // 始终获取 rule 结果（对外返回）
         let rule_result = self.rule_retriever.retrieve(query)?;
 
-        // 可选计算 hybrid，仅用于日志比较
+        // 可选：后台启动 hybrid 比较，不阻塞返回 rule 结果
         if let Some(ref hybrid) = self.hybrid_retriever {
             if query
                 .query_text
@@ -90,21 +91,26 @@ impl Retriever for ShadowRetriever {
                 .map(|t| !t.trim().is_empty())
                 .unwrap_or(false)
             {
-                match hybrid.retrieve(query) {
-                    Ok(hybrid_result) => {
-                        self.log_shadow_comparison(query, &rule_result, &hybrid_result);
+                let hybrid = Arc::clone(hybrid);
+                let query = query.clone();
+                let rule_result = rule_result.clone();
+                std::thread::spawn(move || {
+                    match hybrid.retrieve(&query) {
+                        Ok(hybrid_result) => {
+                            log_shadow_comparison(&query, &rule_result, &hybrid_result);
+                        }
+                        Err(err) => {
+                            emit_structured_log(
+                                "warn",
+                                "shadow_hybrid_failed",
+                                vec![
+                                    ("user_id", json!(&query.user_id)),
+                                    ("error", json!(err.to_string())),
+                                ],
+                            );
+                        }
                     }
-                    Err(err) => {
-                        emit_structured_log(
-                            "warn",
-                            "shadow_hybrid_failed",
-                            vec![
-                                ("user_id", json!(&query.user_id)),
-                                ("error", json!(err.to_string())),
-                            ],
-                        );
-                    }
-                }
+                });
             }
         }
 

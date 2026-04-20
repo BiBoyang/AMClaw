@@ -302,6 +302,29 @@ cargo run --bin trace_eval
 - 支持 `--date`、`--dir`、`--output`、`--baseline`、`--no-baseline`、`--only-interesting` 参数。
 - 支持 `--compare-before <path>`、`--compare-after <path>`、`--compare-output <path>` 对比两份已有报告，输出 PASS/WARN/FAIL 结论。缺少 `--compare-before` 或 `--compare-after` 时报错退出。
 
+#### embedding_test（Embedding Provider 端到端验证）
+
+```bash
+cd ~/Desktop/AMClaw
+cargo run --bin embedding_test
+```
+
+- 验证 OpenAI 兼容 embedding provider 的连接与向量返回。
+- 默认读取 `.env` 中的 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_EMBEDDING_MODEL`。
+- 支持 DeepSeek / Moonshot / OpenAI / ollama / MLX server 后端。
+- 执行前请确保对应服务可达且环境变量已配置。
+
+#### hybrid_test（Hybrid Retriever 端到端验证）
+
+```bash
+cd ~/Desktop/AMClaw
+cargo run --bin hybrid_test
+```
+
+- 验证 HybridRetriever 的完整链路：规则召回 → embedding 编码 → 语义重排序。
+- 需配置 embedding provider（同上），否则 hybrid 会 fallback 到纯 rule 并记录 `fallback_to_rule`。
+- 执行前请确保 embedding 服务可达。
+
 ## 协作与文档约定
 
 - `README.md`：面向人类读者，描述“当前能跑什么、怎么跑、怎么验证”。

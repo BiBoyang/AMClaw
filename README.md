@@ -172,9 +172,23 @@ cp .env.moonshot.example .env.moonshot
 - SQLite 数据库写到 `./data/amclaw.db`
 - 会话合并窗口为 5 秒
 - `agent.session_summary_strategy` 默认 `semantic`（可选 `truncate`）
+- `agent.retriever_mode` 默认 `rule`（可选 `semantic` / `hybrid` / `shadow`）
+- `agent.embedding_provider` 默认 `noop`（可选 `moonshot` / `deepseek` / `openai`）
+- `agent.retriever_rollout_enabled` 默认 `false`（关闭时语义链路短路回退 `rule`，不初始化 embedding provider）
+- `agent.retriever_rollout_allow_users` 默认空数组（为空表示全量放行；非空时仅名单内 user_id 放行）
 - 微信 channel version 为 `1.0.0`
 - 浏览器抓取默认关闭，需要显式在 `[browser]` 下启用
 - `.env*.example` 是可提交模板；真实 `.env` 文件仅用于本地开发，不应提交
+
+最小 rollout 示例（逐步放量）：
+
+```toml
+[agent]
+retriever_mode = "hybrid"
+embedding_provider = "moonshot"
+retriever_rollout_enabled = true
+retriever_rollout_allow_users = ["user-a", "user-b"]
+```
 
 ## 运行
 

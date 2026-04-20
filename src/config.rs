@@ -29,6 +29,8 @@ pub struct AgentConfig {
     pub memory_max_items: usize,
     pub memory_max_total_chars: usize,
     pub memory_max_single_chars: usize,
+    pub retriever_mode: String,
+    pub embedding_provider: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +112,8 @@ impl Default for AgentConfig {
             memory_max_items: 5,
             memory_max_total_chars: 500,
             memory_max_single_chars: 160,
+            retriever_mode: "rule".to_string(),
+            embedding_provider: "noop".to_string(),
         }
     }
 }
@@ -238,7 +242,7 @@ fn log_config_info(event: &str, fields: Vec<(&str, Value)>) {
 
 #[cfg(test)]
 mod tests {
-    use super::AppConfig;
+    use super::{AgentConfig, AppConfig};
     use std::fs;
     use std::time::Duration;
     use uuid::Uuid;
@@ -315,5 +319,11 @@ merge_timeout_secs = "oops"
 
         let err = AppConfig::load_or_create(&config_path).expect_err("非法 TOML 应失败");
         assert!(err.to_string().contains("解析配置失败"));
+    }
+
+    #[test]
+    fn default_retriever_mode_is_rule() {
+        let config = AgentConfig::default();
+        assert_eq!(config.retriever_mode, "rule");
     }
 }

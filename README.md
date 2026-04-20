@@ -302,6 +302,10 @@ cargo run --bin trace_eval
 - 支持 `--date`、`--dir`、`--output`、`--baseline`、`--no-baseline`、`--only-interesting` 参数。
 - 支持 `--compare-before <path>`、`--compare-after <path>`、`--compare-output <path>` 对比两份已有报告，输出 PASS/WARN/FAIL 结论。缺少 `--compare-before` 或 `--compare-after` 时报错退出。
 - Gate 模式：`--gate` 输出精简结果 `OVERALL=PASS|WARN|FAIL|N/A` 并返回退出码（PASS=0, FAIL=1, N/A=2；WARN 默认=0，`--gate-strict` 下 WARN=2）。可用作 CI / 收尾阶段的自动化门禁。规范见 `notes/agent-eval/specs/EVAL-GATE-SPEC-2026-04-20.md`。
+- 推荐收尾命令：
+  - `make trace-compare`：生成最新报告并输出对比报告
+  - `make eval-gate`：执行宽松门禁（仅 FAIL 阻断）
+  - `make eval-gate-strict`：执行严格门禁（WARN/FAIL 都阻断）
 
 #### embedding_test（Embedding Provider 端到端验证）
 

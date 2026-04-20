@@ -90,6 +90,8 @@ pub trait Retriever {
 
 pub mod cached_embedding;
 pub mod embedding;
+pub mod guarded;
 pub mod hybrid;
 pub mod rule;
+pub mod semantic;
 pub mod shadow;

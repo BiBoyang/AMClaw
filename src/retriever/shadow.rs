@@ -13,6 +13,11 @@ use std::time::Instant;
 /// - 用户可见行为与 RuleRetriever 完全一致（零回归）
 /// - hybrid 计算失败不影响 rule 结果（静默失败，仅日志）
 /// - 保持一键回退 rule（shadow 即 rule + 可选观测）
+///
+/// 验收口径（3 条）：
+/// 1. shadow 输出内容与 rule 一致（id / content / 顺序）—— 仅 metadata 允许差异（retrieval_mode=shadow）。
+/// 2. shadow 不阻塞主返回（hybrid 慢时也快速返回 rule 结果，hybrid 在后台线程运行）。
+/// 3. rollout 不放量时稳定回退 rule（GuardedRetriever enabled=false 时始终走 fallback）。
 pub struct ShadowRetriever {
     rule_retriever: RuleRetriever,
     hybrid_retriever: Option<Arc<dyn Retriever + Send + Sync>>,
@@ -36,7 +41,6 @@ impl ShadowRetriever {
         self.name = name.into();
         self
     }
-
 }
 
 /// 结构化日志记录 shadow 与 hybrid 的对比结果。
@@ -94,21 +98,19 @@ impl Retriever for ShadowRetriever {
                 let hybrid = Arc::clone(hybrid);
                 let query = query.clone();
                 let rule_result = rule_result.clone();
-                std::thread::spawn(move || {
-                    match hybrid.retrieve(&query) {
-                        Ok(hybrid_result) => {
-                            log_shadow_comparison(&query, &rule_result, &hybrid_result);
-                        }
-                        Err(err) => {
-                            emit_structured_log(
-                                "warn",
-                                "shadow_hybrid_failed",
-                                vec![
-                                    ("user_id", json!(&query.user_id)),
-                                    ("error", json!(err.to_string())),
-                                ],
-                            );
-                        }
+                std::thread::spawn(move || match hybrid.retrieve(&query) {
+                    Ok(hybrid_result) => {
+                        log_shadow_comparison(&query, &rule_result, &hybrid_result);
+                    }
+                    Err(err) => {
+                        emit_structured_log(
+                            "warn",
+                            "shadow_hybrid_failed",
+                            vec![
+                                ("user_id", json!(&query.user_id)),
+                                ("error", json!(err.to_string())),
+                            ],
+                        );
                     }
                 });
             }
@@ -252,5 +254,85 @@ mod tests {
             .expect("检索应成功");
 
         assert!(result.candidates.is_empty());
+    }
+
+    /// 一个慢速 hybrid mock，用于验证 shadow 非阻塞。
+    struct SlowHybridRetriever {
+        delay_ms: u64,
+    }
+
+    impl Retriever for SlowHybridRetriever {
+        fn retrieve(&self, _query: &RetrieveQuery) -> Result<RetrieveResult> {
+            std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+            Ok(RetrieveResult::empty("slow_hybrid"))
+        }
+    }
+
+    #[test]
+    fn shadow_retrieve_non_blocking() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        store
+            .add_user_memory_typed("user-s5", "快速返回", MemoryType::Auto, 70)
+            .expect("写入失败");
+
+        let hybrid = Box::new(SlowHybridRetriever { delay_ms: 300 });
+        let shadow = ShadowRetriever::new(&db_path, Some(hybrid));
+        let query = RetrieveQuery::new("user-s5", 5).with_query_text("测试");
+
+        let started = Instant::now();
+        let result = shadow.retrieve(&query).expect("检索失败");
+        let elapsed = started.elapsed().as_millis();
+
+        // 验收口径 #2：shadow 不应被 slow hybrid 阻塞，应快速返回
+        assert!(
+            elapsed < 100,
+            "shadow retrieve 应快速返回（<100ms），实际耗时 {}ms",
+            elapsed
+        );
+        // 返回的仍是 rule 结果
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].content, "快速返回");
+    }
+
+    #[test]
+    fn shadow_matches_rule_output() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        store
+            .add_user_memory_typed("user-s6", "第一条", MemoryType::Explicit, 90)
+            .expect("写入失败");
+        store
+            .add_user_memory_typed("user-s6", "第二条", MemoryType::Auto, 70)
+            .expect("写入失败");
+        store
+            .add_user_memory_typed("user-s6", "第三条", MemoryType::UserPreference, 80)
+            .expect("写入失败");
+
+        // 验收口径 #1：shadow 输出内容与 rule 一致
+        let rule = RuleRetriever::new(&db_path);
+        let shadow = ShadowRetriever::new(&db_path, None);
+        let query = RetrieveQuery::new("user-s6", 5);
+
+        let rule_result = rule.retrieve(&query).expect("rule 检索失败");
+        let shadow_result = shadow.retrieve(&query).expect("shadow 检索失败");
+
+        assert_eq!(rule_result.candidates.len(), shadow_result.candidates.len());
+        for (rule_item, shadow_item) in rule_result
+            .candidates
+            .iter()
+            .zip(shadow_result.candidates.iter())
+        {
+            assert_eq!(rule_item.id, shadow_item.id);
+            assert_eq!(rule_item.content, shadow_item.content);
+            assert_eq!(rule_item.score, shadow_item.score);
+            assert_eq!(rule_item.source_type, shadow_item.source_type);
+        }
+
+        // metadata 允许差异：shadow 应带 retrieval_mode=shadow
+        assert_eq!(
+            shadow_result.candidates[0].metadata.get("retrieval_mode"),
+            Some(&"shadow".to_string())
+        );
     }
 }

@@ -211,6 +211,8 @@ fn main() {
     let mut compare_before = None;
     let mut compare_after = None;
     let mut compare_output = None;
+    let mut gate_mode = false;
+    let mut gate_strict = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -255,6 +257,13 @@ fn main() {
                     compare_output = Some(PathBuf::from(v));
                 }
             }
+            "--gate" => {
+                gate_mode = true;
+            }
+            "--gate-strict" => {
+                gate_mode = true;
+                gate_strict = true;
+            }
             _ => {}
         }
     }
@@ -276,7 +285,13 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        run_compare_mode(&before, &after, compare_output.as_ref());
+        run_compare_mode(
+            &before,
+            &after,
+            compare_output.as_ref(),
+            gate_mode,
+            gate_strict,
+        );
         return;
     }
 
@@ -1724,6 +1739,10 @@ fn compute_overall(
         .iter()
         .filter(|v| v.verdict == Verdict::Warn)
         .count();
+    let na_count = core_verdicts
+        .iter()
+        .filter(|v| v.verdict == Verdict::Na)
+        .count();
 
     // Base verdict
     let mut overall = if fail_count > 0 {
@@ -1736,6 +1755,15 @@ fn compute_overall(
         reasons.push("全部核心指标 PASS".to_string());
         Verdict::Pass
     };
+
+    // N/A rule: 超过 2 个 N/A 时总体最多 WARN
+    if na_count > 2 {
+        reasons.push(format!(
+            "核心指标中 {} 项 N/A（>2），综合结论封顶 WARN",
+            na_count
+        ));
+        overall = cap_at_warn(overall);
+    }
 
     // Hard thresholds (additional safety check)
     let unknown_rate = after.unknown_failure_rate.unwrap_or(0.0);
@@ -1777,6 +1805,15 @@ fn compute_overall(
         overall = downgrade(overall);
     }
 
+    // Sample protection: after.total_runs < 20 => 总体最多 WARN
+    if after.total_runs < 20 {
+        reasons.push(format!(
+            "after 样本量 {} < 20，综合结论封顶 WARN",
+            after.total_runs
+        ));
+        overall = cap_at_warn(overall);
+    }
+
     (overall, reasons)
 }
 
@@ -1786,6 +1823,14 @@ fn downgrade(v: Verdict) -> Verdict {
         Verdict::Warn => Verdict::Fail,
         Verdict::Fail => Verdict::Fail,
         Verdict::Na => Verdict::Na,
+    }
+}
+
+/// 封顶为 WARN（不升级到 FAIL，不降级到 PASS）。
+fn cap_at_warn(v: Verdict) -> Verdict {
+    match v {
+        Verdict::Pass => Verdict::Warn,
+        other => other,
     }
 }
 
@@ -2012,7 +2057,13 @@ fn build_compare_report(
 // Compare mode orchestration
 // -------------------------------------------------------------------------
 
-fn run_compare_mode(before_path: &Path, after_path: &Path, output_path: Option<&PathBuf>) {
+fn run_compare_mode(
+    before_path: &Path,
+    after_path: &Path,
+    output_path: Option<&PathBuf>,
+    gate_mode: bool,
+    gate_strict: bool,
+) {
     let before_content = match fs::read_to_string(before_path) {
         Ok(c) => c,
         Err(e) => {
@@ -2167,6 +2218,26 @@ fn run_compare_mode(before_path: &Path, after_path: &Path, output_path: Option<&
         overall,
         &reasons,
     );
+
+    // Gate mode:精简输出
+    if gate_mode {
+        println!("OVERALL={}", verdict_str(overall));
+        if !reasons.is_empty() {
+            println!("REASONS={}", reasons.join("; "));
+        }
+        match overall {
+            Verdict::Pass => std::process::exit(0),
+            Verdict::Warn => {
+                if gate_strict {
+                    std::process::exit(2);
+                } else {
+                    std::process::exit(0);
+                }
+            }
+            Verdict::Fail => std::process::exit(1),
+            Verdict::Na => std::process::exit(2),
+        }
+    }
 
     if let Some(path) = output_path {
         if let Some(parent) = path.parent() {
@@ -2679,6 +2750,7 @@ mod tests {
         let after = CompareMetrics {
             baseline_run_ids: 100,
             baseline_hits: 85,
+            total_runs: 25,
             ..Default::default()
         };
 
@@ -2702,7 +2774,10 @@ mod tests {
     #[test]
     fn test_overall_all_pass() {
         let before = CompareMetrics::default();
-        let after = CompareMetrics::default();
+        let after = CompareMetrics {
+            total_runs: 25,
+            ..Default::default()
+        };
         let core = vec![
             SingleVerdict {
                 metric: "success_rate",
@@ -2728,7 +2803,10 @@ mod tests {
     #[test]
     fn test_overall_warn_only() {
         let before = CompareMetrics::default();
-        let after = CompareMetrics::default();
+        let after = CompareMetrics {
+            total_runs: 25,
+            ..Default::default()
+        };
         let core = vec![
             SingleVerdict {
                 metric: "success_rate",
@@ -2754,7 +2832,10 @@ mod tests {
     #[test]
     fn test_overall_any_fail() {
         let before = CompareMetrics::default();
-        let after = CompareMetrics::default();
+        let after = CompareMetrics {
+            total_runs: 25,
+            ..Default::default()
+        };
         let core = vec![
             SingleVerdict {
                 metric: "success_rate",
@@ -2782,6 +2863,7 @@ mod tests {
         let before = CompareMetrics::default();
         let after = CompareMetrics {
             unknown_failure_rate: Some(11.0),
+            total_runs: 25,
             ..Default::default()
         };
         let core = vec![SingleVerdict {
@@ -2805,6 +2887,7 @@ mod tests {
         };
         let after = CompareMetrics {
             success_rate: Some(74.0),
+            total_runs: 25,
             ..Default::default()
         };
         let core = vec![];
@@ -3342,5 +3425,170 @@ mod tests {
             "report:\n{}",
             report
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Gate mode tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gate_all_pass_overall_pass() {
+        let before = CompareMetrics::default();
+        let after = CompareMetrics {
+            total_runs: 25,
+            ..Default::default()
+        };
+        let core = vec![
+            SingleVerdict {
+                metric: "success_rate",
+                before: 80.0,
+                after: 82.0,
+                delta: 2.0,
+                verdict: Verdict::Pass,
+                note: "无退化".to_string(),
+            },
+            SingleVerdict {
+                metric: "fallback_rate",
+                before: 30.0,
+                after: 28.0,
+                delta: -2.0,
+                verdict: Verdict::Pass,
+                note: "无退化".to_string(),
+            },
+        ];
+        let (overall, reasons) = compute_overall(&core, &[], &before, &after);
+        assert_eq!(
+            overall,
+            Verdict::Pass,
+            "全 PASS 应总体 PASS, reasons={:?}",
+            reasons
+        );
+    }
+
+    #[test]
+    fn test_gate_core_fail_overall_fail() {
+        let before = CompareMetrics::default();
+        let after = CompareMetrics {
+            total_runs: 25,
+            ..Default::default()
+        };
+        let core = vec![
+            SingleVerdict {
+                metric: "success_rate",
+                before: 80.0,
+                after: 74.0,
+                delta: -6.0,
+                verdict: Verdict::Fail,
+                note: "明显退化".to_string(),
+            },
+            SingleVerdict {
+                metric: "fallback_rate",
+                before: 30.0,
+                after: 28.0,
+                delta: -2.0,
+                verdict: Verdict::Pass,
+                note: "无退化".to_string(),
+            },
+        ];
+        let (overall, reasons) = compute_overall(&core, &[], &before, &after);
+        assert_eq!(
+            overall,
+            Verdict::Fail,
+            "core 有 FAIL 应总体 FAIL, reasons={:?}",
+            reasons
+        );
+    }
+
+    #[test]
+    fn test_gate_only_warn_overall_warn() {
+        let before = CompareMetrics::default();
+        let after = CompareMetrics {
+            total_runs: 25,
+            ..Default::default()
+        };
+        let core = vec![
+            SingleVerdict {
+                metric: "success_rate",
+                before: 80.0,
+                after: 77.0,
+                delta: -3.0,
+                verdict: Verdict::Warn,
+                note: "退化 3pp".to_string(),
+            },
+            SingleVerdict {
+                metric: "fallback_rate",
+                before: 30.0,
+                after: 28.0,
+                delta: -2.0,
+                verdict: Verdict::Pass,
+                note: "无退化".to_string(),
+            },
+        ];
+        let (overall, reasons) = compute_overall(&core, &[], &before, &after);
+        assert_eq!(
+            overall,
+            Verdict::Warn,
+            "仅 WARN 应总体 WARN, reasons={:?}",
+            reasons
+        );
+    }
+
+    #[test]
+    fn test_gate_small_sample_caps_at_warn() {
+        let before = CompareMetrics::default();
+        let after = CompareMetrics {
+            total_runs: 15, // < 20
+            ..Default::default()
+        };
+        let core = vec![SingleVerdict {
+            metric: "success_rate",
+            before: 80.0,
+            after: 82.0,
+            delta: 2.0,
+            verdict: Verdict::Pass,
+            note: "无退化".to_string(),
+        }];
+        let (overall, reasons) = compute_overall(&core, &[], &before, &after);
+        // 全 PASS 但样本不足，封顶 WARN
+        assert_eq!(
+            overall,
+            Verdict::Warn,
+            "样本不足时应封顶 WARN, reasons={:?}",
+            reasons
+        );
+        assert!(reasons.iter().any(|r| r.contains("样本量")));
+    }
+
+    #[test]
+    fn test_gate_baseline_drop_downgrades() {
+        let before = CompareMetrics {
+            baseline_run_ids: 100,
+            baseline_hits: 100,
+            total_runs: 30,
+            ..Default::default()
+        };
+        let after = CompareMetrics {
+            baseline_run_ids: 100,
+            baseline_hits: 75, // 下降 25pp > 20pp
+            total_runs: 30,
+            ..Default::default()
+        };
+        let core = vec![SingleVerdict {
+            metric: "success_rate",
+            before: 80.0,
+            after: 80.0,
+            delta: 0.0,
+            verdict: Verdict::Pass,
+            note: "无退化".to_string(),
+        }];
+        let (overall, reasons) = compute_overall(&core, &[], &before, &after);
+        // 全 PASS 但 baseline 覆盖下降 >20pp，降级一档 = WARN
+        assert_eq!(
+            overall,
+            Verdict::Warn,
+            "baseline 下降应降级, reasons={:?}",
+            reasons
+        );
+        assert!(reasons.iter().any(|r| r.contains("baseline 覆盖率下降")));
     }
 }

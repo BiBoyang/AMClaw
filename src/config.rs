@@ -31,6 +31,8 @@ pub struct AgentConfig {
     pub memory_max_single_chars: usize,
     pub retriever_mode: String,
     pub embedding_provider: String,
+    pub retriever_rollout_enabled: bool,
+    pub retriever_rollout_allow_users: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +116,8 @@ impl Default for AgentConfig {
             memory_max_single_chars: 160,
             retriever_mode: "rule".to_string(),
             embedding_provider: "noop".to_string(),
+            retriever_rollout_enabled: false,
+            retriever_rollout_allow_users: vec![],
         }
     }
 }

@@ -2,8 +2,10 @@ use crate::config::AgentConfig;
 use crate::context_pack::*;
 use crate::retriever::cached_embedding::CachedEmbeddingProvider;
 use crate::retriever::embedding::NoOpEmbeddingProvider;
+use crate::retriever::guarded::GuardedRetriever;
 use crate::retriever::hybrid::HybridRetriever;
 use crate::retriever::rule::RuleRetriever;
+use crate::retriever::semantic::SemanticRetriever;
 use crate::retriever::shadow::ShadowRetriever;
 use crate::retriever::Retriever;
 use crate::session_summary::*;
@@ -66,27 +68,43 @@ impl RetrieverMode {
 ///
 /// - semantic / hybrid / shadow 根据 embedding_provider 配置选择 provider
 /// - embedding_provider = "noop" 时 fallback 到 rule
+/// - semantic / hybrid / shadow 外层包 GuardedRetriever 做灰度控制
 fn select_retriever(
     mode: RetrieverMode,
     db_path: Option<&Path>,
     embedding_provider_name: &str,
+    rollout_enabled: bool,
+    allow_users: &[String],
 ) -> Box<dyn Retriever + Send + Sync> {
     match (mode, db_path) {
         (RetrieverMode::Rule, Some(path)) => Box::new(RuleRetriever::new(path)),
         (RetrieverMode::Rule, None) => Box::new(NoOpRetriever),
         (RetrieverMode::Semantic, Some(path)) => {
-            log_agent_info(
-                "retriever_mode_fallback",
-                vec![
-                    ("requested_mode", json!("semantic")),
-                    ("actual_mode", json!("rule")),
-                    (
-                        "reason",
-                        json!("semantic retriever not yet implemented, falling back to rule_v1"),
-                    ),
-                ],
-            );
-            Box::new(RuleRetriever::new(path).with_name("rule_v1_semantic_fallback"))
+            let inner_provider = match crate::retriever::embedding::create_embedding_provider(
+                embedding_provider_name,
+            ) {
+                Ok(p) => p,
+                Err(err) => {
+                    log_agent_warn(
+                        "embedding_provider_init_failed",
+                        vec![
+                            ("provider", json!(embedding_provider_name)),
+                            ("error", json!(err.to_string())),
+                            ("fallback", json!("NoOpEmbeddingProvider")),
+                        ],
+                    );
+                    Box::new(NoOpEmbeddingProvider::new())
+                }
+            };
+            let provider = Box::new(CachedEmbeddingProvider::new(inner_provider, path));
+            let primary = Box::new(SemanticRetriever::new(path, provider));
+            let fallback = Box::new(RuleRetriever::new(path));
+            Box::new(GuardedRetriever::new(
+                primary,
+                fallback,
+                rollout_enabled,
+                allow_users.to_vec(),
+            ))
         }
         (RetrieverMode::Semantic, None) => {
             log_agent_info(
@@ -117,7 +135,14 @@ fn select_retriever(
                 }
             };
             let provider = Box::new(CachedEmbeddingProvider::new(inner_provider, path));
-            Box::new(HybridRetriever::new(path, provider))
+            let primary = Box::new(HybridRetriever::new(path, provider));
+            let fallback = Box::new(RuleRetriever::new(path));
+            Box::new(GuardedRetriever::new(
+                primary,
+                fallback,
+                rollout_enabled,
+                allow_users.to_vec(),
+            ))
         }
         (RetrieverMode::Hybrid, None) => {
             log_agent_info(
@@ -149,7 +174,14 @@ fn select_retriever(
             };
             let provider = Box::new(CachedEmbeddingProvider::new(inner_provider, path));
             let hybrid = Box::new(HybridRetriever::new(path, provider));
-            Box::new(ShadowRetriever::new(path, Some(hybrid)))
+            let primary = Box::new(ShadowRetriever::new(path, Some(hybrid)));
+            let fallback = Box::new(RuleRetriever::new(path));
+            Box::new(GuardedRetriever::new(
+                primary,
+                fallback,
+                rollout_enabled,
+                allow_users.to_vec(),
+            ))
         }
         (RetrieverMode::Shadow, None) => {
             log_agent_info(
@@ -1678,6 +1710,8 @@ impl AgentCore {
             ContextCompactionConfig::from_agent_config(agent_config),
             Some(agent_config.retriever_mode.as_str()),
             Some(agent_config.embedding_provider.as_str()),
+            agent_config.retriever_rollout_enabled,
+            &agent_config.retriever_rollout_allow_users,
         )
     }
 
@@ -1708,6 +1742,8 @@ impl AgentCore {
             context_compaction,
             None,
             None,
+            false,
+            &[],
         )
     }
 
@@ -1718,6 +1754,8 @@ impl AgentCore {
         context_compaction: ContextCompactionConfig,
         retriever_mode: Option<&str>,
         embedding_provider: Option<&str>,
+        retriever_rollout_enabled: bool,
+        retriever_rollout_allow_users: &[String],
     ) -> Result<Self> {
         if max_steps == 0 {
             bail!("max_steps 必须大于 0");
@@ -1734,8 +1772,13 @@ impl AgentCore {
             None => RetrieverMode::Rule,
         };
         let embedding_provider_name = embedding_provider.unwrap_or("noop");
-        let retriever =
-            select_retriever(mode, task_store_db_path.as_deref(), embedding_provider_name);
+        let retriever = select_retriever(
+            mode,
+            task_store_db_path.as_deref(),
+            embedding_provider_name,
+            retriever_rollout_enabled,
+            retriever_rollout_allow_users,
+        );
 
         Ok(Self {
             workspace_root: workspace_root.clone(),
@@ -7669,7 +7712,13 @@ mod tests {
             )
             .expect("写入失败");
 
-        let retriever = select_retriever(RetrieverMode::Semantic, Some(&db_path), "noop");
+        let retriever = select_retriever(
+            RetrieverMode::Semantic,
+            Some(&db_path),
+            "noop",
+            true,
+            &["user-semantic-fb".to_string()],
+        );
         let query = crate::retriever::RetrieveQuery::new("user-semantic-fb", 10);
         let result = retriever.retrieve(&query).expect("检索应成功");
 
@@ -7696,7 +7745,13 @@ mod tests {
             )
             .expect("写入失败");
 
-        let retriever = select_retriever(RetrieverMode::Hybrid, Some(&db_path), "noop");
+        let retriever = select_retriever(
+            RetrieverMode::Hybrid,
+            Some(&db_path),
+            "noop",
+            true,
+            &["user-hybrid-sel".to_string()],
+        );
         let query =
             crate::retriever::RetrieveQuery::new("user-hybrid-sel", 10).with_query_text("测试");
         let result = retriever.retrieve(&query).expect("检索应成功");
@@ -7725,7 +7780,13 @@ mod tests {
             )
             .expect("写入失败");
 
-        let retriever = select_retriever(RetrieverMode::Shadow, Some(&db_path), "noop");
+        let retriever = select_retriever(
+            RetrieverMode::Shadow,
+            Some(&db_path),
+            "noop",
+            true,
+            &["user-shadow-sel".to_string()],
+        );
         let query =
             crate::retriever::RetrieveQuery::new("user-shadow-sel", 10).with_query_text("测试");
         let result = retriever.retrieve(&query).expect("检索应成功");
@@ -7754,13 +7815,120 @@ mod tests {
             )
             .expect("写入失败");
 
-        let retriever = select_retriever(RetrieverMode::Rule, Some(&db_path), "noop");
+        let retriever = select_retriever(RetrieverMode::Rule, Some(&db_path), "noop", false, &[]);
         let query = crate::retriever::RetrieveQuery::new("user-rule-sel", 10);
         let result = retriever.retrieve(&query).expect("检索应成功");
 
         assert_eq!(result.retriever_name, "rule_v1");
         assert_eq!(result.candidates.len(), 1);
         assert_eq!(result.candidates[0].content, "规则检索测试");
+    }
+
+    // -----------------------------------------------------------------
+    // Step 3.4: rollout 回退链路测试（agent_core 侧）
+    // 验收口径 #3：rollout 不放量时稳定回退 rule
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn rollout_disabled_semantic_fallback_to_rule() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        store
+            .add_user_memory_typed(
+                "user-rollout-disabled",
+                "禁用 rollout",
+                MemoryType::UserPreference,
+                80,
+            )
+            .expect("写入失败");
+
+        // rollout_enabled=false → 应回退到 rule
+        let retriever = select_retriever(
+            RetrieverMode::Semantic,
+            Some(&db_path),
+            "noop",
+            false, // disabled
+            &[],
+        );
+        let query = crate::retriever::RetrieveQuery::new("user-rollout-disabled", 10)
+            .with_query_text("测试");
+        let result = retriever.retrieve(&query).expect("检索应成功");
+
+        assert_eq!(result.retriever_name, "rule_v1");
+        assert_eq!(
+            result.candidates[0].metadata.get("retrieval_mode"),
+            Some(&"rollout_fallback_rule".to_string())
+        );
+        assert_eq!(
+            result.candidates[0].metadata.get("rollout_reason"),
+            Some(&"rollout_disabled".to_string())
+        );
+    }
+
+    #[test]
+    fn rollout_allowlist_miss_hybrid_fallback_to_rule() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        store
+            .add_user_memory_typed(
+                "user-rollout-miss",
+                "不在 allowlist",
+                MemoryType::UserPreference,
+                80,
+            )
+            .expect("写入失败");
+
+        // enabled=true 但 allowlist 不匹配 → 回退到 rule
+        let retriever = select_retriever(
+            RetrieverMode::Hybrid,
+            Some(&db_path),
+            "noop",
+            true, // enabled
+            &["other-user".to_string()],
+        );
+        let query =
+            crate::retriever::RetrieveQuery::new("user-rollout-miss", 10).with_query_text("测试");
+        let result = retriever.retrieve(&query).expect("检索应成功");
+
+        assert_eq!(result.retriever_name, "rule_v1");
+        assert_eq!(
+            result.candidates[0].metadata.get("rollout_reason"),
+            Some(&"user_not_in_allowlist".to_string())
+        );
+    }
+
+    #[test]
+    fn rollout_allowlist_hit_shadow_uses_primary() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        store
+            .add_user_memory_typed(
+                "user-rollout-hit",
+                "命中 allowlist",
+                MemoryType::UserPreference,
+                80,
+            )
+            .expect("写入失败");
+
+        // enabled=true + allowlist 命中 → 走 shadow primary（对外仍是 rule 结果）
+        let retriever = select_retriever(
+            RetrieverMode::Shadow,
+            Some(&db_path),
+            "noop",
+            true, // enabled
+            &["user-rollout-hit".to_string()],
+        );
+        let query =
+            crate::retriever::RetrieveQuery::new("user-rollout-hit", 10).with_query_text("测试");
+        let result = retriever.retrieve(&query).expect("检索应成功");
+
+        // Shadow primary 对外返回 rule 内容，但 metadata 带 rollout_allowed
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].content, "命中 allowlist");
+        assert_eq!(
+            result.candidates[0].metadata.get("rollout_allowed"),
+            Some(&"true".to_string())
+        );
     }
 
     #[test]

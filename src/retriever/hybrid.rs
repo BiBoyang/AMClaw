@@ -284,9 +284,8 @@ mod tests {
                 .bytes()
                 .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
             let mut vec = vec![0.0f32; 4];
-            for i in 0..4 {
-                let val = ((hash.wrapping_add(i as u64)) % 1000) as f32 / 1000.0;
-                vec[i] = val;
+            for (i, slot) in vec.iter_mut().enumerate() {
+                *slot = ((hash.wrapping_add(i as u64)) % 1000) as f32 / 1000.0;
             }
             Ok(vec)
         }

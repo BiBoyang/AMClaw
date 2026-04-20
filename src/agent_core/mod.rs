@@ -1,6 +1,10 @@
 use crate::config::AgentConfig;
 use crate::context_pack::*;
+use crate::retriever::cached_embedding::CachedEmbeddingProvider;
+use crate::retriever::embedding::NoOpEmbeddingProvider;
+use crate::retriever::hybrid::HybridRetriever;
 use crate::retriever::rule::RuleRetriever;
+use crate::retriever::shadow::ShadowRetriever;
 use crate::retriever::Retriever;
 use crate::session_summary::*;
 use crate::task_store::{
@@ -30,6 +34,136 @@ const DEFAULT_MAX_REPLANS: usize = 3;
 const DEFAULT_OPENAI_MODEL: &str = "deepseek-chat";
 const DEFAULT_MOONSHOT_MODEL: &str = "kimi-k2.5";
 const LLM_PROVIDER_PRIORITY: [&str; 3] = ["DEEPSEEK", "MOONSHOT", "OPENAI"];
+
+/// 检索模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum RetrieverMode {
+    /// 规则法（默认）：priority / useful / use_count 排序
+    Rule,
+    /// 语义检索（尚未实现，临时回退到 Rule）
+    Semantic,
+    /// 混合检索（尚未实现，临时回退到 Rule）
+    Hybrid,
+    /// Shadow：并行运行语义但只用规则结果（尚未实现，临时回退到 Rule）
+    Shadow,
+}
+
+impl RetrieverMode {
+    /// 从配置字符串解析。非法值明确报错。
+    fn from_config(text: &str) -> Result<Self> {
+        match text {
+            "rule" => Ok(Self::Rule),
+            "semantic" => Ok(Self::Semantic),
+            "hybrid" => Ok(Self::Hybrid),
+            "shadow" => Ok(Self::Shadow),
+            other => bail!("非法 retriever_mode: {other}。合法值: rule, semantic, hybrid, shadow"),
+        }
+    }
+}
+
+/// 根据 mode、db_path 和 embedding_provider 选择 retriever。
+///
+/// - semantic / hybrid / shadow 根据 embedding_provider 配置选择 provider
+/// - embedding_provider = "noop" 时 fallback 到 rule
+fn select_retriever(
+    mode: RetrieverMode,
+    db_path: Option<&Path>,
+    embedding_provider_name: &str,
+) -> Box<dyn Retriever + Send + Sync> {
+    match (mode, db_path) {
+        (RetrieverMode::Rule, Some(path)) => Box::new(RuleRetriever::new(path)),
+        (RetrieverMode::Rule, None) => Box::new(NoOpRetriever),
+        (RetrieverMode::Semantic, Some(path)) => {
+            log_agent_info(
+                "retriever_mode_fallback",
+                vec![
+                    ("requested_mode", json!("semantic")),
+                    ("actual_mode", json!("rule")),
+                    (
+                        "reason",
+                        json!("semantic retriever not yet implemented, falling back to rule_v1"),
+                    ),
+                ],
+            );
+            Box::new(RuleRetriever::new(path).with_name("rule_v1_semantic_fallback"))
+        }
+        (RetrieverMode::Semantic, None) => {
+            log_agent_info(
+                "retriever_mode_fallback_noop",
+                vec![
+                    ("requested_mode", json!("semantic")),
+                    ("actual_mode", json!("noop")),
+                    ("reason", json!("no db_path, using NoOpRetriever")),
+                ],
+            );
+            Box::new(NoOpRetriever)
+        }
+        (RetrieverMode::Hybrid, Some(path)) => {
+            let inner_provider = match crate::retriever::embedding::create_embedding_provider(
+                embedding_provider_name,
+            ) {
+                Ok(p) => p,
+                Err(err) => {
+                    log_agent_warn(
+                        "embedding_provider_init_failed",
+                        vec![
+                            ("provider", json!(embedding_provider_name)),
+                            ("error", json!(err.to_string())),
+                            ("fallback", json!("NoOpEmbeddingProvider")),
+                        ],
+                    );
+                    Box::new(NoOpEmbeddingProvider::new())
+                }
+            };
+            let provider = Box::new(CachedEmbeddingProvider::new(inner_provider, path));
+            Box::new(HybridRetriever::new(path, provider))
+        }
+        (RetrieverMode::Hybrid, None) => {
+            log_agent_info(
+                "retriever_mode_fallback_noop",
+                vec![
+                    ("requested_mode", json!("hybrid")),
+                    ("actual_mode", json!("noop")),
+                    ("reason", json!("no db_path, using NoOpRetriever")),
+                ],
+            );
+            Box::new(NoOpRetriever)
+        }
+        (RetrieverMode::Shadow, Some(path)) => {
+            let inner_provider = match crate::retriever::embedding::create_embedding_provider(
+                embedding_provider_name,
+            ) {
+                Ok(p) => p,
+                Err(err) => {
+                    log_agent_warn(
+                        "embedding_provider_init_failed",
+                        vec![
+                            ("provider", json!(embedding_provider_name)),
+                            ("error", json!(err.to_string())),
+                            ("fallback", json!("NoOpEmbeddingProvider")),
+                        ],
+                    );
+                    Box::new(NoOpEmbeddingProvider::new())
+                }
+            };
+            let provider = Box::new(CachedEmbeddingProvider::new(inner_provider, path));
+            let hybrid = Box::new(HybridRetriever::new(path, provider));
+            Box::new(ShadowRetriever::new(path, Some(hybrid)))
+        }
+        (RetrieverMode::Shadow, None) => {
+            log_agent_info(
+                "retriever_mode_fallback_noop",
+                vec![
+                    ("requested_mode", json!("shadow")),
+                    ("actual_mode", json!("noop")),
+                    ("reason", json!("no db_path, using NoOpRetriever")),
+                ],
+            );
+            Box::new(NoOpRetriever)
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct ContextCompactionConfig {
@@ -711,6 +845,12 @@ struct SessionState {
     retrieval_candidate_count: usize,
     /// 预算裁剪后命中（注入）条数
     retrieval_hit_count: usize,
+    /// 检索模式（rule / hybrid / semantic / shadow）
+    retrieval_mode: String,
+    /// 检索回退原因（如 embedding 失败、query_text 为空）
+    retrieval_fallback_reason: Option<String>,
+    /// 候选结果是否包含语义分数（hybrid/semantic 时为 true）
+    retrieval_scores_present: bool,
 }
 
 impl SessionState {
@@ -771,6 +911,9 @@ impl SessionState {
             retrieval_latency_ms: 0,
             retrieval_candidate_count: 0,
             retrieval_hit_count: 0,
+            retrieval_mode: String::new(),
+            retrieval_fallback_reason: None,
+            retrieval_scores_present: false,
         }
     }
 
@@ -1528,11 +1671,13 @@ impl AgentCore {
         task_store_db_path: impl Into<PathBuf>,
         agent_config: &AgentConfig,
     ) -> Result<Self> {
-        Self::with_max_steps_and_task_store_db_path_with_compaction(
+        Self::with_max_steps_and_task_store_db_path_with_compaction_and_retriever_mode(
             workspace_root,
             DEFAULT_MAX_STEPS,
             Some(task_store_db_path),
             ContextCompactionConfig::from_agent_config(agent_config),
+            Some(agent_config.retriever_mode.as_str()),
+            Some(agent_config.embedding_provider.as_str()),
         )
     }
 
@@ -1556,6 +1701,24 @@ impl AgentCore {
         task_store_db_path: Option<impl Into<PathBuf>>,
         context_compaction: ContextCompactionConfig,
     ) -> Result<Self> {
+        Self::with_max_steps_and_task_store_db_path_with_compaction_and_retriever_mode(
+            workspace_root,
+            max_steps,
+            task_store_db_path,
+            context_compaction,
+            None,
+            None,
+        )
+    }
+
+    fn with_max_steps_and_task_store_db_path_with_compaction_and_retriever_mode(
+        workspace_root: impl Into<PathBuf>,
+        max_steps: usize,
+        task_store_db_path: Option<impl Into<PathBuf>>,
+        context_compaction: ContextCompactionConfig,
+        retriever_mode: Option<&str>,
+        embedding_provider: Option<&str>,
+    ) -> Result<Self> {
         if max_steps == 0 {
             bail!("max_steps 必须大于 0");
         }
@@ -1565,10 +1728,15 @@ impl AgentCore {
             workspace_root.clone(),
             task_store_db_path.clone(),
         )?;
-        let retriever: Box<dyn Retriever + Send + Sync> = match &task_store_db_path {
-            Some(db_path) => Box::new(RuleRetriever::new(db_path)),
-            None => Box::new(NoOpRetriever),
+
+        let mode = match retriever_mode {
+            Some(text) => RetrieverMode::from_config(text)?,
+            None => RetrieverMode::Rule,
         };
+        let embedding_provider_name = embedding_provider.unwrap_or("noop");
+        let retriever =
+            select_retriever(mode, task_store_db_path.as_deref(), embedding_provider_name);
+
         Ok(Self {
             workspace_root: workspace_root.clone(),
             tool_registry,
@@ -1713,6 +1881,7 @@ impl AgentCore {
             &trace,
             self.context_compaction.memory_budget,
             self.retriever.as_ref(),
+            false,
         )?;
         project_session_state_to_trace(&mut trace, &session_state);
         let runtime_session_state =
@@ -1999,6 +2168,7 @@ impl AgentCore {
             trace,
             self.context_compaction.memory_budget,
             self.retriever.as_ref(),
+            step == 0,
         ) {
             Ok(result) => result,
             Err(err) => {
@@ -2519,10 +2689,13 @@ struct AgentRunTrace {
     memory_dropped_count: usize,   // 被裁剪掉的记忆条数
     memory_ids: Vec<String>,       // 注入记忆的 ID 列表
     // --- Retriever-level observability ---
-    retriever_name: String,           // 使用的检索器名称
-    retrieval_candidate_count: usize, // 检索器返回的候选条数
-    retrieval_hit_count: usize,       // 经裁剪后实际命中的条数
-    retrieval_latency_ms: u128,       // 检索耗时（毫秒）
+    retriever_name: String,                    // 使用的检索器名称
+    retrieval_candidate_count: usize,          // 检索器返回的候选条数
+    retrieval_hit_count: usize,                // 经裁剪后实际命中的条数
+    retrieval_latency_ms: u128,                // 检索耗时（毫秒）
+    retrieval_mode: String,                    // 检索模式（rule/hybrid/semantic/shadow）
+    retrieval_fallback_reason: Option<String>, // 回退原因
+    retrieval_scores_present: bool,            // 是否包含语义分数
     persistent_state_present: bool,
     persistent_state_source: Option<String>,
     persistent_state_updated: bool,
@@ -2677,6 +2850,20 @@ struct AgentTraceIndexEntry {
     recovery_action: Option<String>,
     #[serde(default)]
     recovery_result: Option<String>,
+    #[serde(default)]
+    retriever_name: String,
+    #[serde(default)]
+    retrieval_candidate_count: usize,
+    #[serde(default)]
+    retrieval_hit_count: usize,
+    #[serde(default)]
+    retrieval_latency_ms: u128,
+    #[serde(default)]
+    retrieval_mode: String,
+    #[serde(default)]
+    retrieval_fallback_reason: Option<String>,
+    #[serde(default)]
+    retrieval_scores_present: bool,
     context_pack_present: bool,
     context_pack_section_count: usize,
     context_pack_total_chars: usize,
@@ -2741,6 +2928,9 @@ impl AgentRunTrace {
             retrieval_candidate_count: 0,
             retrieval_hit_count: 0,
             retrieval_latency_ms: 0,
+            retrieval_mode: String::new(),
+            retrieval_fallback_reason: None,
+            retrieval_scores_present: false,
             persistent_state_present: context.user_session_state.is_some(),
             persistent_state_source: if context.user_session_state.is_some() {
                 Some("db".to_string())
@@ -3233,6 +3423,13 @@ impl AgentRunTrace {
                 .recovery_result
                 .as_ref()
                 .map(|result| result.as_str().to_string()),
+            retriever_name: self.retriever_name.clone(),
+            retrieval_candidate_count: self.retrieval_candidate_count,
+            retrieval_hit_count: self.retrieval_hit_count,
+            retrieval_latency_ms: self.retrieval_latency_ms,
+            retrieval_mode: self.retrieval_mode.clone(),
+            retrieval_fallback_reason: self.retrieval_fallback_reason.clone(),
+            retrieval_scores_present: self.retrieval_scores_present,
             context_pack_present: self.context_pack_present,
             context_pack_section_count: self.context_pack_section_count,
             context_pack_total_chars: self.context_pack_total_chars,
@@ -3363,6 +3560,23 @@ impl AgentRunTrace {
                 self.retrieval_latency_ms,
                 self.retrieval_candidate_count,
                 self.retrieval_hit_count,
+            ),
+            format!(
+                "- retrieval_mode: {}{}",
+                if self.retrieval_mode.is_empty() {
+                    "(none)"
+                } else {
+                    &self.retrieval_mode
+                },
+                if let Some(ref reason) = self.retrieval_fallback_reason {
+                    format!(" [fallback: {}]", reason)
+                } else {
+                    String::new()
+                }
+            ),
+            format!(
+                "- retrieval_scores_present: {}",
+                self.retrieval_scores_present
             ),
             String::new(),
             "## User Input".to_string(),
@@ -3929,6 +4143,11 @@ fn project_session_state_to_trace(trace: &mut AgentRunTrace, session_state: &Ses
         trace.retrieval_latency_ms = session_state.retrieval_latency_ms;
         trace.retrieval_candidate_count = session_state.retrieval_candidate_count;
         trace.retrieval_hit_count = session_state.retrieval_hit_count;
+        trace
+            .retrieval_mode
+            .clone_from(&session_state.retrieval_mode);
+        trace.retrieval_fallback_reason = session_state.retrieval_fallback_reason.clone();
+        trace.retrieval_scores_present = session_state.retrieval_scores_present;
     }
 }
 
@@ -3994,6 +4213,7 @@ fn load_business_context_snapshot(
     trace: &AgentRunTrace,
     memory_budget: MemoryBudget,
     retriever: &dyn crate::retriever::Retriever,
+    apply_feedback: bool,
 ) -> Result<(Option<BusinessContextSnapshot>, SessionState)> {
     let Some(db_path) = task_store_db_path else {
         return Ok((None, SessionState::default()));
@@ -4014,6 +4234,7 @@ fn load_business_context_snapshot(
     let mut session_state = SessionState::default();
     let user_memories = if let Some(user_id) = &trace.user_id {
         let query = crate::retriever::RetrieveQuery::new(user_id, 15)
+            .with_query_text(&trace.user_input)
             .with_hint(
                 "has_current_task",
                 if current_task.is_some() {
@@ -4022,7 +4243,23 @@ fn load_business_context_snapshot(
                     "false"
                 },
             )
-            .with_hint("plan_step_count", trace.active_plan_steps.len().to_string());
+            .with_hint("plan_step_count", trace.active_plan_steps.len().to_string())
+            .with_hint("source_type", &trace.source_type);
+
+        // query_text 为空时打日志，方便排查 hybrid/semantic 回退原因
+        if trace.user_input.trim().is_empty() {
+            log_agent_info(
+                "retrieve_query_text_empty",
+                vec![
+                    ("user_id", json!(user_id)),
+                    ("source_type", json!(&trace.source_type)),
+                    (
+                        "reason",
+                        json!("user_input is empty, semantic/hybrid may fallback to rule"),
+                    ),
+                ],
+            );
+        }
 
         match retriever.retrieve(&query) {
             Ok(retrieve_result) => {
@@ -4040,6 +4277,25 @@ fn load_business_context_snapshot(
                 session_state.retrieval_latency_ms = retrieve_result.latency_ms;
                 session_state.retrieval_candidate_count = session_state.retrieved_count();
                 session_state.retrieval_hit_count = session_state.injected_count();
+                // 从候选 metadata 中提取 retrieval_mode 和 fallback_reason
+                let first_mode = retrieve_result
+                    .candidates
+                    .first()
+                    .and_then(|item| item.metadata.get("retrieval_mode"))
+                    .cloned()
+                    .unwrap_or_default();
+                let fallback_reason = retrieve_result
+                    .candidates
+                    .first()
+                    .and_then(|item| item.metadata.get("fallback_reason"))
+                    .cloned();
+                let scores_present = retrieve_result.candidates.iter().any(|item| {
+                    item.metadata.contains_key("semantic_score")
+                        || item.metadata.contains_key("final_score")
+                });
+                session_state.retrieval_mode = first_mode;
+                session_state.retrieval_fallback_reason = fallback_reason;
+                session_state.retrieval_scores_present = scores_present;
                 let mut feedback_state = MemoryFeedbackState::default();
                 for memory in &session_state.retrieved {
                     feedback_state.record(&memory.id, FeedbackKind::Retrieved);
@@ -4078,14 +4334,16 @@ fn load_business_context_snapshot(
                         ("retrieval_latency_ms", json!(retrieve_result.latency_ms)),
                     ],
                 );
-                if let Err(err) = store.apply_memory_feedback(&feedback_state) {
-                    log_agent_warn(
-                        "agent_memory_feedback_apply_failed",
-                        vec![
-                            ("user_id", json!(user_id)),
-                            ("detail", json!(err.to_string())),
-                        ],
-                    );
+                if apply_feedback {
+                    if let Err(err) = store.apply_memory_feedback(&feedback_state) {
+                        log_agent_warn(
+                            "agent_memory_feedback_apply_failed",
+                            vec![
+                                ("user_id", json!(user_id)),
+                                ("detail", json!(err.to_string())),
+                            ],
+                        );
+                    }
                 }
                 session_state.injected.clone()
             }
@@ -5214,11 +5472,12 @@ mod tests {
         classify_tool_execution_failure, derive_runtime_session_state,
         detect_stalled_trajectory_failure, load_business_context_snapshot, map_llm_plan,
         parse_llm_plan, project_session_state_to_trace, select_previous_observations,
-        validate_expected_observation, AgentCore, AgentObservation, AgentRunContext, AgentRunTrace,
-        BusinessContextSnapshot, ContextAssembler, ContextPreviewMode, DoneRule, DropReason,
-        ExecutionPlan, ExpectedObservation, FailureAction, FailureDecision, GoalSignal, LlmPlan,
-        MemoryBudget, MinimumNovelty, ObservationKind, PlannedDecision, RecoveryOutcome,
-        ReplanScope, RuntimeSessionStateSnapshot, StepFailureKind,
+        select_retriever, validate_expected_observation, AgentCore, AgentObservation,
+        AgentRunContext, AgentRunTrace, BusinessContextSnapshot, ContextAssembler,
+        ContextPreviewMode, DoneRule, DropReason, ExecutionPlan, ExpectedObservation,
+        FailureAction, FailureDecision, GoalSignal, LlmPlan, MemoryBudget, MinimumNovelty,
+        ObservationKind, PlannedDecision, RecoveryOutcome, ReplanScope, RetrieverMode,
+        RuntimeSessionStateSnapshot, StepFailureKind,
     };
     use crate::context_pack::{ContextSectionChangeReason, ContextSectionKind};
     use crate::retriever::rule::RuleRetriever;
@@ -6553,6 +6812,7 @@ mod tests {
             &trace,
             MemoryBudget::default(),
             &RuleRetriever::new(&db_path),
+            false,
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -6589,6 +6849,7 @@ mod tests {
             &trace,
             MemoryBudget::default(),
             &RuleRetriever::new(&db_path),
+            false,
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -6693,6 +6954,7 @@ mod tests {
             &trace,
             MemoryBudget::default(),
             &RuleRetriever::new(&db_path),
+            true,
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -6732,6 +6994,7 @@ mod tests {
             &trace,
             MemoryBudget::default(),
             &RuleRetriever::new(&db_path),
+            false,
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -6766,6 +7029,7 @@ mod tests {
             &trace,
             MemoryBudget::default(),
             &RuleRetriever::new(&db_path),
+            false,
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -6791,6 +7055,7 @@ mod tests {
             &trace,
             MemoryBudget::default(),
             &RuleRetriever::new(&db_path),
+            false,
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -6819,6 +7084,7 @@ mod tests {
             &trace,
             MemoryBudget::default(),
             &RuleRetriever::new(&db_path),
+            false,
         )
         .expect("读取业务上下文失败");
         // 1 injected, 1 dropped (dedup)
@@ -6847,6 +7113,7 @@ mod tests {
             &trace,
             MemoryBudget::default(),
             &RuleRetriever::new(&db_path),
+            false,
         )
         .expect("读取业务上下文失败");
         // max_items=5, 7 条 → 5 injected, 2 dropped (budget exceeded)
@@ -6878,6 +7145,7 @@ mod tests {
             &trace,
             MemoryBudget::default(),
             &RuleRetriever::new(&db_path),
+            false,
         )
         .expect("读取业务上下文失败");
         // 1 injected (短记忆), 1 dropped (too long)
@@ -6908,6 +7176,7 @@ mod tests {
             &trace1,
             MemoryBudget::default(),
             &RuleRetriever::new(&db_path),
+            false,
         )
         .expect("读取业务上下文失败");
         // 第二轮（同一用户，不同 run）
@@ -6921,6 +7190,7 @@ mod tests {
             &trace2,
             MemoryBudget::default(),
             &RuleRetriever::new(&db_path),
+            false,
         )
         .expect("读取业务上下文失败");
         // 两轮独立，互不泄漏
@@ -6958,6 +7228,7 @@ mod tests {
             &trace,
             MemoryBudget::default(),
             &RuleRetriever::new(&db_path),
+            false,
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -7000,6 +7271,7 @@ mod tests {
             &trace,
             MemoryBudget::default(),
             &RuleRetriever::new(&db_path),
+            false,
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -7034,6 +7306,7 @@ mod tests {
             &trace,
             MemoryBudget::default(),
             &RuleRetriever::new(&db_path),
+            true,
         )
         .expect("读取业务上下文失败");
 
@@ -7077,6 +7350,7 @@ mod tests {
             &trace,
             MemoryBudget::default(),
             &RuleRetriever::new(&db_path),
+            false,
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -7107,6 +7381,7 @@ mod tests {
             &trace,
             MemoryBudget::default(),
             &RuleRetriever::new(&db_path),
+            false,
         )
         .expect("读取业务上下文失败");
 
@@ -7178,6 +7453,7 @@ mod tests {
             &trace,
             MemoryBudget::default(),
             &MockRetriever,
+            false,
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -7208,6 +7484,7 @@ mod tests {
             &trace,
             MemoryBudget::default(),
             &RuleRetriever::new(&db_path),
+            false,
         )
         .expect("读取业务上下文失败");
 
@@ -7249,6 +7526,7 @@ mod tests {
             &trace,
             MemoryBudget::default(),
             &retriever,
+            false,
         )
         .expect("读取业务上下文失败");
         let business = business.expect("应存在业务上下文");
@@ -7260,6 +7538,229 @@ mod tests {
         assert_eq!(session_state.retrieved_count(), 1);
         assert_eq!(session_state.dropped.len(), 0);
         assert_eq!(session_state.retriever_name, "rule_v1");
+    }
+
+    #[test]
+    fn preview_context_does_not_apply_memory_feedback() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        let created = store
+            .add_user_memory_typed(
+                "user-preview-fb",
+                "我喜欢短摘要",
+                MemoryType::UserPreference,
+                80,
+            )
+            .expect("写入失败");
+        // 初始 feedback 计数应为 0
+        let before = store
+            .list_user_memories("user-preview-fb", 10)
+            .expect("查询失败");
+        assert_eq!(before[0].retrieved_count, 0);
+        assert_eq!(before[0].injected_count, 0);
+
+        let agent = AgentCore::with_max_steps_and_task_store_db_path(&workspace, 5, Some(&db_path))
+            .expect("初始化 agent 失败");
+        let _preview = agent
+            .preview_context_with_context(
+                "帮我总结",
+                AgentRunContext::wechat_chat("user-preview-fb", "commit", vec![]),
+            )
+            .expect("preview 应成功");
+
+        // preview 不应写 DB feedback
+        let after = store
+            .list_user_memories("user-preview-fb", 10)
+            .expect("查询失败");
+        assert_eq!(after[0].id, created.id);
+        assert_eq!(
+            after[0].retrieved_count, 0,
+            "preview_context 不应修改 retrieved_count"
+        );
+        assert_eq!(
+            after[0].injected_count, 0,
+            "preview_context 不应修改 injected_count"
+        );
+    }
+
+    #[test]
+    fn memory_feedback_applied_once_per_run() {
+        let workspace = temp_workspace();
+        let db_path = temp_db_path();
+        // 预先在工作区创建文件，确保 Read 工具成功执行，避免 watchdog 介入
+        std::fs::write(workspace.join("demo.txt"), "hello").expect("创建测试文件失败");
+
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        let _created = store
+            .add_user_memory_typed(
+                "user-run-fb",
+                "我喜欢短摘要",
+                MemoryType::UserPreference,
+                80,
+            )
+            .expect("写入失败");
+
+        let agent = AgentCore::with_max_steps_and_task_store_db_path(&workspace, 5, Some(&db_path))
+            .expect("初始化 agent 失败");
+        // 模拟 3 步 run：2 个 tool + 1 个 final
+        agent.scripted_decisions.borrow_mut().extend([
+            PlannedDecision::new(super::AgentDecision::CallTool(super::ToolAction::Read {
+                path: "demo.txt".to_string(),
+            })),
+            PlannedDecision::new(super::AgentDecision::CallTool(super::ToolAction::Read {
+                path: "demo.txt".to_string(),
+            })),
+            PlannedDecision::new(super::AgentDecision::Final("done".to_string())),
+        ]);
+
+        let result = agent
+            .run_with_context(
+                "帮我总结",
+                AgentRunContext::wechat_chat("user-run-fb", "commit", vec![]),
+            )
+            .expect("run 应成功");
+        assert_eq!(result.output, "done", "run 输出应收敛到 scripted final");
+
+        // 重新打开 DB 验证 feedback 只写了一次
+        let store2 = TaskStore::open(&db_path).expect("重新打开失败");
+        let memories = store2
+            .list_user_memories("user-run-fb", 10)
+            .expect("查询失败");
+        assert_eq!(memories.len(), 1);
+        let mem = &memories[0];
+        assert_eq!(
+            mem.retrieved_count, 1,
+            "3 步 run 应只写一次 retrieved feedback, 当前={}",
+            mem.retrieved_count
+        );
+        assert_eq!(
+            mem.injected_count, 1,
+            "3 步 run 应只写一次 injected feedback, 当前={}",
+            mem.injected_count
+        );
+    }
+
+    #[test]
+    fn invalid_retriever_mode_fails_explicitly() {
+        let err = RetrieverMode::from_config("unknown_mode").expect_err("非法 mode 应报错");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("非法 retriever_mode"),
+            "错误信息应提示非法 mode, 实际: {msg}"
+        );
+        assert!(
+            msg.contains("rule, semantic, hybrid, shadow"),
+            "错误信息应列出合法值, 实际: {msg}"
+        );
+    }
+
+    #[test]
+    fn semantic_mode_falls_back_to_rule_with_fallback_name() {
+        let _workspace = temp_workspace();
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        store
+            .add_user_memory_typed(
+                "user-semantic-fb",
+                "我喜欢短摘要",
+                MemoryType::UserPreference,
+                80,
+            )
+            .expect("写入失败");
+
+        let retriever = select_retriever(RetrieverMode::Semantic, Some(&db_path), "noop");
+        let query = crate::retriever::RetrieveQuery::new("user-semantic-fb", 10);
+        let result = retriever.retrieve(&query).expect("检索应成功");
+
+        // 回退到 rule，但有 fallback 标识
+        assert!(
+            result.retriever_name.contains("fallback"),
+            "semantic 回退时 retriever_name 应包含 fallback, 实际: {}",
+            result.retriever_name
+        );
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].content, "我喜欢短摘要");
+    }
+
+    #[test]
+    fn hybrid_mode_returns_hybrid_retriever_with_fallback() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        store
+            .add_user_memory_typed(
+                "user-hybrid-sel",
+                "混合检索测试",
+                MemoryType::UserPreference,
+                80,
+            )
+            .expect("写入失败");
+
+        let retriever = select_retriever(RetrieverMode::Hybrid, Some(&db_path), "noop");
+        let query =
+            crate::retriever::RetrieveQuery::new("user-hybrid-sel", 10).with_query_text("测试");
+        let result = retriever.retrieve(&query).expect("检索应成功");
+
+        // Hybrid 使用 NoOpEmbeddingProvider，会 fallback 到 rule
+        assert_eq!(result.retriever_name, "hybrid_v1_fallback");
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].content, "混合检索测试");
+        // fallback 结果应带 retrieval_mode=hybrid_fallback
+        assert_eq!(
+            result.candidates[0].metadata.get("retrieval_mode"),
+            Some(&"hybrid_fallback".to_string())
+        );
+    }
+
+    #[test]
+    fn shadow_mode_returns_shadow_retriever_with_rule_output() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        store
+            .add_user_memory_typed(
+                "user-shadow-sel",
+                "Shadow 测试",
+                MemoryType::UserPreference,
+                80,
+            )
+            .expect("写入失败");
+
+        let retriever = select_retriever(RetrieverMode::Shadow, Some(&db_path), "noop");
+        let query =
+            crate::retriever::RetrieveQuery::new("user-shadow-sel", 10).with_query_text("测试");
+        let result = retriever.retrieve(&query).expect("检索应成功");
+
+        // Shadow 对外始终返回 rule 结果
+        assert_eq!(result.retriever_name, "shadow_v1");
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].content, "Shadow 测试");
+        // 候选应带 retrieval_mode=shadow
+        assert_eq!(
+            result.candidates[0].metadata.get("retrieval_mode"),
+            Some(&"shadow".to_string())
+        );
+    }
+
+    #[test]
+    fn rule_mode_returns_rule_retriever_directly() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        store
+            .add_user_memory_typed(
+                "user-rule-sel",
+                "规则检索测试",
+                MemoryType::UserPreference,
+                80,
+            )
+            .expect("写入失败");
+
+        let retriever = select_retriever(RetrieverMode::Rule, Some(&db_path), "noop");
+        let query = crate::retriever::RetrieveQuery::new("user-rule-sel", 10);
+        let result = retriever.retrieve(&query).expect("检索应成功");
+
+        assert_eq!(result.retriever_name, "rule_v1");
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].content, "规则检索测试");
     }
 
     #[test]

@@ -41,6 +41,12 @@ struct AgentTrace {
     #[serde(default)]
     retrieval_latency_ms: u128,
     #[serde(default)]
+    retrieval_mode: String,
+    #[serde(default)]
+    retrieval_fallback_reason: Option<String>,
+    #[serde(default)]
+    retrieval_scores_present: bool,
+    #[serde(default)]
     persistent_state_present: bool,
     #[serde(default)]
     persistent_state_source: Option<String>,
@@ -162,6 +168,9 @@ struct TraceSummary {
     retrieval_candidate_count: usize,
     retrieval_hit_count: usize,
     retrieval_latency_ms: u128,
+    retrieval_mode: String,
+    retrieval_fallback_reason: Option<String>,
+    retrieval_scores_present: bool,
     state_present: bool,
     context_pack_dropped: bool,
     context_pack_drop_reasons: Vec<String>,
@@ -398,6 +407,9 @@ fn summarize_trace(trace: &AgentTrace, baseline_run_ids: &HashSet<String>) -> Tr
     if trace.memory_retrieved_count > 0 && trace.memory_hit_count == 0 {
         interest_reasons.push("memory_retrieved_but_none_injected".to_string());
     }
+    if trace.retrieval_fallback_reason.is_some() {
+        interest_reasons.push("retrieval_fallback".to_string());
+    }
 
     let is_interesting = !interest_reasons.is_empty();
     let mut seen_types = std::collections::HashSet::new();
@@ -506,6 +518,9 @@ fn summarize_trace(trace: &AgentTrace, baseline_run_ids: &HashSet<String>) -> Tr
         retrieval_candidate_count: trace.retrieval_candidate_count,
         retrieval_hit_count: trace.retrieval_hit_count,
         retrieval_latency_ms: trace.retrieval_latency_ms,
+        retrieval_mode: trace.retrieval_mode.clone(),
+        retrieval_fallback_reason: trace.retrieval_fallback_reason.clone(),
+        retrieval_scores_present: trace.retrieval_scores_present,
         state_present: trace.persistent_state_present,
         context_pack_dropped: !trace.context_pack_drop_reasons.is_empty(),
         context_pack_drop_reasons: trace.context_pack_drop_reasons.clone(),
@@ -648,22 +663,79 @@ fn build_report(
         lines.push(String::new());
     }
 
-    // === Retriever Dimension ===
+    // === Retrieval Dimension (enhanced) ===
+    let mut all_latencies: Vec<u128> = Vec::new();
+    let mut fallback_count = 0usize;
+    let mut total_candidates = 0usize;
+    let mut total_hits = 0usize;
     let mut retriever_counter: HashMap<String, (usize, usize, usize, u128)> = HashMap::new();
+    let mut mode_counter: HashMap<String, (usize, usize, usize, u128)> = HashMap::new();
+
     for summary in summaries {
+        if summary.retrieval_latency_ms > 0 {
+            all_latencies.push(summary.retrieval_latency_ms);
+        }
+        if summary.retrieval_fallback_reason.is_some() {
+            fallback_count += 1;
+        }
+        total_candidates += summary.retrieval_candidate_count;
+        total_hits += summary.retrieval_hit_count;
+
+        // by retriever_name
         let name = if summary.retriever_name.is_empty() {
             "(unknown)".to_string()
         } else {
             summary.retriever_name.clone()
         };
         let entry = retriever_counter.entry(name).or_insert((0, 0, 0, 0));
-        entry.0 += 1; // trace count
-        entry.1 += summary.retrieval_candidate_count; // total candidates
-        entry.2 += summary.retrieval_hit_count; // total hits
-        entry.3 += summary.retrieval_latency_ms; // total latency
+        entry.0 += 1;
+        entry.1 += summary.retrieval_candidate_count;
+        entry.2 += summary.retrieval_hit_count;
+        entry.3 += summary.retrieval_latency_ms;
+
+        // by retrieval_mode
+        let mode = if summary.retrieval_mode.is_empty() {
+            "(unknown)".to_string()
+        } else {
+            summary.retrieval_mode.clone()
+        };
+        let mentry = mode_counter.entry(mode).or_insert((0, 0, 0, 0));
+        mentry.0 += 1;
+        mentry.1 += summary.retrieval_candidate_count;
+        mentry.2 += summary.retrieval_hit_count;
+        mentry.3 += summary.retrieval_latency_ms;
     }
+
+    lines.push("## Retrieval Statistics".to_string());
+    lines.push(String::new());
+
+    // Latency quantiles
+    let (p50, p95) = latency_quantiles(&all_latencies);
+    let fallback_rate = if total > 0 {
+        fallback_count as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    };
+    let hit_ratio = if total_candidates > 0 {
+        total_hits as f64 / total_candidates as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    lines.push("| metric | value |".to_string());
+    lines.push("| --- | --- |".to_string());
+    lines.push(format!("| latency_p50_ms | {} |", p50));
+    lines.push(format!("| latency_p95_ms | {} |", p95));
+    lines.push(format!("| fallback_rate | {:.1}% |", fallback_rate));
+    lines.push(format!(
+        "| candidate_hit_ratio | {:.1}% ({} / {}) |",
+        hit_ratio, total_hits, total_candidates
+    ));
+    lines.push(String::new());
+
+    // By retriever_name
     if !retriever_counter.is_empty() {
-        lines.push("## Retriever Statistics".to_string());
+        lines.push("### By Retriever Name".to_string());
         lines.push(String::new());
         lines.push(
             "| retriever | traces | avg_candidates | avg_hits | avg_latency_ms |".to_string(),
@@ -690,6 +762,38 @@ fn build_report(
             lines.push(format!(
                 "| {} | {} | {:.1} | {:.1} | {:.1} |",
                 name, count, avg_candidates, avg_hits, avg_latency
+            ));
+        }
+        lines.push(String::new());
+    }
+
+    // By retrieval_mode
+    if !mode_counter.is_empty() {
+        lines.push("### By Retrieval Mode".to_string());
+        lines.push(String::new());
+        lines.push("| mode | traces | avg_candidates | avg_hits | avg_latency_ms |".to_string());
+        lines.push("| --- | ---: | ---: | ---: | ---: |".to_string());
+        let mut pairs = mode_counter.into_iter().collect::<Vec<_>>();
+        pairs.sort_by(|left, right| right.1 .0.cmp(&left.1 .0));
+        for (mode, (count, candidates, hits, latency)) in pairs {
+            let avg_candidates = if count > 0 {
+                candidates as f64 / count as f64
+            } else {
+                0.0
+            };
+            let avg_hits = if count > 0 {
+                hits as f64 / count as f64
+            } else {
+                0.0
+            };
+            let avg_latency = if count > 0 {
+                latency as f64 / count as f64
+            } else {
+                0.0
+            };
+            lines.push(format!(
+                "| {} | {} | {:.1} | {:.1} | {:.1} |",
+                mode, count, avg_candidates, avg_hits, avg_latency
             ));
         }
         lines.push(String::new());
@@ -1122,6 +1226,22 @@ fn pct(part: usize, total: usize) -> f64 {
     } else {
         (part as f64 / total as f64) * 100.0
     }
+}
+
+/// 计算 latency 的 p50/p95（毫秒）。
+/// 输入为空时返回 (0, 0)。
+fn latency_quantiles(values: &[u128]) -> (u128, u128) {
+    if values.is_empty() {
+        return (0, 0);
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let n = sorted.len();
+    let p50_idx = ((n as f64 * 0.5).ceil() as usize).saturating_sub(1);
+    let p95_idx = ((n as f64 * 0.95).ceil() as usize).saturating_sub(1);
+    let p50 = sorted[p50_idx.min(n - 1)];
+    let p95 = sorted[p95_idx.min(n - 1)];
+    (p50, p95)
 }
 
 // =============================================================================
@@ -2177,6 +2297,9 @@ mod tests {
             retrieval_candidate_count: 0,
             retrieval_hit_count: 0,
             retrieval_latency_ms: 0,
+            retrieval_mode: String::new(),
+            retrieval_fallback_reason: None,
+            retrieval_scores_present: false,
             state_present: false,
             context_pack_dropped: false,
             context_pack_drop_reasons: Vec::new(),
@@ -2980,6 +3103,9 @@ mod tests {
             retrieval_candidate_count: 0,
             retrieval_hit_count: 0,
             retrieval_latency_ms: 0,
+            retrieval_mode: String::new(),
+            retrieval_fallback_reason: None,
+            retrieval_scores_present: false,
             persistent_state_present: false,
             persistent_state_source: None,
             persistent_state_updated: false,
@@ -3037,6 +3163,9 @@ mod tests {
             retrieval_candidate_count: 0,
             retrieval_hit_count: 0,
             retrieval_latency_ms: 0,
+            retrieval_mode: String::new(),
+            retrieval_fallback_reason: None,
+            retrieval_scores_present: false,
             persistent_state_present: false,
             persistent_state_source: None,
             persistent_state_updated: false,
@@ -3085,6 +3214,9 @@ mod tests {
             retrieval_candidate_count: 10,
             retrieval_hit_count: 5,
             retrieval_latency_ms: 20,
+            retrieval_mode: String::new(),
+            retrieval_fallback_reason: None,
+            retrieval_scores_present: false,
             state_present: false,
             context_pack_dropped: false,
             context_pack_drop_reasons: vec![],
@@ -3127,6 +3259,9 @@ mod tests {
             retrieval_candidate_count: 8,
             retrieval_hit_count: 4,
             retrieval_latency_ms: 15,
+            retrieval_mode: String::new(),
+            retrieval_fallback_reason: None,
+            retrieval_scores_present: false,
             state_present: false,
             context_pack_dropped: false,
             context_pack_drop_reasons: vec![],
@@ -3169,6 +3304,9 @@ mod tests {
             retrieval_candidate_count: 20,
             retrieval_hit_count: 8,
             retrieval_latency_ms: 50,
+            retrieval_mode: String::new(),
+            retrieval_fallback_reason: None,
+            retrieval_scores_present: false,
             state_present: false,
             context_pack_dropped: false,
             context_pack_drop_reasons: vec![],

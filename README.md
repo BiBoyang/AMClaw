@@ -322,7 +322,7 @@ cargo run --bin hybrid_test
 ```
 
 - 验证 HybridRetriever 的完整链路：规则召回 → embedding 编码 → 语义重排序。
-- 需配置 embedding provider（同上），否则 hybrid 会 fallback 到纯 rule 并记录 `fallback_to_rule`。
+- 需配置 embedding provider（同上），否则 hybrid 会 fallback 到纯 rule，并在候选 metadata 记录 `retrieval_mode=hybrid_fallback` 与 `fallback_reason`。
 - 执行前请确保 embedding 服务可达。
 
 ## 协作与文档约定

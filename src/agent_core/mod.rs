@@ -43,11 +43,11 @@ const LLM_PROVIDER_PRIORITY: [&str; 3] = ["DEEPSEEK", "MOONSHOT", "OPENAI"];
 enum RetrieverMode {
     /// 规则法（默认）：priority / useful / use_count 排序
     Rule,
-    /// 语义检索（尚未实现，临时回退到 Rule）
+    /// 语义检索（纯语义排序）
     Semantic,
-    /// 混合检索（尚未实现，临时回退到 Rule）
+    /// 混合检索（规则粗召回 + 语义重排序）
     Hybrid,
-    /// Shadow：并行运行语义但只用规则结果（尚未实现，临时回退到 Rule）
+    /// Shadow：并行运行语义但对外只返回规则结果
     Shadow,
 }
 
@@ -60,6 +60,15 @@ impl RetrieverMode {
             "hybrid" => Ok(Self::Hybrid),
             "shadow" => Ok(Self::Shadow),
             other => bail!("非法 retriever_mode: {other}。合法值: rule, semantic, hybrid, shadow"),
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Rule => "rule",
+            Self::Semantic => "semantic",
+            Self::Hybrid => "hybrid",
+            Self::Shadow => "shadow",
         }
     }
 }
@@ -76,6 +85,26 @@ fn select_retriever(
     rollout_enabled: bool,
     allow_users: &[String],
 ) -> Box<dyn Retriever + Send + Sync> {
+    // rollout 关闭时，semantic/hybrid/shadow 直接短路到 fallback rule，
+    // 避免初始化 embedding provider（降低默认不放量路径的噪音和开销）。
+    if !rollout_enabled {
+        if let Some(path) = db_path {
+            if mode != RetrieverMode::Rule {
+                log_agent_info(
+                    "retriever_rollout_short_circuit",
+                    vec![
+                        ("requested_mode", json!(mode.as_str())),
+                        ("actual_mode", json!("rule")),
+                        ("reason", json!("rollout_disabled")),
+                    ],
+                );
+                return Box::new(GuardedRetriever::fallback_only(Box::new(
+                    RuleRetriever::new(path),
+                )));
+            }
+        }
+    }
+
     match (mode, db_path) {
         (RetrieverMode::Rule, Some(path)) => Box::new(RuleRetriever::new(path)),
         (RetrieverMode::Rule, None) => Box::new(NoOpRetriever),

@@ -14,7 +14,7 @@ use serde_json::json;
 /// - 回退：retrieval_mode=rollout_fallback_rule, rollout_reason
 /// - 命中主链路：rollout_allowed=true
 pub struct GuardedRetriever {
-    primary: Box<dyn Retriever + Send + Sync>,
+    primary: Option<Box<dyn Retriever + Send + Sync>>,
     fallback: Box<dyn Retriever + Send + Sync>,
     enabled: bool,
     allow_users: Vec<String>,
@@ -28,10 +28,20 @@ impl GuardedRetriever {
         allow_users: Vec<String>,
     ) -> Self {
         Self {
-            primary,
+            primary: Some(primary),
             fallback,
             enabled,
             allow_users,
+        }
+    }
+
+    /// 仅保留 fallback 路径（用于 rollout 关闭时短路，避免初始化 primary）。
+    pub fn fallback_only(fallback: Box<dyn Retriever + Send + Sync>) -> Self {
+        Self {
+            primary: None,
+            fallback,
+            enabled: false,
+            allow_users: Vec::new(),
         }
     }
 
@@ -56,7 +66,29 @@ impl Retriever for GuardedRetriever {
         };
 
         if use_primary {
-            let mut result = self.primary.retrieve(query)?;
+            let Some(primary) = self.primary.as_ref() else {
+                let mut result = self.fallback.retrieve(query)?;
+                for item in &mut result.candidates {
+                    item.metadata.insert(
+                        "retrieval_mode".to_string(),
+                        "rollout_fallback_rule".to_string(),
+                    );
+                    item.metadata.insert(
+                        "rollout_reason".to_string(),
+                        "primary_unavailable".to_string(),
+                    );
+                }
+                emit_structured_log(
+                    "warn",
+                    "retriever_rollout_primary_missing",
+                    vec![
+                        ("user_id", json!(&query.user_id)),
+                        ("retriever_name", json!(&result.retriever_name)),
+                    ],
+                );
+                return Ok(result);
+            };
+            let mut result = primary.retrieve(query)?;
             // 标记命中主链路
             for item in &mut result.candidates {
                 item.metadata
@@ -208,6 +240,24 @@ mod tests {
         assert_eq!(
             result.candidates[0].metadata.get("rollout_allowed"),
             Some(&"true".to_string())
+        );
+    }
+
+    #[test]
+    fn guarded_fallback_only_always_uses_fallback() {
+        let fallback = Box::new(MockRetriever {
+            name: "fallback".to_string(),
+        });
+        let guarded = GuardedRetriever::fallback_only(fallback);
+
+        let result = guarded
+            .retrieve(&RetrieveQuery::new("any-user", 5))
+            .expect("检索应成功");
+
+        assert_eq!(result.retriever_name, "fallback");
+        assert_eq!(
+            result.candidates[0].metadata.get("rollout_reason"),
+            Some(&"rollout_disabled".to_string())
         );
     }
 }

@@ -1025,17 +1025,9 @@ impl PlanningPolicy {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ContextAssembler {
     include_previous_observations: bool,
-}
-
-impl Default for ContextAssembler {
-    fn default() -> Self {
-        Self {
-            include_previous_observations: false,
-        }
-    }
 }
 
 impl ContextAssembler {
@@ -1355,6 +1347,7 @@ impl ContextAssembler {
 ///
 /// This is the single-entry API for constructing structured context packs.
 /// All prompt assembly should go through this path.
+#[allow(clippy::too_many_arguments)]
 fn build_context_pack(
     trace: &AgentRunTrace,
     user_input: &str,
@@ -1776,6 +1769,7 @@ impl AgentCore {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn with_max_steps_and_task_store_db_path_with_compaction_and_retriever_mode(
         workspace_root: impl Into<PathBuf>,
         max_steps: usize,

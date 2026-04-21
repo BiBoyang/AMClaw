@@ -431,7 +431,7 @@ impl WeChatBot {
                 &config.agent,
             )?,
             client: ILinkClient::new(config.wechat.channel_version.clone())?,
-            pipeline: Pipeline::new(root_dir, browser),
+            pipeline: Pipeline::new(root_dir, browser)?,
             reporter: DailyReporter::from_config(&config)?,
             task_store: TaskStore::open(&db_path)?,
             context_token_map: HashMap::new(),
@@ -2246,7 +2246,8 @@ mod tests {
             agent_core: AgentCore::with_task_store_db_path(workspace_root, db_path.to_path_buf())
                 .expect("初始化 agent 失败"),
             client: ILinkClient::new("1.0.0").expect("初始化 iLink 客户端失败"),
-            pipeline: Pipeline::new(temp_dir(), None::<ResolvedBrowserConfig>),
+            pipeline: Pipeline::new(temp_dir(), None::<ResolvedBrowserConfig>)
+                .expect("初始化 pipeline 失败"),
             reporter: DailyReporter::new(reporter_root, db_path.to_path_buf(), timezone),
             task_store: TaskStore::open(db_path).expect("初始化 task store 失败"),
             context_token_map: HashMap::new(),

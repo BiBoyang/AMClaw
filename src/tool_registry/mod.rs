@@ -61,6 +61,10 @@ impl ToolRegistry {
         task_store_db_path: Option<impl Into<PathBuf>>,
     ) -> Result<Self> {
         let workspace_root = normalize_absolute(workspace_root.into())?;
+        fs::create_dir_all(&workspace_root)
+            .with_context(|| format!("创建工具工作区目录失败: {}", workspace_root.display()))?;
+        let workspace_root = fs::canonicalize(&workspace_root)
+            .with_context(|| format!("解析工具工作区真实路径失败: {}", workspace_root.display()))?;
         Ok(Self {
             workspace_root,
             task_store_db_path: task_store_db_path.map(|value| value.into()),
@@ -243,12 +247,37 @@ impl ToolRegistry {
         };
 
         let normalized = normalize_absolute(joined)?;
-        // 路径必须落在 workspace_root 内，阻断 ../../ 越界访问
-        if !normalized.starts_with(&self.workspace_root) {
-            return Err(ToolError::PathTraversal(normalized.display().to_string()).into());
-        }
+        ensure_path_within_workspace(&normalized, &self.workspace_root)?;
         Ok(normalized)
     }
+}
+
+fn ensure_path_within_workspace(path: &Path, workspace_root: &Path) -> Result<()> {
+    let resolved = resolve_for_workspace_check(path)?;
+    if !resolved.starts_with(workspace_root) {
+        return Err(ToolError::PathTraversal(resolved.display().to_string()).into());
+    }
+    Ok(())
+}
+
+fn resolve_for_workspace_check(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return fs::canonicalize(path)
+            .with_context(|| format!("解析路径真实位置失败: {}", path.display()));
+    }
+
+    let mut existing_ancestor = path.to_path_buf();
+    while !existing_ancestor.exists() {
+        if !existing_ancestor.pop() {
+            bail!("路径不存在且没有可解析父目录: {}", path.display());
+        }
+    }
+    let resolved_ancestor = fs::canonicalize(&existing_ancestor)
+        .with_context(|| format!("解析父目录真实位置失败: {}", existing_ancestor.display()))?;
+    let suffix = path
+        .strip_prefix(&existing_ancestor)
+        .with_context(|| format!("计算路径后缀失败: {}", path.display()))?;
+    Ok(resolved_ancestor.join(suffix))
 }
 
 fn normalize_absolute(path: PathBuf) -> Result<PathBuf> {
@@ -345,6 +374,49 @@ mod tests {
             .expect("读取文件失败");
 
         assert_eq!(result.output, "hello world");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deny_symlink_file_escape_read() {
+        let root = temp_workspace();
+        let outside_root =
+            std::env::temp_dir().join(format!("amclaw_tool_outside_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&outside_root).expect("创建外部目录失败");
+        let outside_file = outside_root.join("secret.txt");
+        std::fs::write(&outside_file, "secret").expect("写入外部文件失败");
+
+        let link_path = root.join("leak.txt");
+        std::os::unix::fs::symlink(&outside_file, &link_path).expect("创建符号链接失败");
+
+        let registry = ToolRegistry::new(root).expect("初始化 registry 失败");
+        let err = registry
+            .execute(ToolAction::Read {
+                path: "leak.txt".to_string(),
+            })
+            .expect_err("应当禁止通过符号链接读取工作区外文件");
+        assert!(err.to_string().contains("路径越界"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deny_symlink_parent_escape_write() {
+        let root = temp_workspace();
+        let outside_root =
+            std::env::temp_dir().join(format!("amclaw_tool_outside_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&outside_root).expect("创建外部目录失败");
+
+        let escaped_dir = root.join("escaped");
+        std::os::unix::fs::symlink(&outside_root, &escaped_dir).expect("创建目录符号链接失败");
+
+        let registry = ToolRegistry::new(root).expect("初始化 registry 失败");
+        let err = registry
+            .execute(ToolAction::Write {
+                path: "escaped/pwned.txt".to_string(),
+                content: "owned".to_string(),
+            })
+            .expect_err("应当禁止通过符号链接父目录写入工作区外路径");
+        assert!(err.to_string().contains("路径越界"));
     }
 
     #[test]

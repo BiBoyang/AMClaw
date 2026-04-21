@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 pub struct Pipeline {
     root_dir: PathBuf,
     browser: Option<ResolvedBrowserConfig>,
+    http_client_with_redirect: Client,
+    http_client_no_redirect: Client,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,11 +140,36 @@ impl fmt::Display for PipelineTaskError {
 impl Error for PipelineTaskError {}
 
 impl Pipeline {
-    pub fn new(root_dir: impl Into<PathBuf>, browser: Option<ResolvedBrowserConfig>) -> Self {
-        Self {
+    pub fn new(
+        root_dir: impl Into<PathBuf>,
+        browser: Option<ResolvedBrowserConfig>,
+    ) -> Result<Self> {
+        let http_client_with_redirect = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .redirect(Policy::custom(|attempt| {
+                if should_reject_http_redirect_target(attempt.url().as_str()).is_some() {
+                    return attempt.stop();
+                }
+                if attempt.previous().len() >= 10 {
+                    return attempt.stop();
+                }
+                attempt.follow()
+            }))
+            .build()
+            .context("创建 pipeline HTTP 客户端失败(redirect enabled)")?;
+        let http_client_no_redirect = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .redirect(Policy::none())
+            .build()
+            .context("创建 pipeline HTTP 客户端失败(redirect disabled)")?;
+        Ok(Self {
             root_dir: root_dir.into(),
             browser,
-        }
+            http_client_with_redirect,
+            http_client_no_redirect,
+        })
     }
 
     pub fn process_pending_task(
@@ -274,36 +301,11 @@ impl Pipeline {
             "http_fetch_started",
             vec![("source", json!("http")), ("url", json!(url))],
         );
-        let redirect_policy = if should_disable_http_redirects(url) {
-            Policy::none()
+        let client = if should_disable_http_redirects(url) {
+            &self.http_client_no_redirect
         } else {
-            Policy::custom(|attempt| {
-                if should_reject_http_redirect_target(attempt.url().as_str()).is_some() {
-                    return attempt.stop();
-                }
-                if attempt.previous().len() >= 10 {
-                    return attempt.stop();
-                }
-                attempt.follow()
-            })
+            &self.http_client_with_redirect
         };
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(20))
-            .redirect(redirect_policy)
-            .build()
-            .map_err(|err| {
-                log_pipeline_error(
-                    "http_fetch_failed",
-                    vec![
-                        ("source", json!("http")),
-                        ("url", json!(url)),
-                        ("error_kind", json!("http_client_build_failed")),
-                        ("detail", json!(err.to_string())),
-                    ],
-                );
-                PipelineTaskError::failed(format!("创建 pipeline HTTP 客户端失败: {err}"))
-            })?;
         let response = client.get(url).send().map_err(|err| {
             log_pipeline_error(
                 "http_fetch_failed",
@@ -1442,7 +1444,7 @@ mod tests {
     #[test]
     fn processing_pending_task_creates_markdown_file() {
         let root = temp_dir();
-        let pipeline = Pipeline::new(&root, None);
+        let pipeline = Pipeline::new(&root, None).expect("初始化 pipeline 失败");
         let task = PendingTaskRecord {
             task_id: "task-1".to_string(),
             article_id: "article-1".to_string(),
@@ -1520,7 +1522,7 @@ mod tests {
     #[test]
     fn manual_content_creates_archive() {
         let root = temp_dir();
-        let pipeline = Pipeline::new(&root, None);
+        let pipeline = Pipeline::new(&root, None).expect("初始化 pipeline 失败");
         let task = TaskContentRecord {
             task_id: "task-manual".to_string(),
             article_id: "article-1".to_string(),
@@ -1670,7 +1672,7 @@ mod tests {
     #[test]
     fn browser_capture_archive_uses_extracted_body() {
         let root = temp_dir();
-        let pipeline = Pipeline::new(&root, None);
+        let pipeline = Pipeline::new(&root, None).expect("初始化 pipeline 失败");
         let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let raw_dir = root.join("raw").join(&day);
         let output_dir = root.join("processed").join(day);
@@ -1824,7 +1826,7 @@ mod tests {
     #[test]
     fn http_archive_includes_summary_section() {
         let root = temp_dir();
-        let pipeline = Pipeline::new(&root, None);
+        let pipeline = Pipeline::new(&root, None).expect("初始化 pipeline 失败");
         let task = PendingTaskRecord {
             task_id: "task-summary".to_string(),
             article_id: "article-1".to_string(),

@@ -5,6 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::Path;
 use thiserror::Error;
 use uuid::Uuid;
@@ -555,6 +556,27 @@ impl TaskStore {
 
         let conn = Connection::open(path)
             .with_context(|| format!("打开 SQLite 数据库失败: {}", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))
+            .with_context(|| format!("设置 SQLite busy_timeout 失败: {}", path.display()))?;
+        for attempt in 0..5 {
+            match conn.pragma_update(None, "journal_mode", "WAL") {
+                Ok(_) => break,
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ErrorCode::DatabaseBusy =>
+                {
+                    if attempt == 4 {
+                        return Err(rusqlite::Error::SqliteFailure(err, None)).with_context(|| {
+                            format!("设置 SQLite WAL 模式失败: {}", path.display())
+                        });
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("设置 SQLite WAL 模式失败: {}", path.display()));
+                }
+            }
+        }
         let store = Self { conn };
         store.init_schema()?;
         Ok(store)
@@ -577,7 +599,6 @@ impl TaskStore {
             params![message_id, from_user_id, dedup_received_at],
         )?;
         if inserted == 0 {
-            tx.rollback().context("回滚重复消息事务失败")?;
             log_task_store_info(
                 "inbound_message_deduplicated",
                 vec![
@@ -1658,7 +1679,7 @@ impl TaskStore {
                 FROM tasks t
                 JOIN articles a ON a.id = t.article_id
                 WHERE t.status = 'archived'
-                ORDER BY t.updated_at DESC, t.created_at DESC
+                ORDER BY datetime(t.updated_at) DESC, datetime(t.created_at) DESC
                 LIMIT ?1
                 "#,
             )
@@ -1682,6 +1703,51 @@ impl TaskStore {
         let mut tasks = Vec::new();
         for row in rows {
             tasks.push(row.context("读取 archived 任务记录失败")?);
+        }
+        Ok(tasks)
+    }
+
+    pub fn list_archived_tasks_in_range(
+        &self,
+        start: &str,
+        end: &str,
+        limit: usize,
+    ) -> Result<Vec<ArchivedTaskRecord>> {
+        let limit = i64::try_from(limit).context("archived task limit 超出范围")?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+                SELECT t.id, t.article_id, a.normalized_url, a.title, a.summary, t.content_source, t.page_kind, t.output_path, t.updated_at
+                FROM tasks t
+                JOIN articles a ON a.id = t.article_id
+                WHERE t.status = 'archived'
+                  AND datetime(t.updated_at) >= datetime(?1)
+                  AND datetime(t.updated_at) < datetime(?2)
+                ORDER BY datetime(t.updated_at) DESC, datetime(t.created_at) DESC
+                LIMIT ?3
+                "#,
+            )
+            .context("准备 archived 范围查询失败")?;
+        let rows = stmt
+            .query_map(params![start, end, limit], |row| {
+                Ok(ArchivedTaskRecord {
+                    task_id: row.get(0)?,
+                    article_id: row.get(1)?,
+                    normalized_url: row.get(2)?,
+                    title: row.get(3)?,
+                    summary: row.get(4)?,
+                    content_source: row.get(5)?,
+                    page_kind: row.get(6)?,
+                    output_path: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            })
+            .context("查询 archived 范围任务失败")?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks.push(row.context("读取 archived 范围任务记录失败")?);
         }
         Ok(tasks)
     }
@@ -2159,6 +2225,14 @@ fn ensure_column_exists(
 
     let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {column_def}");
     conn.execute(&sql, [])
+        .or_else(|e| {
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("duplicate column name") {
+                Ok(0)
+            } else {
+                Err(e)
+            }
+        })
         .with_context(|| format!("补充列失败: {table}.{column}"))?;
     Ok(())
 }
@@ -2223,58 +2297,125 @@ pub fn is_private_url(url: &str) -> bool {
 
 /// 检查 host 是否属于私有/本地/元数据地址
 fn is_private_host(host: &str) -> bool {
-    // IPv6 地址在 URL 中带方括号 [::1]，需去掉
-    let trimmed = host.trim_start_matches('[').trim_end_matches(']');
+    is_private_host_with(host, resolve_host_ips)
+}
+
+fn is_private_host_with<F>(host: &str, mut resolver: F) -> bool
+where
+    F: FnMut(&str) -> Vec<IpAddr>,
+{
+    // IPv6 地址在 URL 中可能带方括号 [::1]；域名可能带尾部 dot，统一清洗
+    let trimmed = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
     let lower = trimmed.to_ascii_lowercase();
-    // 特殊域名
+    if lower.is_empty() {
+        return true;
+    }
+
+    // 特殊域名：固定视为本地/内网
     if lower == "localhost"
         || lower == "0.0.0.0"
         || lower.ends_with(".local")
         || lower.ends_with(".internal")
         || lower.ends_with(".localhost")
+        || lower == "metadata.google.internal"
     {
         return true;
     }
-    // IPv6 私有/本地地址
-    if lower.starts_with("::1")
-        || lower.starts_with("fc")
-        || lower.starts_with("fd")
-        || lower.starts_with("fe80:")
-        || lower.starts_with("fe::")
-        || lower.starts_with("::ffff:")
-    {
+
+    // IP 字面量：按真实 IP 分类，避免基于字符串前缀误杀（如 fc*.example.com）
+    if let Ok(ip) = lower.parse::<IpAddr>() {
+        return is_private_ip(ip);
+    }
+
+    // 尝试解析为 IPv4 非标准表示（十六/八进制、单段/双段/三段）
+    if let Some(v4) = parse_ipv4_address(&lower) {
+        return is_private_ipv4(&v4.octets());
+    }
+
+    // DNS 解析防护：若域名解析到任一内网/本地地址，则视为私网
+    resolver(&lower).into_iter().any(is_private_ip)
+}
+
+fn resolve_host_ips(host: &str) -> Vec<IpAddr> {
+    let Ok(addrs) = format!("{host}:80").to_socket_addrs() else {
+        return vec![];
+    };
+    addrs.map(|value| value.ip()).collect()
+}
+
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_private_ipv4(&v4.octets()),
+        IpAddr::V6(v6) => is_private_ipv6(&v6),
+    }
+}
+
+fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
         return true;
     }
-    // 尝试解析为 IPv4 各进制表示
-    if let Some(octets) = parse_ipv4_octets(&lower) {
-        return is_private_ipv4(&octets);
+    if ip.is_unique_local() || ip.is_unicast_link_local() {
+        return true;
+    }
+    if let Some(mapped_v4) = ip.to_ipv4_mapped() {
+        return is_private_ipv4(&mapped_v4.octets());
     }
     false
 }
 
-/// 尝试从 host 字符串解析出 4 个 u8 作为 IPv4 八位组。
-/// 支持十进制、八进制(0前缀)、十六进制(0x前缀)及混合表示。
-fn parse_ipv4_octets(host: &str) -> Option<[u8; 4]> {
+/// 尝试从 host 字符串解析出 IPv4 地址。
+/// 支持十进制、八进制(0前缀)、十六进制(0x前缀)及混合表示，
+/// 兼容 a, a.b, a.b.c, a.b.c.d 四种 inet-aton 样式。
+fn parse_ipv4_address(host: &str) -> Option<Ipv4Addr> {
     let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() != 4 {
-        return None;
+    match parts.len() {
+        1 => {
+            let value = parse_ip_number(parts[0])?;
+            Some(Ipv4Addr::from(value))
+        }
+        2 => {
+            let a = parse_ip_number(parts[0])?;
+            let b = parse_ip_number(parts[1])?;
+            if a > 0xff || b > 0x00ff_ffff {
+                return None;
+            }
+            Some(Ipv4Addr::from((a << 24) | b))
+        }
+        3 => {
+            let a = parse_ip_number(parts[0])?;
+            let b = parse_ip_number(parts[1])?;
+            let c = parse_ip_number(parts[2])?;
+            if a > 0xff || b > 0xff || c > 0x0000_ffff {
+                return None;
+            }
+            Some(Ipv4Addr::from((a << 24) | (b << 16) | c))
+        }
+        4 => {
+            let mut octets = [0u8; 4];
+            for (i, part) in parts.iter().enumerate() {
+                octets[i] = u8::try_from(parse_ip_number(part)?).ok()?;
+            }
+            Some(Ipv4Addr::from(octets))
+        }
+        _ => None,
     }
-    let mut octets = [0u8; 4];
-    for (i, part) in parts.iter().enumerate() {
-        octets[i] = parse_ip_segment(part)?;
-    }
-    Some(octets)
 }
 
-/// 解析单个 IP 段：支持十进制、八进制(0前缀)、十六进制(0x前缀)
-fn parse_ip_segment(s: &str) -> Option<u8> {
+/// 解析 IP 数字段：支持十进制、八进制(0前缀)、十六进制(0x前缀)
+fn parse_ip_number(s: &str) -> Option<u32> {
+    if s.is_empty() {
+        return None;
+    }
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        u8::from_str_radix(hex, 16).ok()
+        u32::from_str_radix(hex, 16).ok()
     } else if s.len() > 1 && s.starts_with('0') {
-        // 八进制：0777 等；但 "0" 本身是十进制 0
-        u8::from_str_radix(s, 8).ok()
+        u32::from_str_radix(s, 8).ok()
     } else {
-        s.parse::<u8>().ok()
+        s.parse::<u32>().ok()
     }
 }
 
@@ -2344,6 +2485,9 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::{json, Value};
     use std::fs;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::sync::Arc;
+    use std::thread;
     use uuid::Uuid;
 
     fn temp_db_path() -> std::path::PathBuf {
@@ -2593,6 +2737,41 @@ mod tests {
         assert!(!super::is_private_url("https://example.com/page"));
         assert!(!super::is_private_url("https://1.1.1.1/dns"));
         assert!(!super::is_private_url("https://8.8.8.8/dns"));
+    }
+
+    #[test]
+    fn fc_fd_prefix_domain_names_are_not_falsely_blocked() {
+        assert!(!super::is_private_url("https://fc-news.example.com/page"));
+        assert!(!super::is_private_url("https://fdomain.example.com/page"));
+    }
+
+    #[test]
+    fn domain_resolving_to_private_ip_is_blocked() {
+        assert!(super::is_private_host_with("demo.test", |host| {
+            if host == "demo.test" {
+                vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))]
+            } else {
+                vec![]
+            }
+        }));
+        assert!(super::is_private_host_with("demo6.test", |host| {
+            if host == "demo6.test" {
+                vec![IpAddr::V6(Ipv6Addr::LOCALHOST)]
+            } else {
+                vec![]
+            }
+        }));
+    }
+
+    #[test]
+    fn domain_resolving_to_public_ip_is_allowed() {
+        assert!(!super::is_private_host_with("public.test", |host| {
+            if host == "public.test" {
+                vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]
+            } else {
+                vec![]
+            }
+        }));
     }
 
     #[test]
@@ -2916,6 +3095,37 @@ mod tests {
                 updated_at: tasks[0].updated_at.clone(),
             }]
         );
+    }
+
+    #[test]
+    fn concurrent_writes_do_not_panic_on_busy() {
+        let db_path = temp_db_path();
+        let db_path = Arc::new(db_path);
+        let threads: Vec<_> = (0..4)
+            .map(|tid| {
+                let path = Arc::clone(&db_path);
+                thread::spawn(move || {
+                    let mut store =
+                        TaskStore::open(&*path).expect("并发线程初始化 task store 失败");
+                    for i in 0..10 {
+                        let msg_id = format!("msg-t{tid}-i{i}");
+                        store
+                            .record_inbound_message(&msg_id, "user-a", "hello")
+                            .expect("并发写入不应 panic 或返回 BUSY");
+                    }
+                })
+            })
+            .collect();
+
+        for t in threads {
+            t.join().expect("并发线程不应 panic");
+        }
+
+        let conn = Connection::open(&*db_path).expect("验证读取失败");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM message_dedup", [], |row| row.get(0))
+            .expect("计数失败");
+        assert_eq!(count, 40, "40 条独立消息应全部写入");
     }
 
     #[test]

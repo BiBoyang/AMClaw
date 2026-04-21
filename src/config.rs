@@ -33,6 +33,8 @@ pub struct AgentConfig {
     pub embedding_provider: String,
     pub retriever_rollout_enabled: bool,
     pub retriever_rollout_allow_users: Vec<String>,
+    pub context_token_ttl_days: u64,
+    pub session_state_ttl_days: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +120,8 @@ impl Default for AgentConfig {
             embedding_provider: "noop".to_string(),
             retriever_rollout_enabled: false,
             retriever_rollout_allow_users: vec![],
+            context_token_ttl_days: 30,
+            session_state_ttl_days: 30,
         }
     }
 }

@@ -110,6 +110,18 @@ pub struct StoredSessionRecord {
     pub updated_at: String,
 }
 
+/// 待补发的消息段记录
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingChunkRecord {
+    pub id: i64,
+    pub user_id: String,
+    pub context_token: String,
+    pub chunk_text: String,
+    pub chunk_index: usize,
+    pub chunk_total: usize,
+    pub created_at: String,
+}
+
 /// 记忆类型枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryType {
@@ -2126,6 +2138,16 @@ impl TaskStore {
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
             CREATE INDEX IF NOT EXISTS idx_tasks_updated_at ON tasks(updated_at);
             CREATE INDEX IF NOT EXISTS idx_inbound_messages_received_at ON inbound_messages(received_at);
+
+            CREATE TABLE IF NOT EXISTS outbound_pending_chunks (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id       TEXT NOT NULL,
+                context_token TEXT NOT NULL,
+                chunk_text    TEXT NOT NULL,
+                chunk_index   INTEGER NOT NULL,
+                chunk_total   INTEGER NOT NULL,
+                created_at    DATETIME NOT NULL
+            );
             "#,
             )
             .context("初始化 SQLite 表结构失败")?;
@@ -2199,7 +2221,161 @@ impl TaskStore {
             "open_questions_json",
             "TEXT",
         )?;
+        // v3 outbound_pending_chunks 表创建（兼容旧库）
+        self.conn
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS outbound_pending_chunks (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id       TEXT NOT NULL,
+                    context_token TEXT NOT NULL,
+                    chunk_text    TEXT NOT NULL,
+                    chunk_index   INTEGER NOT NULL,
+                    chunk_total   INTEGER NOT NULL,
+                    created_at    DATETIME NOT NULL
+                )
+                "#,
+                [],
+            )
+            .context("创建 outbound_pending_chunks 表失败")?;
         Ok(())
+    }
+
+    // ---- Outbound Pending Chunks API ----
+
+    /// 将剩余未发送的消息段持久化，供后续补发。
+    pub fn insert_pending_chunks(
+        &mut self,
+        user_id: &str,
+        context_token: &str,
+        chunks: &[(usize, usize, String)],
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.transaction().context("开启 chunks 事务失败")?;
+        for (chunk_index, chunk_total, chunk_text) in chunks {
+            tx.execute(
+                r#"
+                INSERT INTO outbound_pending_chunks
+                (user_id, context_token, chunk_text, chunk_index, chunk_total, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                params![
+                    user_id,
+                    context_token,
+                    chunk_text,
+                    *chunk_index as i64,
+                    *chunk_total as i64,
+                    now.clone(),
+                ],
+            )
+            .context("插入 pending chunk 失败")?;
+        }
+        tx.commit().context("提交 chunks 事务失败")?;
+        log_task_store_info(
+            "pending_chunks_inserted",
+            vec![
+                ("user_id", json!(user_id)),
+                ("chunk_count", json!(chunks.len())),
+            ],
+        );
+        Ok(())
+    }
+
+    /// 查询最早的一批待补发消息段（按 created_at 排序）。
+    pub fn list_pending_chunks(&self, limit: usize) -> Result<Vec<PendingChunkRecord>> {
+        let limit = i64::try_from(limit).context("chunk limit 超出范围")?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+                SELECT id, user_id, context_token, chunk_text, chunk_index, chunk_total, created_at
+                FROM outbound_pending_chunks
+                ORDER BY created_at ASC
+                LIMIT ?1
+                "#,
+            )
+            .context("准备 pending chunks 查询失败")?;
+        let rows = stmt
+            .query_map([limit], |row| {
+                Ok(PendingChunkRecord {
+                    id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    context_token: row.get(2)?,
+                    chunk_text: row.get(3)?,
+                    chunk_index: row.get::<_, usize>(4)?,
+                    chunk_total: row.get::<_, usize>(5)?,
+                    created_at: row.get(6)?,
+                })
+            })
+            .context("查询 pending chunks 失败")?;
+        let mut chunks = Vec::new();
+        for row in rows {
+            chunks.push(row.context("读取 pending chunk 记录失败")?);
+        }
+        Ok(chunks)
+    }
+
+    /// 删除指定待补发消息段。
+    pub fn delete_pending_chunk(&mut self, id: i64) -> Result<bool> {
+        let deleted = self
+            .conn
+            .execute("DELETE FROM outbound_pending_chunks WHERE id = ?1", [id])
+            .context("删除 pending chunk 失败")?;
+        Ok(deleted > 0)
+    }
+
+    // ---- TTL Cleanup API ----
+
+    /// 清理过期的 context_token（超过 ttl_days 天未更新）。
+    pub fn cleanup_expired_context_tokens(&mut self, ttl_days: u64) -> Result<usize> {
+        let cutoff = Utc::now() - chrono::Duration::days(ttl_days as i64);
+        let cutoff_str = cutoff.to_rfc3339();
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM user_context_tokens WHERE updated_at < ?1",
+                [&cutoff_str],
+            )
+            .context("清理过期 context_token 失败")?;
+        if deleted > 0 {
+            log_task_store_info(
+                "expired_context_tokens_cleaned",
+                vec![("deleted", json!(deleted)), ("ttl_days", json!(ttl_days))],
+            );
+        }
+        Ok(deleted)
+    }
+
+    /// 清理过期的 session_state（超过 ttl_days 天未更新）。
+    pub fn cleanup_expired_user_session_states(&mut self, ttl_days: u64) -> Result<usize> {
+        let cutoff = Utc::now() - chrono::Duration::days(ttl_days as i64);
+        let cutoff_str = cutoff.to_rfc3339();
+        let deleted_sessions = self
+            .conn
+            .execute(
+                "DELETE FROM user_sessions WHERE updated_at < ?1",
+                [&cutoff_str],
+            )
+            .context("清理过期 user_sessions 失败")?;
+        let deleted_states = self
+            .conn
+            .execute(
+                "DELETE FROM user_session_states WHERE updated_at < ?1",
+                [&cutoff_str],
+            )
+            .context("清理过期 user_session_states 失败")?;
+        let total = deleted_sessions + deleted_states;
+        if total > 0 {
+            log_task_store_info(
+                "expired_session_states_cleaned",
+                vec![
+                    ("deleted_sessions", json!(deleted_sessions)),
+                    ("deleted_states", json!(deleted_states)),
+                    ("ttl_days", json!(ttl_days)),
+                ],
+            );
+        }
+        Ok(total)
     }
 }
 

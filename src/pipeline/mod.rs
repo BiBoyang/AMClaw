@@ -1,4 +1,5 @@
 use crate::config::ResolvedBrowserConfig;
+use crate::mode_policy::{check_url, AgentMode};
 use crate::task_store::{PendingTaskRecord, TaskContentRecord};
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -21,6 +22,7 @@ use std::time::{Duration, Instant};
 pub struct Pipeline {
     root_dir: PathBuf,
     browser: Option<ResolvedBrowserConfig>,
+    mode: AgentMode,
     http_client_with_redirect: Client,
     http_client_no_redirect: Client,
 }
@@ -143,6 +145,7 @@ impl Pipeline {
     pub fn new(
         root_dir: impl Into<PathBuf>,
         browser: Option<ResolvedBrowserConfig>,
+        mode: AgentMode,
     ) -> Result<Self> {
         let http_client_with_redirect = Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -167,6 +170,7 @@ impl Pipeline {
         Ok(Self {
             root_dir: root_dir.into(),
             browser,
+            mode,
             http_client_with_redirect,
             http_client_no_redirect,
         })
@@ -184,6 +188,19 @@ impl Pipeline {
                 ("url", json!(task.normalized_url)),
             ],
         );
+        // restricted 运行时门禁：URL 策略
+        let url_decision = check_url(self.mode, &task.normalized_url);
+        if !url_decision.allowed {
+            log_pipeline_error(
+                "url_policy_denied",
+                vec![
+                    ("task_id", json!(task.task_id)),
+                    ("url", json!(task.normalized_url)),
+                    ("reason", json!(url_decision.reason.clone())),
+                ],
+            );
+            return Err(PipelineTaskError::failed(url_decision.reason));
+        }
         if should_prefer_browser_capture(&task.normalized_url) {
             if let Some(browser) = &self.browser {
                 log_pipeline_info(
@@ -301,32 +318,96 @@ impl Pipeline {
             "http_fetch_started",
             vec![("source", json!("http")), ("url", json!(url))],
         );
+        let backoff = [
+            Duration::from_millis(200),
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+        ];
+        let mut last_err = None;
+
+        for attempt in 0..=backoff.len() {
+            match self.fetch_html_once(url, attempt) {
+                Ok(result) => return Ok(result),
+                Err((err, retryable)) => {
+                    last_err = Some(err);
+                    if !retryable || attempt >= backoff.len() {
+                        break;
+                    }
+                    log_pipeline_warn(
+                        "http_fetch_retry_scheduled",
+                        vec![
+                            ("source", json!("http")),
+                            ("url", json!(url)),
+                            ("attempt", json!(attempt + 1)),
+                            ("retryable", json!(true)),
+                            ("backoff_ms", json!(backoff[attempt].as_millis())),
+                        ],
+                    );
+                    sleep(backoff[attempt]);
+                }
+            }
+        }
+
+        let err = last_err.expect("fetch_html 至少应产生一次错误");
+        log_pipeline_error(
+            "http_fetch_failed",
+            vec![
+                ("source", json!("http")),
+                ("url", json!(url)),
+                ("attempts", json!(backoff.len() + 1)),
+                ("error_kind", json!("http_request_failed")),
+                ("detail", json!(err.to_string())),
+            ],
+        );
+        Err(err)
+    }
+
+    /// 单次 HTTP 抓取尝试。
+    /// 返回 Ok(result) 或 Err((error, retryable))。
+    fn fetch_html_once(
+        &self,
+        url: &str,
+        attempt: usize,
+    ) -> std::result::Result<HttpFetchResult, (PipelineTaskError, bool)> {
         let client = if should_disable_http_redirects(url) {
             &self.http_client_no_redirect
         } else {
             &self.http_client_with_redirect
         };
-        let response = client.get(url).send().map_err(|err| {
-            log_pipeline_error(
-                "http_fetch_failed",
-                vec![
-                    ("source", json!("http")),
-                    ("url", json!(url)),
-                    ("error_kind", json!("http_request_failed")),
-                    ("detail", json!(err.to_string())),
-                ],
-            );
-            PipelineTaskError::failed(format!("抓取页面失败: {url} ({err})"))
-        })?;
+        let response = match client.get(url).send() {
+            Ok(resp) => resp,
+            Err(err) => {
+                let retryable = err.is_timeout() || err.is_connect();
+                log_pipeline_warn(
+                    "http_fetch_attempt_failed",
+                    vec![
+                        ("source", json!("http")),
+                        ("url", json!(url)),
+                        ("attempt", json!(attempt + 1)),
+                        ("retryable", json!(retryable)),
+                        ("error_kind", json!("http_request_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
+                return Err((
+                    PipelineTaskError::failed(format!("抓取页面失败: {url} ({err})")),
+                    retryable,
+                ));
+            }
+        };
+
         let final_url = response.url().to_string();
         let status = response.status();
+
         if status.is_redirection() {
             let location = response
                 .headers()
                 .get(LOCATION)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
-            detect_wechat_redirect(location)?;
+            if let Err(err) = detect_wechat_redirect(location) {
+                return Err((err, false));
+            }
             let (error_kind, error_msg) =
                 if let Some(ssrf_kind) = should_reject_http_redirect_target(location) {
                     (
@@ -343,47 +424,85 @@ impl Pipeline {
                         format!("抓取页面失败: HTTP {} {}", status.as_u16(), url),
                     )
                 };
-            log_pipeline_error(
-                "http_fetch_failed",
+            log_pipeline_warn(
+                "http_fetch_attempt_failed",
                 vec![
                     ("source", json!("http")),
                     ("url", json!(url)),
-                    ("status", json!(status.as_u16())),
+                    ("attempt", json!(attempt + 1)),
+                    ("retryable", json!(false)),
                     ("error_kind", json!(error_kind)),
                     ("redirect_target", json!(location)),
                 ],
             );
-            return Err(PipelineTaskError::failed(error_msg));
+            return Err((PipelineTaskError::failed(error_msg), false));
         }
+
         if !status.is_success() {
-            log_pipeline_error(
-                "http_fetch_failed",
+            let retryable = status.is_server_error();
+            let error_kind = if retryable {
+                "http_status_server_error"
+            } else {
+                "http_status_failed"
+            };
+            log_pipeline_warn(
+                "http_fetch_attempt_failed",
                 vec![
                     ("source", json!("http")),
                     ("url", json!(url)),
+                    ("attempt", json!(attempt + 1)),
+                    ("retryable", json!(retryable)),
                     ("status", json!(status.as_u16())),
-                    ("error_kind", json!("http_status_failed")),
+                    ("error_kind", json!(error_kind)),
                 ],
             );
-            return Err(PipelineTaskError::failed(format!(
-                "抓取页面失败: HTTP {} {}",
-                status.as_u16(),
-                url
-            )));
+            return Err((
+                PipelineTaskError::failed(format!(
+                    "抓取页面失败: HTTP {} {}",
+                    status.as_u16(),
+                    url
+                )),
+                retryable,
+            ));
         }
-        let html = response.text().map_err(|err| {
-            log_pipeline_error(
-                "http_fetch_failed",
+
+        let html = match response.text() {
+            Ok(body) => body,
+            Err(err) => {
+                let retryable = err.is_timeout() || err.is_connect();
+                log_pipeline_warn(
+                    "http_fetch_attempt_failed",
+                    vec![
+                        ("source", json!("http")),
+                        ("url", json!(url)),
+                        ("attempt", json!(attempt + 1)),
+                        ("retryable", json!(retryable)),
+                        ("error_kind", json!("http_read_body_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
+                return Err((
+                    PipelineTaskError::failed(format!("读取页面正文失败: {err}")),
+                    retryable,
+                ));
+            }
+        };
+
+        if let Err(err) = validate_fetched_html(url, &final_url, &html) {
+            log_pipeline_warn(
+                "http_fetch_attempt_failed",
                 vec![
                     ("source", json!("http")),
                     ("url", json!(url)),
-                    ("error_kind", json!("http_read_body_failed")),
+                    ("attempt", json!(attempt + 1)),
+                    ("retryable", json!(false)),
+                    ("error_kind", json!("html_validation_failed")),
                     ("detail", json!(err.to_string())),
                 ],
             );
-            PipelineTaskError::failed(format!("读取页面正文失败: {err}"))
-        })?;
-        validate_fetched_html(url, &final_url, &html)?;
+            return Err((err, false));
+        }
+
         log_pipeline_info(
             "http_fetch_finished",
             vec![
@@ -391,6 +510,7 @@ impl Pipeline {
                 ("url", json!(url)),
                 ("final_url", json!(final_url)),
                 ("status", json!("ok")),
+                ("attempt", json!(attempt + 1)),
                 ("html_chars", json!(html.chars().count())),
             ],
         );
@@ -1427,8 +1547,8 @@ mod tests {
         extract_primary_body, generate_rule_summary, is_navigation_like,
         should_disable_http_redirects, should_prefer_browser_capture,
         should_reject_http_redirect_target, validate_browser_capture_paths, validate_fetched_html,
-        BrowserCaptureRequest, BrowserCaptureResponse, BrowserCaptureResult, HttpFetchResult,
-        Pipeline, PipelineFailureKind,
+        AgentMode, BrowserCaptureRequest, BrowserCaptureResponse, BrowserCaptureResult,
+        HttpFetchResult, Pipeline, PipelineFailureKind,
     };
     use crate::task_store::{PendingTaskRecord, TaskContentRecord};
     use serde_json::{json, Value};
@@ -1444,7 +1564,8 @@ mod tests {
     #[test]
     fn processing_pending_task_creates_markdown_file() {
         let root = temp_dir();
-        let pipeline = Pipeline::new(&root, None).expect("初始化 pipeline 失败");
+        let pipeline =
+            Pipeline::new(&root, None, AgentMode::Restricted).expect("初始化 pipeline 失败");
         let task = PendingTaskRecord {
             task_id: "task-1".to_string(),
             article_id: "article-1".to_string(),
@@ -1522,7 +1643,8 @@ mod tests {
     #[test]
     fn manual_content_creates_archive() {
         let root = temp_dir();
-        let pipeline = Pipeline::new(&root, None).expect("初始化 pipeline 失败");
+        let pipeline =
+            Pipeline::new(&root, None, AgentMode::Restricted).expect("初始化 pipeline 失败");
         let task = TaskContentRecord {
             task_id: "task-manual".to_string(),
             article_id: "article-1".to_string(),
@@ -1672,7 +1794,8 @@ mod tests {
     #[test]
     fn browser_capture_archive_uses_extracted_body() {
         let root = temp_dir();
-        let pipeline = Pipeline::new(&root, None).expect("初始化 pipeline 失败");
+        let pipeline =
+            Pipeline::new(&root, None, AgentMode::Restricted).expect("初始化 pipeline 失败");
         let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let raw_dir = root.join("raw").join(&day);
         let output_dir = root.join("processed").join(day);
@@ -1826,7 +1949,8 @@ mod tests {
     #[test]
     fn http_archive_includes_summary_section() {
         let root = temp_dir();
-        let pipeline = Pipeline::new(&root, None).expect("初始化 pipeline 失败");
+        let pipeline =
+            Pipeline::new(&root, None, AgentMode::Restricted).expect("初始化 pipeline 失败");
         let task = PendingTaskRecord {
             task_id: "task-summary".to_string(),
             article_id: "article-1".to_string(),

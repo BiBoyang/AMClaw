@@ -609,7 +609,7 @@ impl PlanStepStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct RuntimePlanStep {
+pub(crate) struct RuntimePlanStep {
     description: String,
     status: PlanStepStatus,
     expected_observation: Option<ExpectedObservation>,
@@ -687,7 +687,7 @@ enum DoneRule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct ExpectedObservation {
+pub(crate) struct ExpectedObservation {
     kind: ObservationKind,
     done_rule: DoneRule,
     expected_fields: Vec<String>,
@@ -1663,6 +1663,8 @@ pub struct AgentCore {
     planning_policy: PlanningPolicy,
     // 可插拔检索器（默认 RuleRetriever）
     retriever: Box<dyn Retriever + Send + Sync>,
+    // 运行时模式策略
+    mode: crate::mode_policy::AgentMode,
     #[cfg(test)]
     scripted_decisions: RefCell<VecDeque<PlannedDecision>>,
 }
@@ -1734,6 +1736,7 @@ impl AgentCore {
             Some(agent_config.embedding_provider.as_str()),
             agent_config.retriever_rollout_enabled,
             &agent_config.retriever_rollout_allow_users,
+            crate::mode_policy::AgentMode::from_config(&agent_config.mode),
         )
     }
 
@@ -1766,6 +1769,7 @@ impl AgentCore {
             None,
             false,
             &[],
+            crate::mode_policy::AgentMode::Restricted,
         )
     }
 
@@ -1779,6 +1783,7 @@ impl AgentCore {
         embedding_provider: Option<&str>,
         retriever_rollout_enabled: bool,
         retriever_rollout_allow_users: &[String],
+        agent_mode: crate::mode_policy::AgentMode,
     ) -> Result<Self> {
         if max_steps == 0 {
             bail!("max_steps 必须大于 0");
@@ -1790,13 +1795,13 @@ impl AgentCore {
             task_store_db_path.clone(),
         )?;
 
-        let mode = match retriever_mode {
+        let retriever_config_mode = match retriever_mode {
             Some(text) => RetrieverMode::from_config(text)?,
             None => RetrieverMode::Rule,
         };
         let embedding_provider_name = embedding_provider.unwrap_or("noop");
         let retriever = select_retriever(
-            mode,
+            retriever_config_mode,
             task_store_db_path.as_deref(),
             embedding_provider_name,
             retriever_rollout_enabled,
@@ -1813,6 +1818,7 @@ impl AgentCore {
             max_replans: DEFAULT_MAX_REPLANS,
             planning_policy: PlanningPolicy::Reactive,
             retriever,
+            mode: agent_mode,
             #[cfg(test)]
             scripted_decisions: RefCell::new(VecDeque::new()),
         })
@@ -2023,6 +2029,30 @@ impl AgentCore {
         previous_observation: Option<&AgentObservation>,
     ) -> Result<LoopControl> {
         let action_source = resulting_source_name(&action);
+
+        // restricted 运行时门禁检查
+        let decision = crate::mode_policy::check_tool_action(self.mode, &action_source);
+        if !decision.allowed {
+            log_agent_warn(
+                "tool_action_policy_denied",
+                vec![
+                    ("step", json!(step)),
+                    ("action", json!(action_source)),
+                    ("reason", json!(decision.reason)),
+                ],
+            );
+            let failure = FailureDecision {
+                kind: StepFailureKind::ManualIntervention,
+                action: FailureAction::Replan,
+                replan_scope: Some(ReplanScope::CurrentStep),
+                detail: decision.reason,
+                source: action_source.clone(),
+                user_message: None,
+            };
+            trace.record_failure(step, &failure);
+            return self.handle_recorded_failure(step, failure, trace);
+        }
+
         for attempt in 0..=MAX_STEP_RETRIES {
             let tool_trace = trace.start_tool_call(step, &action);
             match self.tool_registry.execute(action.clone()) {
@@ -2879,7 +2909,7 @@ struct RecoveryTrace {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct AgentTraceIndexEntry {
+pub(crate) struct AgentTraceIndexEntry {
     trace_version: String,
     run_id: String,
     started_at: String,

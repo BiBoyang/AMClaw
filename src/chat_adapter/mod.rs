@@ -403,7 +403,10 @@ struct WeChatBot {
     pipeline: Pipeline,
     reporter: DailyReporter,
     task_store: TaskStore,
+    task_executor: crate::task_executor::TaskExecutor,
     context_token_map: HashMap<String, String>,
+    context_token_ttl_days: u64,
+    session_state_ttl_days: u64,
     daily_report_schedule: Option<DailyReportSchedule>,
     last_daily_report_push_day: Option<String>,
     weekly_report_schedule: Option<WeeklyReportSchedule>,
@@ -424,6 +427,13 @@ impl WeChatBot {
         let workspace_root = std::env::current_dir().context("获取工作目录失败")?;
         let db_path = config.db_path();
         let root_dir = config.resolved_root_dir();
+        let pipeline = Pipeline::new(
+            &root_dir,
+            browser,
+            crate::mode_policy::AgentMode::from_config(&config.agent.mode),
+        )?;
+        let task_executor =
+            crate::task_executor::TaskExecutor::start(pipeline.clone(), db_path.clone());
         let mut bot = Self {
             agent_core: AgentCore::with_task_store_db_path_and_agent_config(
                 workspace_root,
@@ -431,10 +441,13 @@ impl WeChatBot {
                 &config.agent,
             )?,
             client: ILinkClient::new(config.wechat.channel_version.clone())?,
-            pipeline: Pipeline::new(root_dir, browser)?,
+            pipeline,
             reporter: DailyReporter::from_config(&config)?,
             task_store: TaskStore::open(&db_path)?,
+            task_executor,
             context_token_map: HashMap::new(),
+            context_token_ttl_days: config.agent.context_token_ttl_days,
+            session_state_ttl_days: config.agent.session_state_ttl_days,
             daily_report_schedule: DailyReportSchedule::from_config(&config)?,
             last_daily_report_push_day: None,
             weekly_report_schedule: WeeklyReportSchedule::from_config(&config)?,
@@ -446,6 +459,7 @@ impl WeChatBot {
             running,
         };
         bot.restore_persisted_sessions()?;
+        bot.run_ttl_cleanup();
         Ok(bot)
     }
 
@@ -457,8 +471,36 @@ impl WeChatBot {
         Ok(())
     }
 
+    fn run_ttl_cleanup(&mut self) {
+        if let Err(err) = self
+            .task_store
+            .cleanup_expired_context_tokens(self.context_token_ttl_days)
+        {
+            log_chat_error(
+                "ttl_cleanup_failed",
+                vec![
+                    ("target", json!("context_tokens")),
+                    ("detail", json!(err.to_string())),
+                ],
+            );
+        }
+        if let Err(err) = self
+            .task_store
+            .cleanup_expired_user_session_states(self.session_state_ttl_days)
+        {
+            log_chat_error(
+                "ttl_cleanup_failed",
+                vec![
+                    ("target", json!("session_states")),
+                    ("detail", json!(err.to_string())),
+                ],
+            );
+        }
+    }
+
     fn poll_loop(&mut self) {
         while self.running.load(Ordering::Relaxed) {
+            self.resend_pending_chunks();
             self.flush_expired_sessions();
             self.process_pending_tasks();
             self.process_scheduled_daily_report_push();
@@ -802,7 +844,7 @@ impl WeChatBot {
         self.send_reply_text(user_id, &reply);
     }
 
-    fn handle_task_status_query(&self, user_id: &str, task_id: &str) {
+    fn handle_task_status_query(&mut self, user_id: &str, task_id: &str) {
         let reply = match self.task_store.get_task_status(task_id) {
             Ok(Some(status)) => build_task_status_reply(&status),
             Ok(None) => format!("未找到对应任务: {task_id}"),
@@ -811,7 +853,7 @@ impl WeChatBot {
         self.send_reply_text(user_id, &reply);
     }
 
-    fn handle_recent_tasks_query(&self, user_id: &str) {
+    fn handle_recent_tasks_query(&mut self, user_id: &str) {
         let reply = match self.task_store.list_recent_tasks(5) {
             Ok(tasks) => build_recent_tasks_reply(&tasks),
             Err(err) => format!("查询最近任务失败: {err}"),
@@ -819,7 +861,12 @@ impl WeChatBot {
         self.send_reply_text(user_id, &reply);
     }
 
-    fn handle_context_debug_query(&self, user_id: &str, extra_text: Option<&str>, verbose: bool) {
+    fn handle_context_debug_query(
+        &mut self,
+        user_id: &str,
+        extra_text: Option<&str>,
+        verbose: bool,
+    ) {
         let pending = self.session_router.snapshot(user_id);
         let mut parts = Vec::new();
         let mut message_ids = Vec::new();
@@ -872,12 +919,12 @@ impl WeChatBot {
         self.send_reply_text(user_id, &reply);
     }
 
-    fn handle_daily_report_query(&self, user_id: &str, day: Option<&str>) {
+    fn handle_daily_report_query(&mut self, user_id: &str, day: Option<&str>) {
         let reply = self.build_daily_report_query_reply(day);
         self.send_reply_text(user_id, &reply);
     }
 
-    fn handle_weekly_report_query(&self, user_id: &str, week: Option<&str>) {
+    fn handle_weekly_report_query(&mut self, user_id: &str, week: Option<&str>) {
         let reply = self.build_weekly_report_query_reply(week);
         self.send_reply_text(user_id, &reply);
     }
@@ -931,7 +978,7 @@ impl WeChatBot {
         self.send_reply_text(user_id, &reply);
     }
 
-    fn handle_user_memory_suppress(&self, user_id: &str, memory_id: &str) {
+    fn handle_user_memory_suppress(&mut self, user_id: &str, memory_id: &str) {
         let reply = match self.task_store.suppress_memory(user_id, memory_id) {
             Ok(()) => format!("已屏蔽记忆: {memory_id}"),
             Err(err) => format!("屏蔽记忆失败: {err}"),
@@ -939,7 +986,7 @@ impl WeChatBot {
         self.send_reply_text(user_id, &reply);
     }
 
-    fn handle_user_memory_useful(&self, user_id: &str, memory_id: &str) {
+    fn handle_user_memory_useful(&mut self, user_id: &str, memory_id: &str) {
         let reply = match self.task_store.confirm_memory_useful(user_id, memory_id) {
             Ok(()) => format!("已标记记忆有用: {memory_id}"),
             Err(err) => format!("标记记忆有用失败: {err}"),
@@ -947,7 +994,7 @@ impl WeChatBot {
         self.send_reply_text(user_id, &reply);
     }
 
-    fn handle_user_memories_query(&self, user_id: &str) {
+    fn handle_user_memories_query(&mut self, user_id: &str) {
         let reply = match self.task_store.list_user_memories(user_id, 10) {
             Ok(memories) => build_user_memories_reply(&memories),
             Err(err) => format!("查询记忆失败: {err}"),
@@ -1063,18 +1110,17 @@ impl WeChatBot {
 
     fn handle_task_retry(&mut self, user_id: &str, task_id: &str) {
         let reply = match self.task_store.retry_task(task_id) {
-            Ok(Some(_status)) => match self.process_pending_task_by_id(task_id) {
-                Ok(Some(final_status)) => build_task_retry_reply(&final_status),
-                Ok(None) => format!("未找到对应任务: {task_id}"),
-                Err(err) => format!("任务已重置为 pending，但重试处理失败: {err}"),
-            },
+            Ok(Some(_status)) => {
+                self.task_executor.enqueue(task_id.to_string());
+                format!("任务已重置并加入执行队列: {task_id}")
+            }
             Ok(None) => format!("未找到对应任务: {task_id}"),
             Err(err) => format!("重试任务失败: {err}"),
         };
         self.send_reply_text(user_id, &reply);
     }
 
-    fn handle_manual_tasks_query(&self, user_id: &str) {
+    fn handle_manual_tasks_query(&mut self, user_id: &str) {
         let reply = match self.task_store.list_manual_tasks(5) {
             Ok(tasks) => build_manual_tasks_reply(&tasks),
             Err(err) => format!("查询待补录任务失败: {err}"),
@@ -1387,7 +1433,7 @@ impl WeChatBot {
         self.send_reply_text(user_id, &reply);
     }
 
-    fn send_reply_text(&self, user_id: &str, reply: &str) {
+    fn send_reply_text(&mut self, user_id: &str, reply: &str) {
         let token = self
             .context_token_map
             .get(user_id)
@@ -1409,6 +1455,7 @@ impl WeChatBot {
         let chunk_total = chunks.len();
         let mut sent_chunk_count = 0usize;
         let mut all_sent = true;
+        let mut failed_idx = None;
         for (idx, chunk) in chunks.iter().enumerate() {
             match self.client.send_text_message(user_id, chunk, &token) {
                 Ok(()) => {
@@ -1425,6 +1472,7 @@ impl WeChatBot {
                 }
                 Err(err) => {
                     all_sent = false;
+                    failed_idx = Some(idx);
                     log_chat_error(
                         "reply_send_failed",
                         vec![
@@ -1453,7 +1501,29 @@ impl WeChatBot {
                     ("reply_preview", json!(summarize_text_for_log(reply, 120))),
                 ],
             );
-        } else {
+        } else if let Some(failed_idx) = failed_idx {
+            // 把剩余未发送段持久化，供后续补发
+            let remaining: Vec<(usize, usize, String)> = chunks[failed_idx..]
+                .iter()
+                .enumerate()
+                .map(|(offset, text)| {
+                    let idx = failed_idx + offset;
+                    (idx + 1, chunk_total, text.clone())
+                })
+                .collect();
+            if let Err(err) = self
+                .task_store
+                .insert_pending_chunks(user_id, &token, &remaining)
+            {
+                log_chat_error(
+                    "pending_chunks_insert_failed",
+                    vec![
+                        ("user_id", json!(user_id)),
+                        ("error_kind", json!("chunk_persist_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
+            }
             log_chat_warn(
                 "reply_partially_sent",
                 vec![
@@ -1462,9 +1532,71 @@ impl WeChatBot {
                     ("chunk_total", json!(chunk_total)),
                     ("sent_chunk_count", json!(sent_chunk_count)),
                     ("all_sent", json!(false)),
+                    ("pending_chunks", json!(remaining.len())),
                     ("reply_preview", json!(summarize_text_for_log(reply, 120))),
                 ],
             );
+        }
+    }
+
+    /// 每轮 poll_loop 开头尝试补发之前失败的 chunk。
+    fn resend_pending_chunks(&mut self) {
+        let chunks = match self.task_store.list_pending_chunks(20) {
+            Ok(c) => c,
+            Err(err) => {
+                log_chat_error(
+                    "resend_pending_chunks_query_failed",
+                    vec![
+                        ("error_kind", json!("chunk_query_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
+                return;
+            }
+        };
+
+        for chunk in chunks {
+            match self.client.send_text_message(
+                &chunk.user_id,
+                &chunk.chunk_text,
+                &chunk.context_token,
+            ) {
+                Ok(()) => {
+                    if let Err(err) = self.task_store.delete_pending_chunk(chunk.id) {
+                        log_chat_error(
+                            "pending_chunk_delete_failed",
+                            vec![
+                                ("chunk_id", json!(chunk.id)),
+                                ("error_kind", json!("chunk_delete_failed")),
+                                ("detail", json!(err.to_string())),
+                            ],
+                        );
+                    } else {
+                        log_chat_info(
+                            "pending_chunk_resent",
+                            vec![
+                                ("chunk_id", json!(chunk.id)),
+                                ("user_id", json!(chunk.user_id)),
+                                ("chunk_index", json!(chunk.chunk_index)),
+                                ("chunk_total", json!(chunk.chunk_total)),
+                            ],
+                        );
+                    }
+                }
+                Err(err) => {
+                    log_chat_warn(
+                        "pending_chunk_resend_failed",
+                        vec![
+                            ("chunk_id", json!(chunk.id)),
+                            ("user_id", json!(chunk.user_id)),
+                            ("chunk_index", json!(chunk.chunk_index)),
+                            ("chunk_total", json!(chunk.chunk_total)),
+                            ("error_kind", json!("wechat_send_failed")),
+                            ("detail", json!(err.to_string())),
+                        ],
+                    );
+                }
+            }
         }
     }
 
@@ -1683,112 +1815,18 @@ impl WeChatBot {
         };
 
         for task in pending {
-            if let Err(err) = self.process_single_pending_task(&task) {
-                log_chat_error(
-                    "pending_task_process_failed",
-                    vec![
-                        ("task_id", json!(task.task_id)),
-                        ("error_kind", json!("pending_task_process_failed")),
-                        ("detail", json!(err.to_string())),
-                    ],
-                );
-            }
-        }
-    }
-
-    fn process_pending_task_by_id(
-        &mut self,
-        task_id: &str,
-    ) -> Result<Option<crate::task_store::TaskStatusRecord>> {
-        let Some(task) = self.task_store.get_pending_task(task_id)? else {
-            return self.task_store.get_task_status(task_id);
-        };
-        self.process_single_pending_task(&task)?;
-        self.task_store.get_task_status(task_id)
-    }
-
-    fn process_single_pending_task(
-        &mut self,
-        task: &crate::task_store::PendingTaskRecord,
-    ) -> Result<()> {
-        match self.pipeline.process_pending_task(task) {
-            Ok(result) => {
-                let output_path = result.output_path.to_string_lossy().to_string();
-                let snapshot_path = result
-                    .snapshot_path
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().to_string());
-                self.task_store
-                    .mark_task_archived(
-                        &task.task_id,
-                        MarkTaskArchivedInput {
-                            output_path: &output_path,
-                            title: result.title.as_deref(),
-                            page_kind: Some(&result.page_kind),
-                            snapshot_path: snapshot_path.as_deref(),
-                            content_source: Some(&result.content_source),
-                            summary: result.summary.as_deref(),
-                        },
-                    )
-                    .with_context(|| format!("更新 archived 失败 task_id={}", task.task_id))?;
+            let task_id = task.task_id.clone();
+            let enqueued = self.task_executor.enqueue(task_id.clone());
+            if !enqueued {
                 log_chat_info(
-                    "pending_task_archived",
+                    "pending_task_enqueue_skipped",
                     vec![
-                        ("task_id", json!(task.task_id)),
-                        ("status", json!("archived")),
-                        (
-                            "output_path",
-                            json!(result.output_path.display().to_string()),
-                        ),
+                        ("task_id", json!(task_id)),
+                        ("reason", json!("already_inflight")),
                     ],
                 );
             }
-            Err(err) => match err.kind {
-                crate::pipeline::PipelineFailureKind::AwaitingManualInput { page_kind } => {
-                    let snapshot_path = err
-                        .snapshot_path
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().to_string());
-                    let content_source = err.content_source.clone();
-                    self.task_store
-                        .mark_task_awaiting_manual_input(
-                            &task.task_id,
-                            &err.message,
-                            &page_kind,
-                            snapshot_path.as_deref(),
-                            content_source.as_deref(),
-                        )
-                        .with_context(|| {
-                            format!("更新 awaiting_manual_input 失败 task_id={}", task.task_id)
-                        })?;
-                    log_chat_warn(
-                        "pending_task_awaiting_manual_input",
-                        vec![
-                            ("task_id", json!(task.task_id)),
-                            ("status", json!("awaiting_manual_input")),
-                            ("page_kind", json!(page_kind)),
-                            ("detail", json!(err.message)),
-                        ],
-                    );
-                }
-                crate::pipeline::PipelineFailureKind::Failed => {
-                    self.task_store
-                        .mark_task_failed(&task.task_id, &err.message)
-                        .with_context(|| format!("更新 failed 失败 task_id={}", task.task_id))?;
-                    log_chat_error(
-                        "pending_task_failed",
-                        vec![
-                            ("task_id", json!(task.task_id)),
-                            ("status", json!("failed")),
-                            ("error_kind", json!("pipeline_task_failed")),
-                            ("detail", json!(err.message)),
-                        ],
-                    );
-                }
-            },
         }
-
-        Ok(())
     }
 }
 
@@ -1952,10 +1990,6 @@ fn build_manual_tasks_reply(tasks: &[crate::task_store::RecentTaskRecord]) -> St
         ));
     }
     lines.join("\n")
-}
-
-fn build_task_retry_reply(status: &crate::task_store::TaskStatusRecord) -> String {
-    format!("任务已重试\n{}", build_task_status_reply(status))
 }
 
 fn build_user_memories_reply(memories: &[crate::task_store::UserMemoryRecord]) -> String {
@@ -2246,11 +2280,26 @@ mod tests {
             agent_core: AgentCore::with_task_store_db_path(workspace_root, db_path.to_path_buf())
                 .expect("初始化 agent 失败"),
             client: ILinkClient::new("1.0.0").expect("初始化 iLink 客户端失败"),
-            pipeline: Pipeline::new(temp_dir(), None::<ResolvedBrowserConfig>)
-                .expect("初始化 pipeline 失败"),
+            pipeline: Pipeline::new(
+                temp_dir(),
+                None::<ResolvedBrowserConfig>,
+                crate::mode_policy::AgentMode::Restricted,
+            )
+            .expect("初始化 pipeline 失败"),
             reporter: DailyReporter::new(reporter_root, db_path.to_path_buf(), timezone),
             task_store: TaskStore::open(db_path).expect("初始化 task store 失败"),
+            task_executor: crate::task_executor::TaskExecutor::start(
+                Pipeline::new(
+                    temp_dir(),
+                    None::<ResolvedBrowserConfig>,
+                    crate::mode_policy::AgentMode::Restricted,
+                )
+                .expect("初始化 pipeline 失败"),
+                db_path.to_path_buf(),
+            ),
             context_token_map: HashMap::new(),
+            context_token_ttl_days: 30,
+            session_state_ttl_days: 30,
             daily_report_schedule: None,
             last_daily_report_push_day: None,
             weekly_report_schedule: None,
@@ -2564,6 +2613,7 @@ mod tests {
             message_type: Some(1),
             ..WireMessage::default()
         });
+        bot.task_executor.flush();
 
         let row = task_row(&db_path, &task_id).expect("应存在任务");
         assert_eq!(row.1, 2);
@@ -2586,6 +2636,7 @@ mod tests {
 
         let task_id = first_task_id(&db_path);
         bot.process_pending_tasks();
+        bot.task_executor.flush();
 
         let status = task_row(&db_path, &task_id).map(|row| row.0);
         assert!(matches!(

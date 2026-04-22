@@ -1147,7 +1147,7 @@ impl WeChatBot {
                         Ok(true) => format!(
                             "已写入人工补正文\ntask_id: {task_id}\noutput_path: {output_path}"
                         ),
-                        Ok(false) => format!("未找到对应任务: {task_id}"),
+                        Ok(false) => build_manual_archive_rejected_reply(&self.task_store, task_id),
                         Err(err) => format!("更新任务状态失败: {err}"),
                     }
                 }
@@ -1800,13 +1800,13 @@ impl WeChatBot {
     }
 
     fn process_pending_tasks(&mut self) {
-        let pending = match self.task_store.list_pending_tasks(5) {
+        let claimable = match self.task_store.list_claimable_tasks(5) {
             Ok(tasks) => tasks,
             Err(err) => {
                 log_chat_error(
-                    "pending_tasks_query_failed",
+                    "claimable_tasks_query_failed",
                     vec![
-                        ("error_kind", json!("pending_tasks_query_failed")),
+                        ("error_kind", json!("claimable_tasks_query_failed")),
                         ("detail", json!(err.to_string())),
                     ],
                 );
@@ -1814,12 +1814,12 @@ impl WeChatBot {
             }
         };
 
-        for task in pending {
+        for task in claimable {
             let task_id = task.task_id.clone();
             let enqueued = self.task_executor.enqueue(task_id.clone());
             if !enqueued {
                 log_chat_info(
-                    "pending_task_enqueue_skipped",
+                    "claimable_task_enqueue_skipped",
                     vec![
                         ("task_id", json!(task_id)),
                         ("reason", json!("already_inflight")),
@@ -2002,6 +2002,14 @@ fn build_user_memories_reply(memories: &[crate::task_store::UserMemoryRecord]) -
         lines.push(format!("- id: {} | {}", memory.id, memory.content));
     }
     lines.join("\n")
+}
+
+fn build_manual_archive_rejected_reply(task_store: &TaskStore, task_id: &str) -> String {
+    match task_store.get_task_status(task_id) {
+        Ok(Some(status)) => format!("任务当前状态为 {}，不允许人工归档: {task_id}", status.status),
+        Ok(None) => format!("未找到对应任务: {task_id}"),
+        Err(err) => format!("查询任务状态失败: {err}"),
+    }
 }
 
 fn extract_auto_memory_candidate(input: &str) -> Option<String> {
@@ -2245,7 +2253,7 @@ fn now_epoch_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ILinkClient, WeChatBot, WireMessage};
+    use super::{build_manual_archive_rejected_reply, ILinkClient, WeChatBot, WireMessage};
     use crate::agent_core::AgentCore;
     use crate::config::ResolvedBrowserConfig;
     use crate::pipeline::Pipeline;
@@ -2660,6 +2668,9 @@ mod tests {
 
         let task_id = first_task_id(&db_path);
         bot.task_store
+            .claim_task(&task_id, "test-worker", 300)
+            .expect("claim 失败");
+        bot.task_store
             .mark_task_awaiting_manual_input(
                 &task_id,
                 "微信公众号页面需要验证码验证",
@@ -2690,6 +2701,9 @@ mod tests {
 
         let task_id = first_task_id(&db_path);
         bot.task_store
+            .claim_task(&task_id, "test-worker", 300)
+            .expect("claim 失败");
+        bot.task_store
             .mark_task_awaiting_manual_input(
                 &task_id,
                 "微信公众号页面需要验证码验证",
@@ -2711,6 +2725,31 @@ mod tests {
         assert_eq!(details.0, "archived".to_string());
         assert_eq!(details.1, Some("manual_input".to_string()));
         assert!(details.2.is_some());
+    }
+
+    #[test]
+    fn manual_archive_rejected_reply_includes_current_status() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        bot.handle_message(WireMessage {
+            from_user_id: "user-a".to_string(),
+            text: "https://example.com/not-manual".to_string(),
+            message_id: Some(super::FlexibleId::Str("msg-manual-reject".to_string())),
+            message_type: Some(1),
+            ..WireMessage::default()
+        });
+
+        let task_id = first_task_id(&db_path);
+        let reply = build_manual_archive_rejected_reply(&bot.task_store, &task_id);
+        assert!(
+            reply.contains("任务当前状态为 pending"),
+            "应包含当前状态提示，实际: {reply}"
+        );
+        assert!(
+            reply.contains("不允许人工归档"),
+            "应提示状态不允许人工归档，实际: {reply}"
+        );
     }
 
     #[test]
@@ -2798,6 +2837,9 @@ mod tests {
             .record_link_submission("https://example.com/daily-query")
             .expect("写入任务失败");
         bot.task_store
+            .claim_task(&created.task_id, "test-worker", 300)
+            .expect("claim 失败");
+        bot.task_store
             .mark_task_archived(
                 &created.task_id,
                 MarkTaskArchivedInput {
@@ -2829,6 +2871,9 @@ mod tests {
             .task_store
             .record_link_submission("https://example.com/weekly-query")
             .expect("写入任务失败");
+        bot.task_store
+            .claim_task(&created.task_id, "test-worker", 300)
+            .expect("claim 失败");
         bot.task_store
             .mark_task_archived(
                 &created.task_id,

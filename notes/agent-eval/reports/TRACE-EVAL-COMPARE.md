@@ -1,6 +1,6 @@
 # Trace Evaluation Comparison Report
 
-- **对比窗口**: before=2026-04-18 after=2026-04-18
+- **对比窗口**: before=2026-04-18 after=2026-04-21
 - **样本数**: before=20 after=20
 - **baseline 覆盖**: before=100.0% after=100.0%
 - **综合判定**: PASS

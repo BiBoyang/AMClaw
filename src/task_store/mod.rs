@@ -83,6 +83,15 @@ pub struct PendingTaskRecord {
     pub original_url: String,
 }
 
+/// 可被 worker 领取的任务（pending 或 lease 已过期的 processing）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimableTaskRecord {
+    pub task_id: String,
+    pub article_id: String,
+    pub normalized_url: String,
+    pub original_url: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarkTaskArchivedInput<'a> {
     pub output_path: &'a str,
@@ -1777,13 +1786,38 @@ impl TaskStore {
                     page_kind = NULL,
                     output_path = NULL,
                     snapshot_path = NULL,
+                    worker_id = NULL,
+                    processing_started_at = NULL,
+                    lease_until = NULL,
                     updated_at = ?2
                 WHERE id = ?1
+                  AND status IN ('failed', 'awaiting_manual_input', 'archived')
                 "#,
                 params![task_id, now],
             )
             .context("更新任务重试状态失败")?;
         if updated == 0 {
+            // 任务存在但处于非稳定态（如 processing/pending）
+            if let Ok(Some(status)) = tx
+                .query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()
+            {
+                tx.rollback().context("回滚不允许重试任务事务失败")?;
+                log_task_store_warn(
+                    "task_retry_rejected",
+                    vec![
+                        ("task_id", json!(task_id)),
+                        ("current_status", json!(status)),
+                        ("reason", json!("task_not_in_terminal_state")),
+                    ],
+                );
+                return Err(TaskStoreError::Validation(format!(
+                    "任务当前状态为 {status}，不允许重试"
+                ))
+                .into());
+            }
             tx.rollback().context("回滚不存在任务事务失败")?;
             log_task_store_warn(
                 "task_retry_requested",
@@ -1888,6 +1922,102 @@ impl TaskStore {
             .context("查询指定 pending 任务失败")
     }
 
+    /// 按 task_id 查询任意状态的任务（返回基础字段）。
+    pub fn get_task_by_id(&self, task_id: &str) -> Result<Option<ClaimableTaskRecord>> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT t.id, t.article_id, a.normalized_url, a.original_url
+                FROM tasks t
+                JOIN articles a ON a.id = t.article_id
+                WHERE t.id = ?1
+                "#,
+                [task_id],
+                |row| {
+                    Ok(ClaimableTaskRecord {
+                        task_id: row.get(0)?,
+                        article_id: row.get(1)?,
+                        normalized_url: row.get(2)?,
+                        original_url: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .context("查询指定任务失败")
+    }
+
+    /// 列出所有可领取的任务：pending，或 lease 已过期的 processing。
+    pub fn list_claimable_tasks(&self, limit: usize) -> Result<Vec<ClaimableTaskRecord>> {
+        let limit = i64::try_from(limit).context("claimable task limit 超出范围")?;
+        let now = Utc::now().to_rfc3339();
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+                SELECT t.id, t.article_id, a.normalized_url, a.original_url
+                FROM tasks t
+                JOIN articles a ON a.id = t.article_id
+                WHERE t.status = 'pending'
+                   OR (t.status = 'processing' AND (t.lease_until IS NULL OR datetime(t.lease_until) < datetime(?1)))
+                ORDER BY t.created_at ASC
+                LIMIT ?2
+                "#,
+            )
+            .context("准备 claimable 任务查询失败")?;
+        let rows = stmt
+            .query_map(params![&now, limit], |row| {
+                Ok(ClaimableTaskRecord {
+                    task_id: row.get(0)?,
+                    article_id: row.get(1)?,
+                    normalized_url: row.get(2)?,
+                    original_url: row.get(3)?,
+                })
+            })
+            .context("查询 claimable 任务失败")?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks.push(row.context("读取 claimable 任务记录失败")?);
+        }
+        Ok(tasks)
+    }
+
+    /// 原子领取任务：将 pending 或 lease 过期的 processing 任务更新为 processing。
+    /// 成功返回 true，失败（已被其他 worker 领取或不存在）返回 false。
+    pub fn claim_task(&mut self, task_id: &str, worker_id: &str, lease_secs: u64) -> Result<bool> {
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let lease_until = now + chrono::Duration::seconds(lease_secs as i64);
+        let lease_str = lease_until.to_rfc3339();
+        let updated = self
+            .conn
+            .execute(
+                r#"
+                UPDATE tasks
+                SET status = 'processing',
+                    worker_id = ?2,
+                    processing_started_at = ?3,
+                    lease_until = ?4,
+                    updated_at = ?5
+                WHERE id = ?1
+                  AND (status = 'pending' OR (status = 'processing' AND (lease_until IS NULL OR datetime(lease_until) < datetime(?6))))
+                "#,
+                params![task_id, worker_id, &now_str, &lease_str, &now_str, &now_str],
+            )
+            .context("claim 任务失败")?;
+        if updated > 0 {
+            log_task_store_info(
+                "task_claimed",
+                vec![
+                    ("task_id", json!(task_id)),
+                    ("worker_id", json!(worker_id)),
+                    ("lease_until", json!(lease_str)),
+                ],
+            );
+        }
+        Ok(updated > 0)
+    }
+
     pub fn mark_task_archived(
         &mut self,
         task_id: &str,
@@ -1905,7 +2035,7 @@ impl TaskStore {
         let tx = self.conn.transaction().context("开启 archived 事务失败")?;
         let updated = tx
             .execute(
-                "UPDATE tasks SET status = 'archived', last_error = NULL, output_path = ?2, page_kind = COALESCE(?3, page_kind), snapshot_path = ?4, content_source = COALESCE(?5, content_source), updated_at = ?6 WHERE id = ?1",
+                "UPDATE tasks SET status = 'archived', last_error = NULL, worker_id = NULL, processing_started_at = NULL, lease_until = NULL, output_path = ?2, page_kind = COALESCE(?3, page_kind), snapshot_path = ?4, content_source = COALESCE(?5, content_source), updated_at = ?6 WHERE id = ?1 AND (status = 'processing' OR status = 'awaiting_manual_input')",
                 params![task_id, output_path, page_kind, snapshot_path, content_source, now.clone()],
             )
             .context("更新 archived 状态失败")?;
@@ -1970,7 +2100,7 @@ impl TaskStore {
         let updated = self
             .conn
             .execute(
-                "UPDATE tasks SET status = 'awaiting_manual_input', last_error = ?2, page_kind = ?3, snapshot_path = ?4, content_source = COALESCE(?5, content_source), output_path = NULL, updated_at = ?6 WHERE id = ?1",
+                "UPDATE tasks SET status = 'awaiting_manual_input', last_error = ?2, page_kind = ?3, snapshot_path = ?4, content_source = COALESCE(?5, content_source), output_path = NULL, worker_id = NULL, processing_started_at = NULL, lease_until = NULL, updated_at = ?6 WHERE id = ?1 AND status = 'processing'",
                 params![task_id, last_error, page_kind, snapshot_path, content_source, now],
             )
             .context("更新 awaiting_manual_input 状态失败")?;
@@ -2005,7 +2135,7 @@ impl TaskStore {
         let updated = self
             .conn
             .execute(
-                "UPDATE tasks SET status = 'failed', last_error = ?2, page_kind = NULL, output_path = NULL, snapshot_path = NULL, content_source = NULL, updated_at = ?3 WHERE id = ?1",
+                "UPDATE tasks SET status = 'failed', last_error = ?2, page_kind = NULL, output_path = NULL, snapshot_path = NULL, content_source = NULL, worker_id = NULL, processing_started_at = NULL, lease_until = NULL, updated_at = ?3 WHERE id = ?1 AND status = 'processing'",
                 params![task_id, last_error, now],
             )
             .context("更新 failed 状态失败")?;
@@ -2058,6 +2188,9 @@ impl TaskStore {
                 page_kind    TEXT,
                 output_path  TEXT,
                 snapshot_path TEXT,
+                worker_id    TEXT,
+                processing_started_at DATETIME,
+                lease_until  DATETIME,
                 created_at   DATETIME NOT NULL,
                 updated_at   DATETIME NOT NULL
             );
@@ -2137,6 +2270,7 @@ impl TaskStore {
             CREATE INDEX IF NOT EXISTS idx_tasks_article_id ON tasks(article_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
             CREATE INDEX IF NOT EXISTS idx_tasks_updated_at ON tasks(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_tasks_status_lease ON tasks(status, lease_until);
             CREATE INDEX IF NOT EXISTS idx_inbound_messages_received_at ON inbound_messages(received_at);
 
             CREATE TABLE IF NOT EXISTS outbound_pending_chunks (
@@ -2155,6 +2289,9 @@ impl TaskStore {
         ensure_column_exists(&self.conn, "tasks", "page_kind", "TEXT")?;
         ensure_column_exists(&self.conn, "tasks", "output_path", "TEXT")?;
         ensure_column_exists(&self.conn, "tasks", "snapshot_path", "TEXT")?;
+        ensure_column_exists(&self.conn, "tasks", "worker_id", "TEXT")?;
+        ensure_column_exists(&self.conn, "tasks", "processing_started_at", "DATETIME")?;
+        ensure_column_exists(&self.conn, "tasks", "lease_until", "DATETIME")?;
         ensure_column_exists(&self.conn, "articles", "summary", "TEXT")?;
         ensure_column_exists(
             &self.conn,
@@ -2658,7 +2795,7 @@ mod tests {
         PendingTaskRecord, PromoteReason, RecentTaskRecord, SkipReason, StoredSessionRecord,
         TaskStatusRecord, TaskStore, UserMemoryRecord, UserSessionStateRecord, WriteDecision,
     };
-    use rusqlite::Connection;
+    use rusqlite::{params, Connection};
     use serde_json::{json, Value};
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -3100,6 +3237,84 @@ mod tests {
     }
 
     #[test]
+    fn retry_processing_task_returns_validation_error() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        let created = store
+            .record_link_submission("https://example.com/retry-processing")
+            .expect("写入链接失败");
+
+        // 先领取，进入 processing 状态
+        assert!(
+            store
+                .claim_task(&created.task_id, "worker-a", 300)
+                .expect("claim 失败"),
+            "pending 任务应可被领取"
+        );
+
+        let err = store
+            .retry_task(&created.task_id)
+            .expect_err("processing 状态下重试应失败");
+        let message = err.to_string();
+        assert!(
+            message.contains("不允许重试"),
+            "错误信息应提示不允许重试，实际: {message}"
+        );
+        assert!(
+            message.contains("processing"),
+            "错误信息应包含当前状态 processing，实际: {message}"
+        );
+    }
+
+    #[test]
+    fn expired_lease_task_can_be_reclaimed() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        let created = store
+            .record_link_submission("https://example.com/reclaim")
+            .expect("写入链接失败");
+
+        // 首次领取成功，第二次应失败（lease 尚未过期）
+        assert!(
+            store
+                .claim_task(&created.task_id, "worker-a", 300)
+                .expect("首次 claim 失败")
+        );
+        assert!(
+            !store
+                .claim_task(&created.task_id, "worker-b", 300)
+                .expect("二次 claim 查询失败"),
+            "lease 未过期时不应被再次领取"
+        );
+
+        // 人工制造过期 lease，再次领取应成功
+        let conn = Connection::open(&db_path).expect("打开数据库失败");
+        conn.execute(
+            "UPDATE tasks SET lease_until = ?2 WHERE id = ?1",
+            params![created.task_id.as_str(), "2000-01-01T00:00:00+00:00"],
+        )
+        .expect("回写过期 lease 失败");
+        drop(conn);
+
+        assert!(
+            store
+                .claim_task(&created.task_id, "worker-b", 300)
+                .expect("过期后 claim 失败"),
+            "lease 过期后应可被重新领取"
+        );
+
+        let conn = Connection::open(&db_path).expect("打开数据库失败");
+        let worker_id: Option<String> = conn
+            .query_row(
+                "SELECT worker_id FROM tasks WHERE id = ?1",
+                [created.task_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("读取 worker_id 失败");
+        assert_eq!(worker_id, Some("worker-b".to_string()));
+    }
+
+    #[test]
     fn pending_tasks_can_be_listed_and_archived() {
         let db_path = temp_db_path();
         let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
@@ -3117,6 +3332,10 @@ mod tests {
                 original_url: "https://example.com/pending".to_string(),
             }]
         );
+
+        store
+            .claim_task(&created.task_id, "test-worker", 300)
+            .expect("claim 失败");
 
         assert!(store
             .mark_task_archived(
@@ -3155,6 +3374,10 @@ mod tests {
             .record_link_submission("https://example.com/fail")
             .expect("写入链接失败");
 
+        store
+            .claim_task(&created.task_id, "test-worker", 300)
+            .expect("claim 失败");
+
         assert!(store
             .mark_task_failed(&created.task_id, "network fail")
             .expect("更新 failed 状态失败"));
@@ -3176,6 +3399,10 @@ mod tests {
         let created = store
             .record_link_submission("https://mp.weixin.qq.com/s/manual")
             .expect("写入链接失败");
+
+        store
+            .claim_task(&created.task_id, "test-worker", 300)
+            .expect("claim 失败");
 
         assert!(store
             .mark_task_awaiting_manual_input(
@@ -3210,6 +3437,9 @@ mod tests {
             .expect("写入链接失败");
 
         store
+            .claim_task(&created.task_id, "test-worker", 300)
+            .expect("claim 失败");
+        store
             .mark_task_awaiting_manual_input(
                 &created.task_id,
                 "微信公众号页面需要验证码验证",
@@ -3241,6 +3471,10 @@ mod tests {
         let created = store
             .record_link_submission("https://example.com/archived-list")
             .expect("写入链接失败");
+
+        store
+            .claim_task(&created.task_id, "test-worker", 300)
+            .expect("claim 失败");
 
         assert!(store
             .mark_task_archived(
@@ -3661,6 +3895,9 @@ mod tests {
             .expect("写入链接失败");
 
         store
+            .claim_task(&created.task_id, "test-worker", 300)
+            .expect("claim 失败");
+        store
             .mark_task_archived(
                 &created.task_id,
                 MarkTaskArchivedInput {
@@ -3677,12 +3914,15 @@ mod tests {
         // Simulate retry: reset then re-archive with better summary
         let conn = Connection::open(&db_path).expect("打开数据库失败");
         conn.execute(
-            "UPDATE tasks SET status = 'pending', output_path = NULL WHERE id = ?1",
+            "UPDATE tasks SET status = 'pending', output_path = NULL, worker_id = NULL, processing_started_at = NULL, lease_until = NULL WHERE id = ?1",
             [created.task_id.as_str()],
         )
         .expect("重置任务状态失败");
         drop(conn);
 
+        store
+            .claim_task(&created.task_id, "test-worker", 300)
+            .expect("claim 失败");
         store
             .mark_task_archived(
                 &created.task_id,

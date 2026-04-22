@@ -1,6 +1,6 @@
 # Trace Evaluation Report
 
-- generated: 2026-04-18T11:20:10.620477+00:00
+- generated: 2026-04-21T23:16:26.634510+00:00
 - total traces: 20
 - baseline_file: notes/agent-eval/baselines/EVAL-BASELINE-SAMPLES-2026-04-18.md
 - baseline_run_ids: 20
@@ -26,6 +26,27 @@
 | baseline run ids | 20 | 100% |
 | baseline hits in current trace set | 20 | 100.0% |
 | baseline missing in current trace set | 0 | 0.0% |
+
+## Retrieval Statistics
+
+| metric | value |
+| --- | --- |
+| latency_p50_ms | 0 |
+| latency_p95_ms | 0 |
+| fallback_rate | 0.0% |
+| candidate_hit_ratio | 0.0% (0 / 0) |
+
+### By Retriever Name
+
+| retriever | traces | avg_candidates | avg_hits | avg_latency_ms |
+| --- | ---: | ---: | ---: | ---: |
+| (unknown) | 20 | 0.0 | 0.0 | 0.0 |
+
+### By Retrieval Mode
+
+| mode | traces | avg_candidates | avg_hits | avg_latency_ms |
+| --- | ---: | ---: | ---: | ---: |
+| (unknown) | 20 | 0.0 | 0.0 | 0.0 |
 
 ## Failure Type Distribution
 

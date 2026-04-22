@@ -443,6 +443,9 @@ mod tests {
             .expect("写入任务失败");
         // 注入一个指向 workspace 外的 output_path
         store
+            .claim_task(&record.task_id, "test-worker", 300)
+            .expect("claim 失败");
+        store
             .mark_task_archived(
                 &record.task_id,
                 crate::task_store::MarkTaskArchivedInput {
@@ -503,6 +506,9 @@ mod tests {
             .record_link_submission("https://example.com/manual")
             .expect("写入待补录任务失败");
         store
+            .claim_task(&manual.task_id, "test-worker", 300)
+            .expect("claim 失败");
+        store
             .mark_task_awaiting_manual_input(
                 &manual.task_id,
                 "need manual",
@@ -547,6 +553,9 @@ mod tests {
         std::fs::create_dir_all(archive_path.parent().expect("归档路径应存在父目录"))
             .expect("创建归档目录失败");
         std::fs::write(&archive_path, "# Archived\n\nhello archive").expect("写入归档文件失败");
+        store
+            .claim_task(&record.task_id, "test-worker", 300)
+            .expect("claim 失败");
         store
             .mark_task_archived(
                 &record.task_id,

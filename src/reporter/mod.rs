@@ -346,6 +346,9 @@ timezone = "Asia/Shanghai"
             .record_link_submission("https://example.com/report-item")
             .expect("写入链接失败");
         store
+            .claim_task(&created.task_id, "test-worker", 300)
+            .expect("claim 失败");
+        store
             .mark_task_archived(
                 &created.task_id,
                 MarkTaskArchivedInput {
@@ -402,6 +405,9 @@ timezone = "Asia/Shanghai"
             .record_link_submission("https://example.com/with-summary")
             .expect("写入链接失败");
         store
+            .claim_task(&with_summary.task_id, "test-worker", 300)
+            .expect("claim 失败");
+        store
             .mark_task_archived(
                 &with_summary.task_id,
                 MarkTaskArchivedInput {
@@ -420,6 +426,9 @@ timezone = "Asia/Shanghai"
         let without_summary = store
             .record_link_submission("https://example.com/without-summary")
             .expect("写入链接失败");
+        store
+            .claim_task(&without_summary.task_id, "test-worker", 300)
+            .expect("claim 失败");
         store
             .mark_task_archived(
                 &without_summary.task_id,
@@ -474,6 +483,9 @@ timezone = "Asia/Shanghai"
         let created = store
             .record_link_submission("https://example.com/weekly-report-item")
             .expect("写入链接失败");
+        store
+            .claim_task(&created.task_id, "test-worker", 300)
+            .expect("claim 失败");
         store
             .mark_task_archived(
                 &created.task_id,
@@ -539,6 +551,9 @@ timezone = "Asia/Shanghai"
                 .record_link_submission(&format!("https://example.com/yesterday-{i}"))
                 .expect("写入链接失败");
             store
+                .claim_task(&created.task_id, "test-worker", 300)
+                .expect("claim 失败");
+            store
                 .mark_task_archived(
                     &created.task_id,
                     MarkTaskArchivedInput {
@@ -560,6 +575,9 @@ timezone = "Asia/Shanghai"
             let created = store
                 .record_link_submission(&format!("https://example.com/twodays-{i}"))
                 .expect("写入链接失败");
+            store
+                .claim_task(&created.task_id, "test-worker", 300)
+                .expect("claim 失败");
             store
                 .mark_task_archived(
                     &created.task_id,
@@ -630,6 +648,9 @@ timezone = "Asia/Shanghai"
                 let created = store
                     .record_link_submission(&format!("https://example.com/boundary-{i}"))
                     .expect("写入链接失败");
+                store
+                    .claim_task(&created.task_id, "test-worker", 300)
+                    .expect("claim 失败");
                 store
                     .mark_task_archived(
                         &created.task_id,

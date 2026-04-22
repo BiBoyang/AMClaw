@@ -9,6 +9,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use uuid::Uuid;
 
 /// TaskExecutor 把 pipeline 任务执行从 poll_loop 主线程解耦到独立 worker 线程。
 /// poll_loop 只负责 enqueue task_id，worker 负责实际的抓取与归档。
@@ -28,6 +29,8 @@ impl TaskExecutor {
         let pc = pending_count.clone();
         let inflight_worker = inflight.clone();
         let worker = thread::spawn(move || {
+            let worker_id = Uuid::new_v4().to_string();
+            log_task_executor_info("worker_started", vec![("worker_id", json!(&worker_id))]);
             let mut task_store = match TaskStore::open(&db_path) {
                 Ok(store) => store,
                 Err(err) => {
@@ -39,7 +42,7 @@ impl TaskExecutor {
                 }
             };
             while let Ok(task_id) = receiver.recv() {
-                if let Err(err) = process_task(&pipeline, &mut task_store, &task_id) {
+                if let Err(err) = process_task(&pipeline, &mut task_store, &task_id, &worker_id) {
                     log_task_executor_error(
                         "task_execution_failed",
                         vec![
@@ -106,19 +109,46 @@ impl TaskExecutor {
     }
 }
 
-/// 在 worker 线程内执行单个任务：抓取 -> 归档 -> 更新状态。
-fn process_task(pipeline: &Pipeline, task_store: &mut TaskStore, task_id: &str) -> Result<()> {
-    let Some(task) = task_store.get_pending_task(task_id)? else {
+/// 在 worker 线程内执行单个任务：claim -> 抓取 -> 归档 -> 更新状态。
+fn process_task(
+    pipeline: &Pipeline,
+    task_store: &mut TaskStore,
+    task_id: &str,
+    worker_id: &str,
+) -> Result<()> {
+    // 1. 原子领取任务（pending 或 lease 过期的 processing -> processing）
+    const LEASE_SECS: u64 = 300;
+    if !task_store.claim_task(task_id, worker_id, LEASE_SECS)? {
+        log_task_executor_info(
+            "task_claim_skipped",
+            vec![
+                ("task_id", json!(task_id)),
+                ("reason", json!("already_claimed_or_missing")),
+            ],
+        );
+        return Ok(());
+    }
+
+    // 2. 获取任务详情
+    let Some(task) = task_store.get_task_by_id(task_id)? else {
         log_task_executor_warn(
-            "task_not_found_or_not_pending",
+            "task_not_found_after_claim",
             vec![("task_id", json!(task_id))],
         );
         return Ok(());
     };
 
-    match pipeline.process_pending_task(&task) {
+    // pipeline 接受 PendingTaskRecord，字段完全一致，做兼容转换
+    let pending_task = crate::task_store::PendingTaskRecord {
+        task_id: task.task_id.clone(),
+        article_id: task.article_id.clone(),
+        normalized_url: task.normalized_url.clone(),
+        original_url: task.original_url.clone(),
+    };
+
+    match pipeline.process_pending_task(&pending_task) {
         Ok(result) => {
-            archive_success(task_store, &task, &result)?;
+            archive_success(task_store, &pending_task, &result)?;
         }
         Err(err) => {
             let err_msg = err.message.clone();
@@ -131,7 +161,7 @@ fn process_task(pipeline: &Pipeline, task_store: &mut TaskStore, task_id: &str) 
                     let content_source = err.content_source.clone();
                     task_store
                         .mark_task_awaiting_manual_input(
-                            &task.task_id,
+                            &pending_task.task_id,
                             &err_msg,
                             page_kind,
                             snapshot_path.as_deref(),
@@ -140,13 +170,13 @@ fn process_task(pipeline: &Pipeline, task_store: &mut TaskStore, task_id: &str) 
                         .with_context(|| {
                             format!(
                                 "worker 更新 awaiting_manual_input 失败 task_id={}",
-                                task.task_id
+                                pending_task.task_id
                             )
                         })?;
                     log_task_executor_warn(
                         "pending_task_awaiting_manual_input",
                         vec![
-                            ("task_id", json!(task.task_id)),
+                            ("task_id", json!(pending_task.task_id)),
                             ("status", json!("awaiting_manual_input")),
                             ("page_kind", json!(page_kind)),
                             ("detail", json!(err_msg)),
@@ -155,14 +185,14 @@ fn process_task(pipeline: &Pipeline, task_store: &mut TaskStore, task_id: &str) 
                 }
                 PipelineFailureKind::Failed => {
                     task_store
-                        .mark_task_failed(&task.task_id, &err_msg)
+                        .mark_task_failed(&pending_task.task_id, &err_msg)
                         .with_context(|| {
-                            format!("worker 更新 failed 失败 task_id={}", task.task_id)
+                            format!("worker 更新 failed 失败 task_id={}", pending_task.task_id)
                         })?;
                     log_task_executor_error(
                         "pending_task_failed",
                         vec![
-                            ("task_id", json!(task.task_id)),
+                            ("task_id", json!(pending_task.task_id)),
                             ("status", json!("failed")),
                             ("error_kind", json!("pipeline_task_failed")),
                             ("detail", json!(err_msg)),

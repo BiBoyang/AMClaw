@@ -757,7 +757,7 @@ fn build_report(
         );
         lines.push("| --- | ---: | ---: | ---: | ---: |".to_string());
         let mut pairs = retriever_counter.into_iter().collect::<Vec<_>>();
-        pairs.sort_by(|left, right| right.1 .0.cmp(&left.1 .0));
+        pairs.sort_by_key(|right| std::cmp::Reverse(right.1 .0));
         for (name, (count, candidates, hits, latency)) in pairs {
             let avg_candidates = if count > 0 {
                 candidates as f64 / count as f64
@@ -789,7 +789,7 @@ fn build_report(
         lines.push("| mode | traces | avg_candidates | avg_hits | avg_latency_ms |".to_string());
         lines.push("| --- | ---: | ---: | ---: | ---: |".to_string());
         let mut pairs = mode_counter.into_iter().collect::<Vec<_>>();
-        pairs.sort_by(|left, right| right.1 .0.cmp(&left.1 .0));
+        pairs.sort_by_key(|right| std::cmp::Reverse(right.1 .0));
         for (mode, (count, candidates, hits, latency)) in pairs {
             let avg_candidates = if count > 0 {
                 candidates as f64 / count as f64
@@ -907,7 +907,7 @@ fn build_report(
     lines.push("| tool_calls | trace_count |".to_string());
     lines.push("| --- | ---: |".to_string());
     let mut dist_pairs = tool_count_dist.into_iter().collect::<Vec<_>>();
-    dist_pairs.sort_by(|left, right| left.0.cmp(&right.0));
+    dist_pairs.sort_by_key(|left| left.0);
     for (call_count, trace_count) in dist_pairs {
         lines.push(format!("| {} | {} |", call_count, trace_count));
     }

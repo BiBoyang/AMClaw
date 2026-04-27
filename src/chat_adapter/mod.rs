@@ -2006,7 +2006,10 @@ fn build_user_memories_reply(memories: &[crate::task_store::UserMemoryRecord]) -
 
 fn build_manual_archive_rejected_reply(task_store: &TaskStore, task_id: &str) -> String {
     match task_store.get_task_status(task_id) {
-        Ok(Some(status)) => format!("任务当前状态为 {}，不允许人工归档: {task_id}", status.status),
+        Ok(Some(status)) => format!(
+            "任务当前状态为 {}，不允许人工归档: {task_id}",
+            status.status
+        ),
         Ok(None) => format!("未找到对应任务: {task_id}"),
         Err(err) => format!("查询任务状态失败: {err}"),
     }

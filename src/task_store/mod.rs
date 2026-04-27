@@ -3275,11 +3275,9 @@ mod tests {
             .expect("写入链接失败");
 
         // 首次领取成功，第二次应失败（lease 尚未过期）
-        assert!(
-            store
-                .claim_task(&created.task_id, "worker-a", 300)
-                .expect("首次 claim 失败")
-        );
+        assert!(store
+            .claim_task(&created.task_id, "worker-a", 300)
+            .expect("首次 claim 失败"));
         assert!(
             !store
                 .claim_task(&created.task_id, "worker-b", 300)

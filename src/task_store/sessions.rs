@@ -157,7 +157,10 @@ impl super::TaskStore {
     // ---- UserSessionState API ----
 
     /// 加载用户会话结构化状态（v2，含 7-slot 完整字段）
-    pub fn load_user_session_state(&self, user_id: &str) -> Result<Option<super::UserSessionStateRecord>> {
+    pub fn load_user_session_state(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<super::UserSessionStateRecord>> {
         self.conn
             .query_row(
                 r#"
@@ -199,7 +202,10 @@ impl super::TaskStore {
     }
 
     /// 覆盖写入用户会话结构化状态（v2，含 7-slot 完整字段）
-    pub fn upsert_user_session_state(&mut self, record: &super::UserSessionStateRecord) -> Result<()> {
+    pub fn upsert_user_session_state(
+        &mut self,
+        record: &super::UserSessionStateRecord,
+    ) -> Result<()> {
         let user_id = record.user_id.trim();
         if user_id.is_empty() {
             bail!("user_id 不能为空");

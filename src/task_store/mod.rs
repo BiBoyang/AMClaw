@@ -8,25 +8,22 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::Path;
 
-
-mod types;
+mod chunk_queue;
+mod embedding_cache;
+mod logging;
+mod memory;
 mod schema;
 mod sessions;
-mod memory;
-mod embedding_cache;
 mod tasks;
-mod chunk_queue;
+mod types;
 mod url_guard;
-mod logging;
 
 pub use self::types::{
-    ArchivedTaskRecord, ClaimableTaskRecord, FeedbackKind, LinkTaskRecord,
-    MarkTaskArchivedInput, MemoryFeedbackState, MemoryType, MemoryWriteState,
-    PendingChunkRecord, PendingTaskRecord, PromoteReason, RecentTaskRecord,
-    SkipReason, StoredSessionRecord, TaskContentRecord, TaskStatusRecord,
-    TaskStoreError, UserMemoryRecord, UserSessionStateRecord, WriteDecision,
+    ArchivedTaskRecord, ClaimableTaskRecord, FeedbackKind, LinkTaskRecord, MarkTaskArchivedInput,
+    MemoryFeedbackState, MemoryType, MemoryWriteState, PendingChunkRecord, PendingTaskRecord,
+    PromoteReason, RecentTaskRecord, SkipReason, StoredSessionRecord, TaskContentRecord,
+    TaskStatusRecord, TaskStoreError, UserMemoryRecord, UserSessionStateRecord, WriteDecision,
 };
-
 
 /// 最大单条内容长度（写入时校验）
 
@@ -71,11 +68,8 @@ impl TaskStore {
         Ok(store)
     }
 
-
     /// 统一 feedback 写回入口
     ///
-
-
 
     // ---- Outbound Pending Chunks API ----
 
@@ -159,7 +153,6 @@ impl TaskStore {
             .context("删除 pending chunk 失败")?;
         Ok(deleted > 0)
     }
-
 }
 
 pub(super) fn log_task_store_info(event: &str, fields: Vec<(&str, Value)>) {

@@ -1,9 +1,9 @@
+use super::{log_chat_info, log_chat_warn};
 use crate::session_router::SessionEvent;
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::json;
 use std::time::Instant;
-use super::{log_chat_info, log_chat_warn};
 
 impl super::WeChatBot {
     pub(super) fn persist_session_snapshot(&mut self, user_id: &str) {

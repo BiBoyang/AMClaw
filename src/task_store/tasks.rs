@@ -657,7 +657,10 @@ impl super::TaskStore {
                     ("content_source", json!(content_source)),
                     ("snapshot_path", json!(snapshot_path)),
                     ("error_kind", json!("awaiting_manual_input")),
-                    ("detail", json!(super::summarize_text_for_log(last_error, 160))),
+                    (
+                        "detail",
+                        json!(super::summarize_text_for_log(last_error, 160)),
+                    ),
                 ],
             );
         } else {
@@ -689,7 +692,10 @@ impl super::TaskStore {
                     ("task_id", json!(task_id)),
                     ("status", json!("failed")),
                     ("error_kind", json!("task_failed")),
-                    ("detail", json!(super::summarize_text_for_log(last_error, 160))),
+                    (
+                        "detail",
+                        json!(super::summarize_text_for_log(last_error, 160)),
+                    ),
                 ],
             );
         } else {

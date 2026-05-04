@@ -1,3 +1,7 @@
+use super::{
+    is_agent_command, is_llm_auth_error, log_chat_error, log_chat_info, log_chat_warn,
+    sanitize_report_markdown_for_wechat, summarize_text_for_log,
+};
 use crate::agent_core::AgentRunContext;
 use crate::command_router;
 use crate::session_router::FlushReason;
@@ -5,7 +9,6 @@ use crate::task_store::{MarkTaskArchivedInput, TaskStore};
 use chrono::Utc;
 use chrono_tz::Asia::Shanghai;
 use serde_json::json;
-use super::{is_agent_command, is_llm_auth_error, log_chat_error, log_chat_info, log_chat_warn, sanitize_report_markdown_for_wechat, summarize_text_for_log};
 
 pub(super) fn build_link_submission_reply(
     records: &[crate::task_store::LinkTaskRecord],
@@ -132,7 +135,9 @@ pub(super) fn build_manual_tasks_reply(tasks: &[crate::task_store::RecentTaskRec
     lines.join("\n")
 }
 
-pub(super) fn build_user_memories_reply(memories: &[crate::task_store::UserMemoryRecord]) -> String {
+pub(super) fn build_user_memories_reply(
+    memories: &[crate::task_store::UserMemoryRecord],
+) -> String {
     if memories.is_empty() {
         return "当前还没有保存的记忆".to_string();
     }

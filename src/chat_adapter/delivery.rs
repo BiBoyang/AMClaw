@@ -1,8 +1,8 @@
-use chrono::Utc;
-use serde_json::json;
 use super::{log_chat_error, log_chat_info, log_chat_warn, summarize_text_for_log};
 use crate::agent_core::AgentRunContext;
 use crate::session_router::FlushReason;
+use chrono::Utc;
+use serde_json::json;
 
 pub(super) fn split_reply_into_chunks(reply: &str, max_chars: usize) -> Vec<String> {
     let total_chars = reply.chars().count();

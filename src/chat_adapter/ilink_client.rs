@@ -13,8 +13,8 @@ use uuid::Uuid;
 use super::ingest::extract_messages;
 use super::types::GetUpdatesResult;
 use super::{
-    assert_ok, compact_json, first_non_empty, get_i64, get_str,
-    log_chat_info, log_chat_warn, truncate_for_log, BASE_URL,
+    assert_ok, compact_json, first_non_empty, get_i64, get_str, log_chat_info, log_chat_warn,
+    truncate_for_log, BASE_URL,
 };
 
 pub(super) struct ILinkClient {

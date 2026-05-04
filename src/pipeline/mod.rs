@@ -9,6 +9,8 @@ use reqwest::redirect::Policy;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+#[cfg(test)]
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -25,6 +27,8 @@ pub struct Pipeline {
     mode: AgentMode,
     http_client_with_redirect: Client,
     http_client_no_redirect: Client,
+    #[cfg(test)]
+    http_test_fixtures: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,7 +177,19 @@ impl Pipeline {
             mode,
             http_client_with_redirect,
             http_client_no_redirect,
+            #[cfg(test)]
+            http_test_fixtures: HashMap::new(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_http_fixture(
+        mut self,
+        url: impl Into<String>,
+        html: impl Into<String>,
+    ) -> Self {
+        self.http_test_fixtures.insert(url.into(), html.into());
+        self
     }
 
     pub fn process_pending_task(
@@ -314,6 +330,14 @@ impl Pipeline {
     }
 
     fn fetch_html(&self, url: &str) -> std::result::Result<HttpFetchResult, PipelineTaskError> {
+        #[cfg(test)]
+        if let Some(html) = self.http_test_fixtures.get(url) {
+            return Ok(HttpFetchResult {
+                html: html.clone(),
+                final_url: url.to_string(),
+            });
+        }
+
         log_pipeline_info(
             "http_fetch_started",
             vec![("source", json!("http")), ("url", json!(url))],

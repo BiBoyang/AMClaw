@@ -1,15 +1,14 @@
-mod types;
-mod ilink_client;
-mod ingest;
 mod command_handlers;
-mod session_flow;
 mod delivery;
 mod helpers;
+mod ilink_client;
+mod ingest;
+mod session_flow;
+mod types;
 use self::helpers::{
     assert_ok, compact_json, first_non_empty, get_i64, get_str, is_agent_command,
-    is_llm_auth_error, is_poll_timeout_error, log_chat_error, log_chat_info,
-    log_chat_warn, sanitize_report_markdown_for_wechat, summarize_text_for_log,
-    truncate_for_log, value_to_string,
+    is_llm_auth_error, is_poll_timeout_error, log_chat_error, log_chat_info, log_chat_warn,
+    sanitize_report_markdown_for_wechat, summarize_text_for_log, truncate_for_log, value_to_string,
 };
 
 use self::ilink_client::ILinkClient;
@@ -188,7 +187,6 @@ impl WeChatBot {
             }
         }
     }
-
 }
 
 #[cfg(test)]
@@ -228,28 +226,22 @@ mod tests {
         temp_dir().join("amclaw.db")
     }
 
-    fn build_test_bot(db_path: &Path, workspace_root: PathBuf) -> WeChatBot {
+    fn build_test_bot_with_pipeline(
+        db_path: &Path,
+        workspace_root: PathBuf,
+        pipeline: Pipeline,
+    ) -> WeChatBot {
         let reporter_root = temp_dir();
         let timezone = "Asia/Shanghai".parse().expect("解析测试 timezone 失败");
         let mut bot = WeChatBot {
             agent_core: AgentCore::with_task_store_db_path(workspace_root, db_path.to_path_buf())
                 .expect("初始化 agent 失败"),
             client: ILinkClient::new("1.0.0").expect("初始化 iLink 客户端失败"),
-            pipeline: Pipeline::new(
-                temp_dir(),
-                None::<ResolvedBrowserConfig>,
-                crate::mode_policy::AgentMode::Restricted,
-            )
-            .expect("初始化 pipeline 失败"),
+            pipeline: pipeline.clone(),
             reporter: DailyReporter::new(reporter_root, db_path.to_path_buf(), timezone),
             task_store: TaskStore::open(db_path).expect("初始化 task store 失败"),
             task_executor: crate::task_executor::TaskExecutor::start(
-                Pipeline::new(
-                    temp_dir(),
-                    None::<ResolvedBrowserConfig>,
-                    crate::mode_policy::AgentMode::Restricted,
-                )
-                .expect("初始化 pipeline 失败"),
+                pipeline,
                 db_path.to_path_buf(),
             ),
             context_token_map: HashMap::new(),
@@ -268,6 +260,16 @@ mod tests {
         bot.restore_persisted_sessions()
             .expect("恢复测试 session 失败");
         bot
+    }
+
+    fn build_test_bot(db_path: &Path, workspace_root: PathBuf) -> WeChatBot {
+        let pipeline = Pipeline::new(
+            temp_dir(),
+            None::<ResolvedBrowserConfig>,
+            crate::mode_policy::AgentMode::Restricted,
+        )
+        .expect("初始化 pipeline 失败");
+        build_test_bot_with_pipeline(db_path, workspace_root, pipeline)
     }
 
     fn test_bot(db_path: &Path) -> WeChatBot {
@@ -579,11 +581,21 @@ mod tests {
     #[test]
     fn pending_link_task_is_consumed() {
         let db_path = temp_db_path();
-        let mut bot = test_bot(&db_path);
+        let fixture_url = "https://example.com/archive-me";
+        let fixture_html =
+            "<html><head><title>Fixture Page</title></head><body>fixture content</body></html>";
+        let pipeline = Pipeline::new(
+            temp_dir(),
+            None::<ResolvedBrowserConfig>,
+            crate::mode_policy::AgentMode::Restricted,
+        )
+        .expect("初始化 fixture pipeline 失败")
+        .with_http_fixture(fixture_url, fixture_html);
+        let mut bot = build_test_bot_with_pipeline(&db_path, temp_dir(), pipeline);
 
         bot.handle_message(WireMessage {
             from_user_id: "user-a".to_string(),
-            text: "https://example.com/archive-me".to_string(),
+            text: fixture_url.to_string(),
             message_id: Some(super::types::FlexibleId::Str("msg-14".to_string())),
             message_type: Some(1),
             ..WireMessage::default()
@@ -682,13 +694,16 @@ mod tests {
         bot.handle_message(WireMessage {
             from_user_id: "user-a".to_string(),
             text: "https://example.com/not-manual".to_string(),
-            message_id: Some(super::types::FlexibleId::Str("msg-manual-reject".to_string())),
+            message_id: Some(super::types::FlexibleId::Str(
+                "msg-manual-reject".to_string(),
+            )),
             message_type: Some(1),
             ..WireMessage::default()
         });
 
         let task_id = first_task_id(&db_path);
-        let reply = super::command_handlers::build_manual_archive_rejected_reply(&bot.task_store, &task_id);
+        let reply =
+            super::command_handlers::build_manual_archive_rejected_reply(&bot.task_store, &task_id);
         assert!(
             reply.contains("任务当前状态为 pending"),
             "应包含当前状态提示，实际: {reply}"
@@ -1000,7 +1015,9 @@ mod tests {
         bot.handle_message(WireMessage {
             from_user_id: "user-a".to_string(),
             text: "记住 仅 user-a 可屏蔽".to_string(),
-            message_id: Some(super::types::FlexibleId::Str("msg-suppress-cross-1".to_string())),
+            message_id: Some(super::types::FlexibleId::Str(
+                "msg-suppress-cross-1".to_string(),
+            )),
             message_type: Some(1),
             ..WireMessage::default()
         });
@@ -1015,7 +1032,9 @@ mod tests {
         bot.handle_message(WireMessage {
             from_user_id: "user-b".to_string(),
             text: format!("忘记 {memory_id}"),
-            message_id: Some(super::types::FlexibleId::Str("msg-suppress-cross-2".to_string())),
+            message_id: Some(super::types::FlexibleId::Str(
+                "msg-suppress-cross-2".to_string(),
+            )),
             message_type: Some(1),
             ..WireMessage::default()
         });
@@ -1038,7 +1057,9 @@ mod tests {
         bot.handle_message(WireMessage {
             from_user_id: "user-a".to_string(),
             text: "记住 我喜欢短摘要".to_string(),
-            message_id: Some(super::types::FlexibleId::Str("msg-memory-useful-1".to_string())),
+            message_id: Some(super::types::FlexibleId::Str(
+                "msg-memory-useful-1".to_string(),
+            )),
             message_type: Some(1),
             ..WireMessage::default()
         });
@@ -1052,7 +1073,9 @@ mod tests {
         bot.handle_message(WireMessage {
             from_user_id: "user-a".to_string(),
             text: format!("有用 {memory_id}"),
-            message_id: Some(super::types::FlexibleId::Str("msg-memory-useful-2".to_string())),
+            message_id: Some(super::types::FlexibleId::Str(
+                "msg-memory-useful-2".to_string(),
+            )),
             message_type: Some(1),
             ..WireMessage::default()
         });
@@ -1116,7 +1139,9 @@ mod tests {
         bot.handle_message(WireMessage {
             from_user_id: "user-a".to_string(),
             text: "我在研究 Rust Agent".to_string(),
-            message_id: Some(super::types::FlexibleId::Str("msg-auto-memory-1".to_string())),
+            message_id: Some(super::types::FlexibleId::Str(
+                "msg-auto-memory-1".to_string(),
+            )),
             message_type: Some(1),
             ..WireMessage::default()
         });
@@ -1131,7 +1156,9 @@ mod tests {
         bot.handle_message(WireMessage {
             from_user_id: "user-a".to_string(),
             text: "我在研究 Rust Agent".to_string(),
-            message_id: Some(super::types::FlexibleId::Str("msg-auto-memory-2".to_string())),
+            message_id: Some(super::types::FlexibleId::Str(
+                "msg-auto-memory-2".to_string(),
+            )),
             message_type: Some(1),
             ..WireMessage::default()
         });
@@ -1436,10 +1463,14 @@ mod tests {
         assert!(super::delivery::should_send_processing_ack(&at_threshold));
         // 超过阈值：应触发
         let above_threshold = "b".repeat(super::PROCESSING_ACK_MIN_INPUT_CHARS + 1);
-        assert!(super::delivery::should_send_processing_ack(&above_threshold));
+        assert!(super::delivery::should_send_processing_ack(
+            &above_threshold
+        ));
         // 刚好低于阈值：不应触发
         let below_threshold = "c".repeat(super::PROCESSING_ACK_MIN_INPUT_CHARS - 1);
-        assert!(!super::delivery::should_send_processing_ack(&below_threshold));
+        assert!(!super::delivery::should_send_processing_ack(
+            &below_threshold
+        ));
     }
 
     /// 行为刻画测试：当前 `handle_user_memory_write` 在 Promoted 分支使用 `&id[..8]`，

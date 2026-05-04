@@ -1490,7 +1490,7 @@ mod tests {
     }
 
     /// 回归测试：Promoted 分支对短/非 ASCII memory_id 不再 panic，
-    /// 且回复中 id 预览字符安全、可读。
+    /// 且记忆类型可正确被提升为 explicit。
     #[test]
     fn user_memory_promoted_short_non_ascii_id_safe_preview() {
         let db_path = temp_db_path();
@@ -1523,8 +1523,7 @@ mod tests {
         assert_eq!(affected, 1, "应更新 1 行");
         drop(conn);
 
-        // 3. 发送 "记住 <同内容>" 触发 WriteDecision::Promoted 分支，
-        //    应不 panic 且回复可读。
+        // 3. 发送 "记住 <同内容>" 触发 WriteDecision::Promoted 分支，应不 panic。
         bot.handle_message(WireMessage {
             from_user_id: "user-a".to_string(),
             text: "记住 我喜欢短摘要".to_string(),
@@ -1535,7 +1534,7 @@ mod tests {
             ..WireMessage::default()
         });
 
-        // 验证回复包含预期文案且 id 预览字符安全
+        // 验证记忆已被提升为 explicit
         let memories = bot
             .task_store
             .list_user_memories("user-a", 10)

@@ -2780,8 +2780,10 @@ struct AgentRunTrace {
     tool_calls: Vec<ToolCallTrace>,
     session_state_snapshot: Option<RuntimeSessionStateSnapshot>,
     memory_hit_count: usize,       // 实际注入 prompt 的记忆条数（= injected）
+    memory_injected_count: usize,  // 兼容字段：与 memory_hit_count 同值
     memory_retrieved_count: usize, // 从 DB 取出的候选记忆条数
     memory_total_chars: usize,     // 注入记忆的总字符数（= injected_total_chars）
+    memory_injected_total_chars: usize, // 兼容字段：与 memory_total_chars 同值
     memory_dropped_count: usize,   // 被裁剪掉的记忆条数
     memory_ids: Vec<String>,       // 注入记忆的 ID 列表
     // --- Retriever-level observability ---
@@ -2798,8 +2800,11 @@ struct AgentRunTrace {
     persistent_state_slot_count: usize,
     persistent_state_preview: Option<String>,
     // --- ContextPack-level observability (C3/C4) ---
+    #[serde(default)]
     context_pack_present: bool,
+    #[serde(default)]
     context_pack_section_count: usize,
+    #[serde(default)]
     context_pack_total_chars: usize,
     context_pack_drop_reasons: Vec<String>,
     #[serde(skip_serializing)]
@@ -2934,11 +2939,17 @@ pub(crate) struct AgentTraceIndexEntry {
     final_output_chars: Option<usize>,
     error: Option<String>,
     llm_fallback_reason: Option<String>,
+    #[serde(default)]
     memory_hit_count: usize,
+    #[serde(default)]
     memory_injected_count: usize,
+    #[serde(default)]
     memory_retrieved_count: usize,
+    #[serde(default)]
     memory_total_chars: usize,
+    #[serde(default)]
     memory_injected_total_chars: usize,
+    #[serde(default)]
     memory_dropped_count: usize,
     #[serde(default)]
     recovery_attempt_count: usize,
@@ -2962,8 +2973,11 @@ pub(crate) struct AgentTraceIndexEntry {
     retrieval_fallback_reason: Option<String>,
     #[serde(default)]
     retrieval_scores_present: bool,
+    #[serde(default)]
     context_pack_present: bool,
+    #[serde(default)]
     context_pack_section_count: usize,
+    #[serde(default)]
     context_pack_total_chars: usize,
     json_file: String,
     markdown_file: String,
@@ -3018,8 +3032,10 @@ impl AgentRunTrace {
             session_state_snapshot: None,
             trace_dir_root: workspace_root.join("data").join("agent_traces"),
             memory_hit_count: 0,
+            memory_injected_count: 0,
             memory_retrieved_count: 0,
             memory_total_chars: 0,
+            memory_injected_total_chars: 0,
             memory_dropped_count: 0,
             memory_ids: Vec::new(),
             retriever_name: String::new(),
@@ -4231,8 +4247,10 @@ fn normalize_optional_text(input: String) -> Option<String> {
 fn project_session_state_to_trace(trace: &mut AgentRunTrace, session_state: &SessionState) {
     if session_state.has_memory_activity() {
         trace.memory_hit_count = session_state.injected_count();
+        trace.memory_injected_count = session_state.injected_count();
         trace.memory_retrieved_count = session_state.retrieved_count();
         trace.memory_total_chars = session_state.injected_total_chars();
+        trace.memory_injected_total_chars = session_state.injected_total_chars();
         trace.memory_dropped_count = session_state.dropped.len();
         trace.memory_ids = session_state.injected_ids();
     }
@@ -5580,11 +5598,11 @@ mod tests {
         detect_stalled_trajectory_failure, load_business_context_snapshot, map_llm_plan,
         parse_llm_plan, project_session_state_to_trace, select_previous_observations,
         select_retriever, validate_expected_observation, AgentCore, AgentObservation,
-        AgentRunContext, AgentRunTrace, BusinessContextSnapshot, ContextAssembler,
-        ContextPreviewMode, DoneRule, DropReason, ExecutionPlan, ExpectedObservation,
-        FailureAction, FailureDecision, GoalSignal, LlmPlan, MemoryBudget, MinimumNovelty,
-        ObservationKind, PlannedDecision, RecoveryOutcome, ReplanScope, RetrieverMode,
-        RuntimeSessionStateSnapshot, StepFailureKind,
+        AgentRunContext, AgentRunTrace, AgentTraceIndexEntry, BusinessContextSnapshot,
+        ContextAssembler, ContextPreviewMode, DoneRule, DropReason, ExecutionPlan,
+        ExpectedObservation, FailureAction, FailureDecision, GoalSignal, LlmPlan, MemoryBudget,
+        MinimumNovelty, ObservationKind, PlannedDecision, RecoveryOutcome, ReplanScope,
+        RetrieverMode, RuntimeSessionStateSnapshot, StepFailureKind,
     };
     use crate::context_pack::{ContextSectionChangeReason, ContextSectionKind};
     use crate::retriever::rule::RuleRetriever;
@@ -7495,8 +7513,10 @@ mod tests {
         // 模拟 agent_core 中对 trace 的赋值
         if session_state.has_memory_activity() {
             trace.memory_hit_count = session_state.injected_count();
+            trace.memory_injected_count = session_state.injected_count();
             trace.memory_retrieved_count = session_state.retrieved_count();
             trace.memory_total_chars = session_state.injected_total_chars();
+            trace.memory_injected_total_chars = session_state.injected_total_chars();
             trace.memory_dropped_count = session_state.dropped.len();
             trace.memory_ids = session_state.injected_ids();
         }
@@ -7512,6 +7532,47 @@ mod tests {
         assert!(rendered.contains("memory_hit_count"));
         assert!(rendered.contains("memory_retrieved_count"));
         assert!(rendered.contains("memory_dropped_count"));
+    }
+
+    #[test]
+    fn trace_index_backcompat_missing_injected_alias_fields_defaults_to_zero() {
+        let legacy_line = r#"{
+            "trace_version":"agent_trace_v1",
+            "run_id":"run-legacy",
+            "started_at":"2026-04-01T00:00:00Z",
+            "finished_at":"2026-04-01T00:00:01Z",
+            "duration_ms":1,
+            "success":true,
+            "user_input":"legacy",
+            "user_input_chars":6,
+            "source_type":"agent_demo",
+            "trigger_type":null,
+            "user_id":null,
+            "message_ids":[],
+            "message_count":0,
+            "task_id":null,
+            "article_id":null,
+            "session_text_chars":0,
+            "context_token_present":false,
+            "step_count":1,
+            "llm_call_count":0,
+            "tool_call_count":0,
+            "observation_count":0,
+            "final_output_chars":null,
+            "error":null,
+            "llm_fallback_reason":null,
+            "memory_hit_count":0,
+            "memory_retrieved_count":0,
+            "memory_total_chars":0,
+            "memory_dropped_count":0,
+            "json_file":"legacy.json",
+            "markdown_file":"legacy.md"
+        }"#;
+
+        let entry: AgentTraceIndexEntry =
+            serde_json::from_str(legacy_line).expect("旧版 index 行应可反序列化");
+        assert_eq!(entry.memory_injected_count, 0);
+        assert_eq!(entry.memory_injected_total_chars, 0);
     }
 
     #[test]

@@ -96,7 +96,7 @@ impl WeChatBot {
                         ("detail", json!(err.to_string())),
                     ],
                 );
-                true
+                false
             }
         };
         if !is_new {

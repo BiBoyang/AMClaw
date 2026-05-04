@@ -643,7 +643,7 @@ impl super::TaskStore {
         let updated = self
             .conn
             .execute(
-                "UPDATE tasks SET status = 'awaiting_manual_input', last_error = ?2, page_kind = ?3, snapshot_path = ?4, content_source = COALESCE(?5, content_source), output_path = NULL, worker_id = NULL, processing_started_at = NULL, lease_until = NULL, updated_at = ?6 WHERE id = ?1 AND status = 'processing'",
+                "UPDATE tasks SET status = 'awaiting_manual_input', last_error = ?2, page_kind = ?3, snapshot_path = COALESCE(?4, snapshot_path), content_source = COALESCE(?5, content_source), output_path = NULL, worker_id = NULL, processing_started_at = NULL, lease_until = NULL, updated_at = ?6 WHERE id = ?1 AND status = 'processing'",
                 params![task_id, last_error, page_kind, snapshot_path, content_source, now],
             )
             .context("更新 awaiting_manual_input 状态失败")?;
@@ -681,7 +681,7 @@ impl super::TaskStore {
         let updated = self
             .conn
             .execute(
-                "UPDATE tasks SET status = 'failed', last_error = ?2, page_kind = NULL, output_path = NULL, snapshot_path = NULL, content_source = NULL, worker_id = NULL, processing_started_at = NULL, lease_until = NULL, updated_at = ?3 WHERE id = ?1 AND status = 'processing'",
+                "UPDATE tasks SET status = 'failed', last_error = ?2, output_path = NULL, worker_id = NULL, processing_started_at = NULL, lease_until = NULL, updated_at = ?3 WHERE id = ?1 AND status = 'processing'",
                 params![task_id, last_error, now],
             )
             .context("更新 failed 状态失败")?;

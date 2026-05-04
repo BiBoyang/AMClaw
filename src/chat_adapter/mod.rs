@@ -1607,4 +1607,24 @@ mod tests {
             "flush_expired_sessions 应删除持久化 session_state"
         );
     }
+
+    #[test]
+    fn mark_seen_store_error_is_fail_closed() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        // 破坏数据库：删除 message_dedup 表，使 record_inbound_message 失败
+        let raw_conn = Connection::open(&db_path).expect("打开 raw 连接失败");
+        raw_conn
+            .execute("DROP TABLE message_dedup", [])
+            .expect("删除表失败");
+        drop(raw_conn);
+
+        // mark_seen 在 DB 失败时应返回 false（fail-closed）
+        let result = bot.mark_seen("msg-1", "user-a", "hello");
+        assert!(
+            !result,
+            "mark_seen 在 store 失败时应返回 false，避免重复处理"
+        );
+    }
 }

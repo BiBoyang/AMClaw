@@ -2702,4 +2702,81 @@ mod tests {
         assert_eq!(loaded2.goal, Some("新目标".to_string()));
         assert_eq!(loaded2.constraints(), vec!["约束"]);
     }
+
+    #[test]
+    fn mark_task_awaiting_manual_input_preserves_snapshot_when_none() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        let created = store
+            .record_link_submission("https://example.com/snapshot-test")
+            .expect("写入链接失败");
+        store
+            .claim_task(&created.task_id, "test-worker", 300)
+            .expect("claim 失败");
+
+        // 先手动设置 snapshot_path
+        let raw_conn = Connection::open(&db_path).expect("打开 raw 连接失败");
+        raw_conn
+            .execute(
+                "UPDATE tasks SET snapshot_path = 'original_snapshot' WHERE id = ?1",
+                [&created.task_id],
+            )
+            .expect("设置 snapshot_path 失败");
+        drop(raw_conn);
+
+        // 传入 None，应保留原有 snapshot_path
+        assert!(store
+            .mark_task_awaiting_manual_input(
+                &created.task_id,
+                "需要人工确认",
+                "article",
+                None,
+                Some("browser_capture"),
+            )
+            .expect("更新 awaiting_manual_input 状态失败"));
+
+        let status = store
+            .get_task_status(&created.task_id)
+            .expect("查询状态失败")
+            .expect("应存在任务");
+        assert_eq!(status.snapshot_path, Some("original_snapshot".to_string()));
+        assert_eq!(status.content_source, Some("browser_capture".to_string()));
+    }
+
+    #[test]
+    fn mark_task_failed_preserves_diagnostic_fields() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+        let created = store
+            .record_link_submission("https://example.com/fail-diag")
+            .expect("写入链接失败");
+        store
+            .claim_task(&created.task_id, "test-worker", 300)
+            .expect("claim 失败");
+
+        // 先设置诊断字段
+        let raw_conn = Connection::open(&db_path).expect("打开 raw 连接失败");
+        raw_conn
+            .execute(
+                "UPDATE tasks SET page_kind = 'wechat_article', snapshot_path = 'snap.html', content_source = 'browser_capture' WHERE id = ?1",
+                [&created.task_id],
+            )
+            .expect("设置诊断字段失败");
+        drop(raw_conn);
+
+        assert!(store
+            .mark_task_failed(&created.task_id, "network timeout")
+            .expect("更新 failed 状态失败"));
+
+        let status = store
+            .get_task_status(&created.task_id)
+            .expect("查询状态失败")
+            .expect("应存在任务");
+        assert_eq!(status.status, "failed");
+        assert_eq!(status.last_error, Some("network timeout".to_string()));
+        assert_eq!(status.page_kind, Some("wechat_article".to_string()));
+        assert_eq!(status.snapshot_path, Some("snap.html".to_string()));
+        assert_eq!(status.content_source, Some("browser_capture".to_string()));
+        assert_eq!(status.output_path, None);
+    }
 }

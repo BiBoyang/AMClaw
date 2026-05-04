@@ -100,11 +100,26 @@ impl TaskExecutor {
     }
 
     /// 等待所有已投递的任务执行完毕（主要用于测试同步断言）。
-    pub fn flush(&self) {
+    /// 返回 `true` 表示在超时前全部 drain；`false` 表示超时。
+    pub fn flush(&self) -> bool {
         let mut spins = 0;
         while self.pending_count.load(Ordering::SeqCst) > 0 && spins < 3000 {
             thread::sleep(Duration::from_millis(10));
             spins += 1;
+        }
+        let pending = self.pending_count.load(Ordering::SeqCst);
+        if pending > 0 {
+            log_task_executor_warn(
+                "flush_timeout",
+                vec![
+                    ("pending_count", json!(pending)),
+                    ("spins", json!(spins)),
+                    ("wait_ms", json!(spins * 10)),
+                ],
+            );
+            false
+        } else {
+            true
         }
     }
 }

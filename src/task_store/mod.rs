@@ -1202,6 +1202,47 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_expired_user_session_states_cleans_both_tables() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        // 插入一条正常 session_state
+        store
+            .upsert_session_state("user-old", "旧会话", &["msg-old-1".to_string()])
+            .expect("写入失败");
+        // 插入一条旧 user_session_state（直接写旧 updated_at）
+        store
+            .upsert_user_session_state(&crate::task_store::UserSessionStateRecord {
+                user_id: "user-old".to_string(),
+                last_user_intent: Some("旧意图".to_string()),
+                current_task: None,
+                next_step: None,
+                blocked_reason: None,
+                goal: None,
+                current_subtask: None,
+                constraints_json: None,
+                confirmed_facts_json: None,
+                done_items_json: None,
+                open_questions_json: None,
+                updated_at: "2000-01-01T00:00:00Z".to_string(),
+            })
+            .expect("写入 v2 state 失败");
+
+        // ttl=0 时， cutoff = now，旧记录应被清理
+        let cleaned = store
+            .cleanup_expired_user_session_states(0)
+            .expect("清理失败");
+        assert!(cleaned > 0, "应清理至少一条过期记录");
+
+        // 两条表都应为空
+        assert!(store.list_session_states().expect("查询失败").is_empty());
+        assert!(store
+            .load_user_session_state("user-old")
+            .expect("加载失败")
+            .is_none());
+    }
+
+    #[test]
     fn user_memory_can_be_added_and_listed() {
         let db_path = temp_db_path();
         let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");

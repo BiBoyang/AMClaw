@@ -36,6 +36,11 @@ pub(super) fn split_reply_into_chunks(reply: &str, max_chars: usize) -> Vec<Stri
         prev_count = segments.len();
     }
 
+    // 安全兜底：若预算不足以分片，直接返回原文（避免空返回导致消息丢失）
+    if segments.is_empty() {
+        return vec![reply.to_string()];
+    }
+
     let total = segments.len();
     segments
         .into_iter()
@@ -48,6 +53,10 @@ pub(super) fn split_reply_into_chunks(reply: &str, max_chars: usize) -> Vec<Stri
 fn split_content_only(reply: &str, content_budget: usize) -> Vec<String> {
     if reply.is_empty() {
         return Vec::new();
+    }
+    // 0-budget 防御：无法分片时直接返回全文，避免进入死循环
+    if content_budget == 0 {
+        return vec![reply.to_string()];
     }
     let mut result = Vec::new();
     let mut char_indices = reply.char_indices().peekable();

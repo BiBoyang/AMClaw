@@ -286,23 +286,28 @@ impl super::TaskStore {
     }
 
     /// 清理过期的 session_state（超过 ttl_days 天未更新）。
+    ///
+    /// 原子性：两条 DELETE 在同一个事务内执行，避免半清理。
     pub fn cleanup_expired_user_session_states(&mut self, ttl_days: u64) -> Result<usize> {
         let cutoff = Utc::now() - chrono::Duration::days(ttl_days as i64);
         let cutoff_str = cutoff.to_rfc3339();
-        let deleted_sessions = self
+        let tx = self
             .conn
+            .transaction()
+            .context("开启 session_state 清理事务失败")?;
+        let deleted_sessions = tx
             .execute(
                 "DELETE FROM user_sessions WHERE updated_at < ?1",
                 [&cutoff_str],
             )
             .context("清理过期 user_sessions 失败")?;
-        let deleted_states = self
-            .conn
+        let deleted_states = tx
             .execute(
                 "DELETE FROM user_session_states WHERE updated_at < ?1",
                 [&cutoff_str],
             )
             .context("清理过期 user_session_states 失败")?;
+        tx.commit().context("提交 session_state 清理事务失败")?;
         let total = deleted_sessions + deleted_states;
         if total > 0 {
             super::log_task_store_info(

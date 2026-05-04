@@ -48,7 +48,16 @@ impl super::WeChatBot {
             reason,
         } = event
         {
-            let _ = self.task_store.delete_session_state(&user_id);
+            if let Err(err) = self.task_store.delete_session_state(&user_id) {
+                log_chat_warn(
+                    "session_state_delete_failed",
+                    vec![
+                        ("user_id", json!(user_id)),
+                        ("error_kind", json!("session_state_delete_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
+            }
             self.update_session_state_intent(&user_id, &merged_text);
             self.send_generated_reply(&user_id, &merged_text, &message_ids, reason);
         }
@@ -56,7 +65,16 @@ impl super::WeChatBot {
 
     pub(super) fn flush_expired_sessions(&mut self) {
         for item in self.session_router.flush_expired(Instant::now()) {
-            let _ = self.task_store.delete_session_state(&item.user_id);
+            if let Err(err) = self.task_store.delete_session_state(&item.user_id) {
+                log_chat_warn(
+                    "session_state_delete_failed",
+                    vec![
+                        ("user_id", json!(&item.user_id)),
+                        ("error_kind", json!("session_state_delete_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
+            }
             self.update_session_state_intent(&item.user_id, &item.merged_text);
             self.send_generated_reply(
                 &item.user_id,

@@ -1545,4 +1545,53 @@ mod tests {
             crate::task_store::MemoryType::Explicit
         );
     }
+
+    // ——— B2 回归测试 ———
+
+    #[test]
+    fn split_reply_into_chunks_zero_budget_does_not_loop() {
+        // max_chars 过小导致 content_budget 为 0 时，不应死循环或 panic
+        let chunks = super::delivery::split_reply_into_chunks("测试内容", 1);
+        // 0-budget 防御下直接返回原文（至少不丢失内容）
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().any(|c| c.contains("测试内容")));
+    }
+
+    #[test]
+    fn flush_expired_sessions_deletes_persisted_state() {
+        let db_path = temp_db_path();
+        let mut bot = test_bot(&db_path);
+
+        // 1. 直接写入一条持久化 session_state
+        bot.task_store
+            .upsert_session_state("user-expired", "过期会话", &["msg-exp-1".to_string()])
+            .expect("写入失败");
+        assert_eq!(
+            bot.task_store
+                .list_session_states()
+                .expect("查询失败")
+                .len(),
+            1
+        );
+
+        // 2. 在 session_router 恢复一条已过期会话（timeout=0 即立即过期）
+        bot.session_router =
+            crate::session_router::SessionRouter::new(std::time::Duration::from_secs(0));
+        bot.session_router.restore_session(
+            "user-expired",
+            "过期会话",
+            vec!["msg-exp-1".to_string()],
+            std::time::Instant::now(),
+        );
+
+        // 3. flush_expired_sessions 应删除持久化 state
+        bot.flush_expired_sessions();
+        assert!(
+            bot.task_store
+                .list_session_states()
+                .expect("查询失败")
+                .is_empty(),
+            "flush_expired_sessions 应删除持久化 session_state"
+        );
+    }
 }

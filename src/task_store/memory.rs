@@ -184,7 +184,7 @@ impl super::TaskStore {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        let existing = self.search_user_memories(user_id, 50);
+        let existing = self.search_all_active_user_memories(user_id);
 
         match existing {
             Ok(memories) => {
@@ -306,31 +306,7 @@ impl super::TaskStore {
             )
             .context("准备 user_memory 查询失败")?;
         let rows = stmt
-            .query_map(params![user_id, limit], |row| {
-                let mt_str: String = row.get(3)?;
-                let memory_type = mt_str.parse().unwrap_or_else(|e| {
-                    super::log_task_store_warn(
-                        "memory_type_unknown_fallback",
-                        vec![("raw_type", json!(mt_str)), ("error", json!(e))],
-                    );
-                    MemoryType::Auto
-                });
-                Ok(UserMemoryRecord {
-                    id: row.get(0)?,
-                    user_id: row.get(1)?,
-                    content: row.get(2)?,
-                    memory_type,
-                    status: row.get(4)?,
-                    priority: row.get(5)?,
-                    last_used_at: row.get(6)?,
-                    use_count: row.get(7)?,
-                    retrieved_count: row.get(8)?,
-                    injected_count: row.get(9)?,
-                    useful: row.get::<_, i64>(10)? != 0,
-                    created_at: row.get(11)?,
-                    updated_at: row.get(12)?,
-                })
-            })
+            .query_map(params![user_id, limit], Self::map_user_memory_row)
             .context("查询 user_memory 失败")?;
         let mut memories = Vec::new();
         for row in rows {
@@ -374,31 +350,7 @@ impl super::TaskStore {
             )
             .context("准备 user_memory 检索失败")?;
         let rows = stmt
-            .query_map(params![user_id, limit], |row| {
-                let mt_str: String = row.get(3)?;
-                let memory_type = mt_str.parse().unwrap_or_else(|e| {
-                    super::log_task_store_warn(
-                        "memory_type_unknown_fallback",
-                        vec![("raw_type", json!(mt_str)), ("error", json!(e))],
-                    );
-                    MemoryType::Auto
-                });
-                Ok(UserMemoryRecord {
-                    id: row.get(0)?,
-                    user_id: row.get(1)?,
-                    content: row.get(2)?,
-                    memory_type,
-                    status: row.get(4)?,
-                    priority: row.get(5)?,
-                    last_used_at: row.get(6)?,
-                    use_count: row.get(7)?,
-                    retrieved_count: row.get(8)?,
-                    injected_count: row.get(9)?,
-                    useful: row.get::<_, i64>(10)? != 0,
-                    created_at: row.get(11)?,
-                    updated_at: row.get(12)?,
-                })
-            })
+            .query_map(params![user_id, limit], Self::map_user_memory_row)
             .context("检索 user_memory 失败")?;
 
         let mut results = Vec::new();
@@ -408,38 +360,95 @@ impl super::TaskStore {
         Ok(results)
     }
 
+    /// 全量检索该用户的 active 记忆（无 LIMIT，用于 dedup 等需要完整语义集的场景）。
+    fn search_all_active_user_memories(&self, user_id: &str) -> Result<Vec<UserMemoryRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+                SELECT id, user_id, content, memory_type, status, priority, last_used_at, use_count, retrieved_count, injected_count, useful, created_at, updated_at
+                FROM user_memories
+                WHERE user_id = ?1 AND status = 'active'
+                ORDER BY priority DESC, useful DESC, use_count DESC, COALESCE(last_used_at, updated_at) DESC, id ASC
+                "#,
+            )
+            .context("准备 user_memory 全量检索失败")?;
+        let rows = stmt
+            .query_map([user_id], Self::map_user_memory_row)
+            .context("全量检索 user_memory 失败")?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.context("读取 user_memory 失败")?);
+        }
+        Ok(results)
+    }
+
+    fn map_user_memory_row(row: &rusqlite::Row) -> rusqlite::Result<UserMemoryRecord> {
+        let mt_str: String = row.get(3)?;
+        let memory_type = mt_str.parse().unwrap_or_else(|e| {
+            super::log_task_store_warn(
+                "memory_type_unknown_fallback",
+                vec![("raw_type", json!(mt_str)), ("error", json!(e))],
+            );
+            MemoryType::Auto
+        });
+        Ok(UserMemoryRecord {
+            id: row.get(0)?,
+            user_id: row.get(1)?,
+            content: row.get(2)?,
+            memory_type,
+            status: row.get(4)?,
+            priority: row.get(5)?,
+            last_used_at: row.get(6)?,
+            use_count: row.get(7)?,
+            retrieved_count: row.get(8)?,
+            injected_count: row.get(9)?,
+            useful: row.get::<_, i64>(10)? != 0,
+            created_at: row.get(11)?,
+            updated_at: row.get(12)?,
+        })
+    }
+
     /// 统一 feedback 写回入口
     ///
     /// 将 MemoryFeedbackState 中记录的 feedback 一次性写回长期字段：
     /// - Retrieved: retrieved_count += N
     /// - Injected: injected_count += N
     /// - Useful: use_count += N, useful = 1, last_used_at = now
-    pub fn apply_memory_feedback(&self, feedback_state: &MemoryFeedbackState) -> Result<()> {
+    ///
+    /// 原子性：所有子更新在同一个事务内提交，任一步失败时整体回滚，
+    /// 避免部分计数落库。
+    pub fn apply_memory_feedback(&mut self, feedback_state: &MemoryFeedbackState) -> Result<()> {
         let now = Utc::now().to_rfc3339();
+        let tx = self.conn.transaction().context("开启 feedback 事务失败")?;
         for memory_id in feedback_state.memory_ids() {
             let retrieved = feedback_state.retrieved_count(&memory_id);
             let injected = feedback_state.injected_count(&memory_id);
             let useful = feedback_state.useful_count(&memory_id);
 
             if retrieved > 0 {
-                self.conn.execute(
+                tx.execute(
                     "UPDATE user_memories SET retrieved_count = retrieved_count + ?1 WHERE id = ?2",
                     params![retrieved as i64, memory_id],
-                ).context("更新 retrieved_count 失败")?;
+                )
+                .context("更新 retrieved_count 失败")?;
             }
             if injected > 0 {
-                self.conn.execute(
+                tx.execute(
                     "UPDATE user_memories SET injected_count = injected_count + ?1 WHERE id = ?2",
                     params![injected as i64, memory_id],
-                ).context("更新 injected_count 失败")?;
+                )
+                .context("更新 injected_count 失败")?;
             }
             if useful > 0 {
-                self.conn.execute(
+                tx.execute(
                     "UPDATE user_memories SET use_count = use_count + ?1, useful = 1, last_used_at = ?2 WHERE id = ?3",
                     params![useful as i64, now.clone(), memory_id],
                 ).context("更新 useful/use_count 失败")?;
             }
         }
+        tx.commit().context("提交 feedback 事务失败")?;
         Ok(())
     }
 
@@ -447,7 +456,7 @@ impl super::TaskStore {
     ///
     /// - 校验该记忆归属于当前用户且仍为 active
     /// - 统一走 apply_memory_feedback 写回 Useful
-    pub fn confirm_memory_useful(&self, user_id: &str, memory_id: &str) -> Result<()> {
+    pub fn confirm_memory_useful(&mut self, user_id: &str, memory_id: &str) -> Result<()> {
         let exists: i64 = self
             .conn
             .query_row(

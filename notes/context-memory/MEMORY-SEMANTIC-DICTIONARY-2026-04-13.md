@@ -22,11 +22,13 @@
 | `injected` | 经去重 + 单条长度 + 总预算裁剪后，实际注入 prompt 的记忆 | 是（= `memory_hit_count`） |
 | `useful` | 真正帮助本轮决策、被反馈确认为有用的记忆 | 部分是（支持显式确认命令，尚无自动判定链路） |
 
-### 当前 `memory_hit_count` 的精确含义
+### 当前 `memory_hit_count` / `memory_injected_count` 的精确含义
 
-**`memory_hit_count` = `injected` 数量**，即实际注入 prompt 的记忆条数。
+**`memory_hit_count` = `memory_injected_count` = `injected` 数量**，即实际注入 prompt 的记忆条数。
 
 它不是"从 DB 取出的数量"，也不是"真正有用的数量"。
+
+两个字段为同一语义的不同名称，同时输出以保障下游兼容。
 
 ## 3. `use_count` 字段语义
 
@@ -73,11 +75,16 @@ ORDER BY priority DESC,
 | 场景 | 字段名 | 含义 |
 |---|---|---|
 | agent_core 结构化日志 | `memory_retrieved_count` | DB 取出条数 |
-| agent_core 结构化日志 | `memory_hit_count` | 注入条数 |
-| agent_core 结构化日志 | `memory_total_chars` | 注入总字符数 |
+| agent_core 结构化日志 | `memory_hit_count` | 注入条数（= `memory_injected_count`） |
+| agent_core 结构化日志 | `memory_injected_count` | 注入条数（= `memory_hit_count`，兼容字段） |
+| agent_core 结构化日志 | `memory_total_chars` | 注入总字符数（= `memory_injected_total_chars`） |
+| agent_core 结构化日志 | `memory_injected_total_chars` | 注入总字符数（= `memory_total_chars`，兼容字段） |
 | agent_core 结构化日志 | `memory_ids` | 注入记忆 ID 列表 |
 | AgentRunTrace JSON | `memory_hit_count` | 注入条数 |
+| AgentRunTrace JSON | `memory_injected_count` | 注入条数（兼容字段） |
 | AgentRunTrace JSON | `memory_retrieved_count` | DB 取出条数 |
+| AgentRunTrace JSON | `memory_total_chars` | 注入总字符数 |
+| AgentRunTrace JSON | `memory_injected_total_chars` | 注入总字符数（兼容字段） |
 | AgentRunTrace Markdown | `memory_hit_count (injected)` | 注入条数（标注语义） |
 | AgentRunTrace Markdown | `memory_retrieved_count` | DB 取出条数 |
 | AgentRunTrace Markdown | `memory_total_chars (injected)` | 注入总字符数（标注语义） |
@@ -112,7 +119,7 @@ candidate → validate → dedup → promote/skip → persist → trace/log
 | `TooLong` | 内容超过 500 字符 |
 | `TooWeak` | 自动记忆置信度不足（预留） |
 | `Duplicate` | 与已有同类型记忆规范化后重复 |
-| `AutoWouldDowngradeExplicit` | auto 不允许降级已有 explicit |
+| `LowerPriorityWouldDowngradeHigher` | 低优先级类型不能覆盖高优先级类型 |
 | `Invalid` | user_id 或内容格式无效 |
 | `StorageError` | 持久化写入失败 |
 
@@ -120,15 +127,15 @@ candidate → validate → dedup → promote/skip → persist → trace/log
 
 | 值 | 含义 |
 |---|---|
-| `ExplicitPromotesAuto` | 新 explicit 提升了已有 auto 为 explicit |
+| `TypePromotesLower` | 高优先级类型提升了已有低优先级类型记忆 |
 
 ### 写入规则
 
 1. 空/whitespace → Skip(Empty)
 2. 超过 500 字符 → Skip(TooLong)
 3. normalize 后与已有相同：
-   - auto + 已有 explicit → Skip(AutoWouldDowngradeExplicit)
-   - explicit + 已有 auto → Promote(ExplicitPromotesAuto)
+   - auto + 已有 explicit → Skip(LowerPriorityWouldDowngradeHigher)
+   - explicit + 已有 auto → Promote(TypePromotesLower)
    - 同类型 → Skip(Duplicate)
 4. 确实不同 → WriteNew
 

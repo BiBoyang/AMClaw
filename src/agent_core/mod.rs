@@ -2779,9 +2779,9 @@ struct AgentRunTrace {
     llm_calls: Vec<LlmCallTrace>,
     tool_calls: Vec<ToolCallTrace>,
     session_state_snapshot: Option<RuntimeSessionStateSnapshot>,
-    memory_hit_count: usize,       // 实际注入 prompt 的记忆条数
+    memory_hit_count: usize,       // 实际注入 prompt 的记忆条数（= injected）
     memory_retrieved_count: usize, // 从 DB 取出的候选记忆条数
-    memory_total_chars: usize,     // 注入记忆的总字符数
+    memory_total_chars: usize,     // 注入记忆的总字符数（= injected_total_chars）
     memory_dropped_count: usize,   // 被裁剪掉的记忆条数
     memory_ids: Vec<String>,       // 注入记忆的 ID 列表
     // --- Retriever-level observability ---
@@ -2935,8 +2935,10 @@ pub(crate) struct AgentTraceIndexEntry {
     error: Option<String>,
     llm_fallback_reason: Option<String>,
     memory_hit_count: usize,
+    memory_injected_count: usize,
     memory_retrieved_count: usize,
     memory_total_chars: usize,
+    memory_injected_total_chars: usize,
     memory_dropped_count: usize,
     #[serde(default)]
     recovery_attempt_count: usize,
@@ -3502,8 +3504,10 @@ impl AgentRunTrace {
                 .clone()
                 .map(|v| summarize_for_markdown(&v, 240)),
             memory_hit_count: self.memory_hit_count,
+            memory_injected_count: self.memory_hit_count,
             memory_retrieved_count: self.memory_retrieved_count,
             memory_total_chars: self.memory_total_chars,
+            memory_injected_total_chars: self.memory_total_chars,
             memory_dropped_count: self.memory_dropped_count,
             recovery_attempt_count: self.recovery_attempts.len(),
             recovery_success_count: self
@@ -4315,7 +4319,7 @@ fn load_business_context_snapshot(
         return Ok((None, SessionState::default()));
     };
 
-    let store = TaskStore::open(db_path)?;
+    let mut store = TaskStore::open(db_path)?;
     let current_task = if let Some(task_id) = &trace.task_id {
         store.get_task_status(task_id)?
     } else {
@@ -4412,9 +4416,16 @@ fn load_business_context_snapshot(
                             "memory_injected_count",
                             json!(session_state.injected_count()),
                         ),
+                        // 兼容字段：memory_hit_count 与 memory_injected_count 同值
+                        ("memory_hit_count", json!(session_state.injected_count())),
                         ("memory_dropped_count", json!(session_state.dropped.len())),
                         (
                             "memory_total_chars",
+                            json!(session_state.injected_total_chars()),
+                        ),
+                        // 兼容字段：memory_injected_total_chars 与 memory_total_chars 同值
+                        (
+                            "memory_injected_total_chars",
                             json!(session_state.injected_total_chars()),
                         ),
                         ("memory_ids", json!(session_state.injected_ids())),

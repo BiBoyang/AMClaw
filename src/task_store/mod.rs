@@ -1250,6 +1250,66 @@ mod tests {
     }
 
     #[test]
+    fn govern_dedup_checks_all_active_memories_not_top_50() {
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        // 写入 50 条高优先级 explicit 记忆，把后续 auto 记忆挤出 top 50
+        for i in 0..50 {
+            store
+                .add_user_memory("user-dedup-all", &format!("高优先级记忆 {i}"))
+                .expect("写入失败");
+        }
+        // 写入 1 条低优先级 auto 记忆（priority=60 < 100）
+        let mut ws1 = MemoryWriteState::default();
+        let decision = store.govern_memory_write(
+            "user-dedup-all",
+            "将被提升的偏好",
+            MemoryType::Auto,
+            60,
+            &mut ws1,
+        );
+        let auto_id = match decision {
+            WriteDecision::Written(r) => r.id,
+            _ => panic!("应写入 auto memory"),
+        };
+
+        // 再写入 50 条高优先级 explicit 记忆，确保 auto 记忆在检索时远在 50 名之后
+        for i in 0..50 {
+            store
+                .add_user_memory("user-dedup-all", &format!("高优先级记忆 {i}"))
+                .expect("写入失败");
+        }
+
+        // 现在用 explicit 写入同一内容；若 dedup 仅查 top 50 会误判为新写入，
+        // 全量查应正确识别为重复并 promote。
+        let mut ws2 = MemoryWriteState::default();
+        let decision = store.govern_memory_write(
+            "user-dedup-all",
+            "将被提升的偏好",
+            MemoryType::Explicit,
+            100,
+            &mut ws2,
+        );
+        match decision {
+            WriteDecision::Promoted { id, .. } => assert_eq!(id, auto_id),
+            other => panic!("应 Promote 原有 auto memory: {:?}", other),
+        }
+
+        // 验证只存在一条该内容的记忆
+        let memories = store
+            .list_user_memories("user-dedup-all", 200)
+            .expect("查询失败");
+        assert_eq!(
+            memories
+                .iter()
+                .filter(|m| m.content == "将被提升的偏好")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn user_memory_schema_has_new_fields() {
         let db_path = temp_db_path();
         let mut store = TaskStore::open(&db_path).expect("初始化 task store 失败");

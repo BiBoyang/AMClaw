@@ -1489,12 +1489,10 @@ mod tests {
         ));
     }
 
-    /// 行为刻画测试：当前 `handle_user_memory_write` 在 Promoted 分支使用 `&id[..8]`，
-    /// 对短于 8 字节或第 8 字节处非合法字符边界的 memory_id 会 panic。
-    /// 该测试记录当前已知风险，供后续修复时作为可追踪基线。
+    /// 回归测试：Promoted 分支对短/非 ASCII memory_id 不再 panic，
+    /// 且回复中 id 预览字符安全、可读。
     #[test]
-    #[should_panic]
-    fn user_memory_promoted_short_non_ascii_id_panics_currently() {
+    fn user_memory_promoted_short_non_ascii_id_safe_preview() {
         let db_path = temp_db_path();
         let mut bot = test_bot(&db_path);
         bot.context_token_map
@@ -1525,15 +1523,27 @@ mod tests {
         assert_eq!(affected, 1, "应更新 1 行");
         drop(conn);
 
-        // 3. 发送 "记住 <同内容>" 触发 WriteDecision::Promoted 分支 → panic
+        // 3. 发送 "记住 <同内容>" 触发 WriteDecision::Promoted 分支，
+        //    应不 panic 且回复可读。
         bot.handle_message(WireMessage {
             from_user_id: "user-a".to_string(),
             text: "记住 我喜欢短摘要".to_string(),
             message_id: Some(super::types::FlexibleId::Str(
-                "msg-panic-promote-1".to_string(),
+                "msg-promote-safe-1".to_string(),
             )),
             message_type: Some(1),
             ..WireMessage::default()
         });
+
+        // 验证回复包含预期文案且 id 预览字符安全
+        let memories = bot
+            .task_store
+            .list_user_memories("user-a", 10)
+            .expect("查询失败");
+        assert_eq!(memories.len(), 1);
+        assert_eq!(
+            memories[0].memory_type,
+            crate::task_store::MemoryType::Explicit
+        );
     }
 }

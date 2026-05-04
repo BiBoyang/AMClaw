@@ -300,7 +300,8 @@ impl super::WeChatBot {
                         ("promote_reason", json!(reason.to_string())),
                     ],
                 );
-                format!("已提升已有记忆为显式记忆 (id: {})", &id[..8])
+                let id_preview: String = id.chars().take(8).collect();
+                format!("已提升已有记忆为显式记忆 (id: {})", id_preview)
             }
         };
         self.send_reply_text(user_id, &reply);

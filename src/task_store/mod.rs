@@ -68,9 +68,6 @@ impl TaskStore {
         Ok(store)
     }
 
-    /// 统一 feedback 写回入口
-    ///
-
     // ---- Outbound Pending Chunks API ----
 
     /// 将剩余未发送的消息段持久化，供后续补发。

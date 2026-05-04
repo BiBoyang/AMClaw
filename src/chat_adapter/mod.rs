@@ -580,7 +580,10 @@ mod tests {
             message_type: Some(1),
             ..WireMessage::default()
         });
-        assert!(bot.task_executor.flush(), "task_executor flush 超时，任务未在预期时间内 drain 完");
+        assert!(
+            bot.task_executor.flush(),
+            "task_executor flush 超时，任务未在预期时间内 drain 完"
+        );
 
         let row = task_row(&db_path, &task_id).expect("应存在任务");
         assert_eq!(row.1, 2);
@@ -613,7 +616,10 @@ mod tests {
 
         let task_id = first_task_id(&db_path);
         bot.process_pending_tasks();
-        assert!(bot.task_executor.flush(), "task_executor flush 超时，任务未在预期时间内 drain 完");
+        assert!(
+            bot.task_executor.flush(),
+            "task_executor flush 超时，任务未在预期时间内 drain 完"
+        );
 
         let status = task_row(&db_path, &task_id).map(|row| row.0);
         assert!(matches!(

@@ -544,11 +544,21 @@ mod tests {
     #[test]
     fn retry_command_processes_task_immediately() {
         let db_path = temp_db_path();
-        let mut bot = test_bot(&db_path);
+        let fixture_url = "https://example.com/retry-chat-fixture";
+        let fixture_html =
+            "<html><head><title>Fixture Page</title></head><body>fixture content</body></html>";
+        let pipeline = Pipeline::new(
+            temp_dir(),
+            None::<ResolvedBrowserConfig>,
+            crate::mode_policy::AgentMode::Restricted,
+        )
+        .expect("初始化 fixture pipeline 失败")
+        .with_http_fixture(fixture_url, fixture_html);
+        let mut bot = build_test_bot_with_pipeline(&db_path, temp_dir(), pipeline);
 
         bot.handle_message(WireMessage {
             from_user_id: "user-a".to_string(),
-            text: "https://example.com/retry-chat".to_string(),
+            text: fixture_url.to_string(),
             message_id: Some(super::types::FlexibleId::Str("msg-12".to_string())),
             message_type: Some(1),
             ..WireMessage::default()

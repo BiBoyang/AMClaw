@@ -36,17 +36,23 @@ pub(super) fn split_reply_into_chunks(reply: &str, max_chars: usize) -> Vec<Stri
         prev_count = segments.len();
     }
 
-    // 安全兜底：若预算不足以分片，直接返回原文（避免空返回导致消息丢失）
-    if segments.is_empty() {
-        return vec![reply.to_string()];
+    // 安全兜底：若 budget 过小导致无法收敛，退化为无前缀逐字符切分，
+    // 保证单段仍不超过 max_chars。
+    let fallback_no_prefix = segments.is_empty();
+    if fallback_no_prefix {
+        segments = split_content_only(reply, max_chars);
     }
 
     let total = segments.len();
-    segments
-        .into_iter()
-        .enumerate()
-        .map(|(i, content)| format!("（{}/{}）{}", i + 1, total, content))
-        .collect()
+    if fallback_no_prefix {
+        segments
+    } else {
+        segments
+            .into_iter()
+            .enumerate()
+            .map(|(i, content)| format!("（{}/{}）{}", i + 1, total, content))
+            .collect()
+    }
 }
 
 /// 仅按 content_budget 切分内容，不添加前缀。返回每段内容的 Vec<String>。

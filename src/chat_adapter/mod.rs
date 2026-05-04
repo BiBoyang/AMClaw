@@ -1550,11 +1550,24 @@ mod tests {
 
     #[test]
     fn split_reply_into_chunks_zero_budget_does_not_loop() {
-        // max_chars 过小导致 content_budget 为 0 时，不应死循环或 panic
-        let chunks = super::delivery::split_reply_into_chunks("测试内容", 1);
-        // 0-budget 防御下直接返回原文（至少不丢失内容）
+        // max_chars 过小导致 content_budget 为 0 时，不应死循环或 panic，
+        // 且退化为无前缀切分后每段仍不超过 max_chars。
+        let max_chars = 1usize;
+        let chunks = super::delivery::split_reply_into_chunks("测试内容", max_chars);
         assert!(!chunks.is_empty());
-        assert!(chunks.iter().any(|c| c.contains("测试内容")));
+        assert!(chunks.iter().any(|c| c.contains("测试内容")
+            || c.contains("测")
+            || c.contains("试")
+            || c.contains("内")
+            || c.contains("容")));
+        for chunk in &chunks {
+            assert!(
+                chunk.chars().count() <= max_chars,
+                "每段不应超过 max_chars={}: {}",
+                max_chars,
+                chunk
+            );
+        }
     }
 
     #[test]

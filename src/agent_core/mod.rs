@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -3563,15 +3565,14 @@ impl AgentRunTrace {
         let index_path = dir.join("index.jsonl");
         let index_line =
             serde_json::to_string(&index_entry).context("序列化 agent trace index 失败")?;
-        let mut existing = if index_path.exists() {
-            fs::read_to_string(&index_path)
-                .with_context(|| format!("读取 agent trace index 失败: {}", index_path.display()))?
-        } else {
-            String::new()
-        };
-        existing.push_str(&index_line);
-        existing.push('\n');
-        fs::write(&index_path, existing)
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&index_path)
+            .with_context(|| format!("打开 agent trace index 失败: {}", index_path.display()))?;
+        let mut line_with_nl = index_line;
+        line_with_nl.push('\n');
+        file.write_all(line_with_nl.as_bytes())
             .with_context(|| format!("写入 agent trace index 失败: {}", index_path.display()))?;
         self.write_daily_index_markdown(&dir, &day)?;
         Ok(json_path)
@@ -3586,9 +3587,19 @@ impl AgentRunTrace {
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: AgentTraceIndexEntry = serde_json::from_str(line)
-                .with_context(|| format!("解析 agent trace index 第 {} 行失败", idx + 1))?;
-            entries.push(entry);
+            match serde_json::from_str::<AgentTraceIndexEntry>(line) {
+                Ok(entry) => entries.push(entry),
+                Err(err) => {
+                    log_agent_warn(
+                        "agent_trace_index_line_parse_failed",
+                        vec![
+                            ("line_no", json!(idx + 1)),
+                            ("detail", json!(err.to_string())),
+                            ("index_path", json!(index_path.display().to_string())),
+                        ],
+                    );
+                }
+            }
         }
 
         let markdown_path = dir.join("index.md");
@@ -5609,6 +5620,8 @@ mod tests {
     use crate::session_summary::SessionSummaryStrategy;
     use crate::task_store::{MemoryType, TaskStore};
     use serde_json::{json, Value};
+    use std::fs::OpenOptions;
+    use std::io::Write;
     use uuid::Uuid;
 
     fn temp_workspace() -> std::path::PathBuf {
@@ -7573,6 +7586,83 @@ mod tests {
             serde_json::from_str(legacy_line).expect("旧版 index 行应可反序列化");
         assert_eq!(entry.memory_injected_count, 0);
         assert_eq!(entry.memory_injected_total_chars, 0);
+    }
+
+    #[test]
+    fn persist_twice_appends_index_without_overwrite() {
+        let workspace = temp_workspace();
+        let mut trace = AgentRunTrace::new(&workspace, "第一次", AgentRunContext::agent_demo());
+        trace.finish_success("第一次结果", std::time::Duration::from_secs(1));
+        let path1 = trace.persist().expect("第一次 persist 失败");
+        let run_id1 = trace.run_id.clone();
+
+        // 第二次运行（不同 run_id）
+        let mut trace2 = AgentRunTrace::new(&workspace, "第二次", AgentRunContext::agent_demo());
+        trace2.finish_success("第二次结果", std::time::Duration::from_secs(1));
+        let path2 = trace2.persist().expect("第二次 persist 失败");
+        let run_id2 = trace2.run_id.clone();
+
+        // 两个 json 文件应不同
+        assert_ne!(path1, path2);
+
+        // index.jsonl 应有两行
+        let day_dir = path1.parent().expect("应有父目录");
+        let index_path = day_dir.join("index.jsonl");
+        let index_content = std::fs::read_to_string(&index_path).expect("读取 index.jsonl 失败");
+        let lines: Vec<&str> = index_content.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "index.jsonl 应有两行，实际: {}",
+            lines.len()
+        );
+
+        // 两行应分别包含两个 run_id
+        assert!(lines[0].contains(&run_id1), "第一行应包含 run_id1");
+        assert!(lines[1].contains(&run_id2), "第二行应包含 run_id2");
+    }
+
+    #[test]
+    fn write_daily_index_markdown_skips_invalid_lines() {
+        let workspace = temp_workspace();
+        let mut trace = AgentRunTrace::new(&workspace, "测试", AgentRunContext::agent_demo());
+        trace.finish_success("结果", std::time::Duration::from_secs(1));
+        let _ = trace.persist().expect("persist 失败");
+
+        let day_dir = workspace.join("data").join("agent_traces");
+        let day_dir = std::fs::read_dir(&day_dir)
+            .expect("应存在日期目录")
+            .next()
+            .expect("应存在日期目录")
+            .expect("读取日期目录失败")
+            .path();
+        let index_path = day_dir.join("index.jsonl");
+
+        // 追加一行坏数据
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&index_path)
+            .expect("打开 index.jsonl 失败");
+        file.write_all(b"this is not json\n").expect("写入坏行失败");
+        drop(file);
+
+        // 再 persist 一次（追加一行好的）
+        let mut trace2 = AgentRunTrace::new(&workspace, "第二次", AgentRunContext::agent_demo());
+        trace2.finish_success("结果2", std::time::Duration::from_secs(1));
+        let _path2 = trace2.persist().expect("第二次 persist 失败");
+
+        // 验证 index.md 存在且包含有效 run
+        let markdown_path = day_dir.join("index.md");
+        assert!(markdown_path.exists(), "index.md 应存在");
+        let markdown = std::fs::read_to_string(&markdown_path).expect("读取 index.md 失败");
+        assert!(
+            markdown.contains("total_runs: 2"),
+            "index.md 应显示 2 条有效 run"
+        );
+        assert!(
+            markdown.contains(&trace2.run_id),
+            "index.md 应包含第二个 run_id"
+        );
     }
 
     #[test]

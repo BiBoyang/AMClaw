@@ -206,6 +206,42 @@ pub fn spawn_daily_scheduler(
     Ok(Some(handle))
 }
 
+/// 启动 scheduler watchdog 线程，定期检查 scheduler 线程是否异常终止。
+/// 若 scheduler 在 `running` 仍为 true 时结束，则记录结构化 error 日志并返回 true。
+/// 返回的 JoinHandle 可通过 `.join()` 获取检测结果（true = 异常终止）。
+pub fn spawn_scheduler_watchdog(
+    handle: JoinHandle<()>,
+    running: Arc<AtomicBool>,
+) -> JoinHandle<bool> {
+    spawn_scheduler_watchdog_with_interval(handle, running, Duration::from_secs(5))
+}
+
+/// 带自定义检查间隔的 watchdog，主要用于测试缩短等待时间。
+pub fn spawn_scheduler_watchdog_with_interval(
+    handle: JoinHandle<()>,
+    running: Arc<AtomicBool>,
+    check_interval: Duration,
+) -> JoinHandle<bool> {
+    thread::spawn(move || {
+        while running.load(Ordering::Relaxed) {
+            if handle.is_finished() {
+                let _ = handle.join();
+                log_scheduler_error(
+                    "scheduler_health_check_failed",
+                    vec![
+                        ("component", json!("scheduler")),
+                        ("status", json!("thread_terminated")),
+                    ],
+                );
+                return true;
+            }
+            thread::sleep(check_interval);
+        }
+        let _ = handle.join();
+        false
+    })
+}
+
 pub fn generate_daily_report_once(config: &AppConfig, day: &str) -> Result<DailyReportOutput> {
     DailyReporter::from_config(config)?.generate_for_day(day)
 }
@@ -278,13 +314,17 @@ fn log_scheduler_error(event: &str, fields: Vec<(&str, Value)>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_daily_run_time, should_run_for_now, should_run_for_week, DailyReportSchedule,
-        WeeklyReportSchedule,
+        parse_daily_run_time, should_run_for_now, should_run_for_week,
+        spawn_scheduler_watchdog_with_interval, DailyReportSchedule, WeeklyReportSchedule,
     };
     use crate::config::AppConfig;
     use chrono::TimeZone;
     use chrono_tz::Asia::Shanghai;
     use std::fs;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
     use uuid::Uuid;
 
     fn temp_dir() -> std::path::PathBuf {
@@ -387,6 +427,46 @@ report_to_user_id = "user-a"
         assert_eq!(
             schedule.should_run_now(now, None),
             Some("2026-16".to_string())
+        );
+    }
+
+    #[test]
+    fn scheduler_watchdog_detects_panic() {
+        let running = Arc::new(AtomicBool::new(true));
+        let doomed = thread::spawn(|| panic!("injected scheduler panic"));
+        let watchdog = spawn_scheduler_watchdog_with_interval(
+            doomed,
+            Arc::clone(&running),
+            Duration::from_millis(10),
+        );
+        let detected = watchdog.join().expect("watchdog 不应 panic");
+        assert!(detected, "watchdog 应检测到 scheduler 异常终止");
+    }
+
+    #[test]
+    fn scheduler_watchdog_ignores_normal_shutdown() {
+        let running = Arc::new(AtomicBool::new(true));
+        let r = Arc::clone(&running);
+        let normal = thread::spawn(move || {
+            while r.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let watchdog = spawn_scheduler_watchdog_with_interval(
+            normal,
+            Arc::clone(&running),
+            Duration::from_millis(10),
+        );
+
+        // 模拟主流程正常退出：先设置 running=false，再等待 watchdog
+        thread::sleep(Duration::from_millis(30));
+        running.store(false, Ordering::Relaxed);
+
+        let detected = watchdog.join().expect("watchdog 不应 panic");
+        assert!(
+            !detected,
+            "正常结束时 running 已为 false，不应被判定为异常终止"
         );
     }
 }

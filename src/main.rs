@@ -60,6 +60,9 @@ fn main() -> Result<()> {
     let scheduler_handle =
         scheduler::spawn_daily_scheduler(app_config.clone(), Arc::clone(&running))?;
 
+    let watchdog_handle = scheduler_handle
+        .map(|handle| scheduler::spawn_scheduler_watchdog(handle, Arc::clone(&running)));
+
     if let Err(err) = chat_adapter::run(app_config, browser, Arc::clone(&running)) {
         log_startup_error(
             "startup_failed",
@@ -71,7 +74,7 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
     running.store(false, Ordering::Relaxed);
-    if let Some(handle) = scheduler_handle {
+    if let Some(handle) = watchdog_handle {
         let _ = handle.join();
     }
     Ok(())

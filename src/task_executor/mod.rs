@@ -3,6 +3,7 @@ use crate::task_store::{MarkTaskArchivedInput, TaskStore};
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::collections::HashSet;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -42,15 +43,38 @@ impl TaskExecutor {
                 }
             };
             while let Ok(task_id) = receiver.recv() {
-                if let Err(err) = process_task(&pipeline, &mut task_store, &task_id, &worker_id) {
-                    log_task_executor_error(
-                        "task_execution_failed",
-                        vec![
-                            ("task_id", json!(task_id)),
-                            ("detail", json!(err.to_string())),
-                        ],
-                    );
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    process_task(&pipeline, &mut task_store, &task_id, &worker_id)
+                }));
+
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        log_task_executor_error(
+                            "task_execution_failed",
+                            vec![
+                                ("task_id", json!(task_id)),
+                                ("detail", json!(err.to_string())),
+                            ],
+                        );
+                    }
+                    Err(panic_payload) => {
+                        let panic_msg = panic_payload
+                            .downcast_ref::<String>()
+                            .map(|s| s.as_str())
+                            .or_else(|| panic_payload.downcast_ref::<&str>().copied())
+                            .unwrap_or("unknown panic");
+                        log_task_executor_error(
+                            "worker_task_panicked",
+                            vec![
+                                ("task_id", json!(task_id)),
+                                ("worker_id", json!(&worker_id)),
+                                ("panic", json!(panic_msg)),
+                            ],
+                        );
+                    }
                 }
+
                 inflight_worker.lock().unwrap().remove(&task_id);
                 pc.fetch_sub(1, Ordering::SeqCst);
             }
@@ -125,12 +149,50 @@ impl TaskExecutor {
 }
 
 /// 在 worker 线程内执行单个任务：claim -> 抓取 -> 归档 -> 更新状态。
+#[cfg(test)]
+static PANIC_INJECTION: std::sync::LazyLock<Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+#[cfg(test)]
+fn should_panic_for_task(task_id: &str) -> bool {
+    PANIC_INJECTION.lock().unwrap().contains(task_id)
+}
+
+#[cfg(test)]
+struct PanicInjectionGuard {
+    task_id: String,
+}
+
+#[cfg(test)]
+impl PanicInjectionGuard {
+    fn inject(task_id: &str) -> Self {
+        PANIC_INJECTION.lock().unwrap().insert(task_id.to_string());
+        Self {
+            task_id: task_id.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PanicInjectionGuard {
+    fn drop(&mut self) {
+        PANIC_INJECTION.lock().unwrap().remove(&self.task_id);
+    }
+}
+
 fn process_task(
     pipeline: &Pipeline,
     task_store: &mut TaskStore,
     task_id: &str,
     worker_id: &str,
 ) -> Result<()> {
+    #[cfg(test)]
+    {
+        if should_panic_for_task(task_id) {
+            panic!("injected test panic for task {}", task_id);
+        }
+    }
+
     // 1. 原子领取任务（pending 或 lease 过期的 processing -> processing）
     const LEASE_SECS: u64 = 300;
     if !task_store.claim_task(task_id, worker_id, LEASE_SECS)? {
@@ -264,4 +326,62 @@ fn log_task_executor_warn(event: &str, fields: Vec<(&str, serde_json::Value)>) {
 
 fn log_task_executor_error(event: &str, fields: Vec<(&str, serde_json::Value)>) {
     crate::logging::emit_structured_log("error", event, fields);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mode_policy::AgentMode;
+    use std::fs;
+
+    fn temp_dir() -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("amclaw_task_executor_test_{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("创建测试目录失败");
+        root
+    }
+
+    #[test]
+    fn worker_survives_task_panic_and_consumes_next_task() {
+        let db_path = temp_dir().join("amclaw.db");
+        let root = temp_dir();
+        let fixture_url = "https://example.com/safe-page";
+        let fixture_html =
+            "<html><head><title>Safe Page</title></head><body>safe content</body></html>";
+
+        let pipeline = Pipeline::new(&root, None, AgentMode::Restricted)
+            .expect("初始化 pipeline 失败")
+            .with_http_fixture(fixture_url, fixture_html);
+
+        let mut task_store = TaskStore::open(&db_path).expect("初始化 task store 失败");
+
+        // 创建两个任务：第一个会 panic，第二个会成功
+        let panic_task = task_store
+            .record_link_submission("https://example.com/panic-page")
+            .expect("创建 panic 任务失败");
+        let safe_task = task_store
+            .record_link_submission(fixture_url)
+            .expect("创建 safe 任务失败");
+
+        let _guard = PanicInjectionGuard::inject(&panic_task.task_id);
+
+        let executor = TaskExecutor::start(pipeline, db_path.clone());
+
+        assert!(executor.enqueue(panic_task.task_id.clone()));
+        assert!(executor.enqueue(safe_task.task_id.clone()));
+
+        assert!(
+            executor.flush(),
+            "flush 超时，worker 可能卡死或泄漏 pending count"
+        );
+        assert_eq!(executor.pending_count.load(Ordering::SeqCst), 0);
+        assert!(executor.inflight.lock().unwrap().is_empty());
+
+        // 验证第二个任务被成功归档
+        let safe_status = task_store
+            .get_task_status(&safe_task.task_id)
+            .expect("查询 safe 任务失败")
+            .expect("safe 任务应存在");
+        assert_eq!(safe_status.status, "archived");
+    }
 }

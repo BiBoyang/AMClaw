@@ -8,10 +8,10 @@
 
 ### 当前基线
 
-- `src/agent_core/mod.rs`: 8755 行
+- `src/agent_core/mod.rs`: 8755 行 → **1193 行**（Phase C 完成）
 - `src/task_store/mod.rs`: 5002 行
 - `src/chat_adapter/mod.rs`: 3500 行
-- `cargo test`: `371 passed`（`src/lib.rs` 单元测试）
+- `cargo test`: `371 passed`（`src/lib.rs` 单元测试）→ **385 passed**（Phase C 完成）
 - `cargo test -- --list`: 411 test entries（含多个 test target）
 
 ### 拆分约束
@@ -759,6 +759,8 @@ cargo test agent_core::tests::map_llm_plan_requires_path_for_read
 
 ### C8. 精简 `mod.rs` 为编排层
 
+**状态：✅ 已完成（2026-05-06）**
+
 保留在 `mod.rs` 的内容：
 
 - `AgentCore` 构造函数
@@ -781,6 +783,29 @@ cargo check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test agent_core::tests::
 ```
+
+### C8-Final. 收口验收与最小可见性回收
+
+**状态：✅ 已完成（2026-05-06）**
+
+- `mod.rs` 最终行数：**1193 行**
+- 新增/稳定模块文件：
+  - `command_parse.rs` (267) — LLM plan / 用户指令解析
+  - `context_assembly.rs` (1499) — context pack / session state / business context 组装
+  - `llm_client.rs` (371) — LLM 调用与配置解析
+  - `logging.rs` (22) — 结构化 agent 日志
+  - `recovery.rs` (234) — 失败恢复策略与控制器状态
+  - `retriever_factory.rs` (211) — retriever 工厂与模式选择
+  - `trace.rs` (1609) — trace 模型、持久化、markdown 渲染
+  - `types.rs` (28) — 通用类型辅助函数
+  - `watchdog.rs` (395) — 轨迹观测校验与失败分类
+  - `tests.rs` (3264) — 全部 agent_core 测试
+- 可见性回收（机械调整，无逻辑改动）：
+  - `trace.rs`: `truncate_for_trace` → `pub(super)`
+  - `trace.rs`: `DecisionTrace`, `PromptSnapshot`, `LlmCallTrace`, `ToolCallTrace`, `FailureTrace`, `RecoveryTrace` → `pub(super)`
+  - `trace.rs`: `AgentRunTrace::consecutive_failures_for_current_step` → `pub(super)`
+  - `trace.rs`: `AgentRunTrace` 大量未被外部直接访问的字段 → `pub(super)`
+- Gate：check / fmt / clippy / test 全绿
 
 ## 6. 每阶段验收标准
 

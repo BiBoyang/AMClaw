@@ -9,8 +9,8 @@
 ### 当前基线
 
 - `src/agent_core/mod.rs`: 8755 行 → **1193 行**（Phase C 完成）
-- `src/task_store/mod.rs`: 5002 行
-- `src/chat_adapter/mod.rs`: 3500 行
+- `src/task_store/mod.rs`: 5002 行 → **78 行**（Phase B 完成）
+- `src/chat_adapter/mod.rs`: 3500 行 → **200 行**（Phase A 完成）
 - `cargo test`: `371 passed`（`src/lib.rs` 单元测试）→ **385 passed**（Phase C 完成）
 - `cargo test -- --list`: 411 test entries（含多个 test target）
 
@@ -811,14 +811,18 @@ cargo test agent_core::tests::
 
 ### A 阶段完成标准
 
-1. `chat_adapter/mod.rs` 降到 <= 1200 行
-2. `chat_adapter::tests::` 全绿
+**状态：✅ 已完成（2026-05-07）**
+
+1. `chat_adapter/mod.rs` 降到 <= 1200 行 → **200 行**
+2. `chat_adapter::tests::` 全绿（42 passed）
 3. 关键流程测试全绿：去重、会话 flush、分片发送、任务补录
 
 ### B 阶段完成标准
 
-1. `task_store/mod.rs` 降到 <= 1000 行
-2. `task_store::tests::` 全绿
+**状态：✅ 已完成（2026-05-07）**
+
+1. `task_store/mod.rs` 降到 <= 1000 行 → **78 行**
+2. `task_store::tests::` 全绿（88 passed）
 3. URL guard、task 状态流、memory 治理测试全绿
 
 ### C 阶段完成标准

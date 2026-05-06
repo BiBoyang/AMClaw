@@ -191,6 +191,7 @@ struct TraceSummary {
     in_baseline: bool,
     is_interesting: bool,
     interest_reasons: Vec<String>,
+    persistent_state_updated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -425,6 +426,9 @@ fn summarize_trace(trace: &AgentTrace, baseline_run_ids: &HashSet<String>) -> Tr
     if trace.retrieval_fallback_reason.is_some() {
         interest_reasons.push("retrieval_fallback".to_string());
     }
+    if trace.persistent_state_updated {
+        interest_reasons.push("state_updated".to_string());
+    }
 
     let is_interesting = !interest_reasons.is_empty();
     let mut seen_types = std::collections::HashSet::new();
@@ -556,6 +560,7 @@ fn summarize_trace(trace: &AgentTrace, baseline_run_ids: &HashSet<String>) -> Tr
         in_baseline: baseline_run_ids.contains(&trace.run_id),
         is_interesting,
         interest_reasons,
+        persistent_state_updated: trace.persistent_state_updated,
     }
 }
 
@@ -610,6 +615,10 @@ fn build_report(
         .iter()
         .filter(|summary| summary.has_failures)
         .count();
+    let with_state_updated = summaries
+        .iter()
+        .filter(|summary| summary.persistent_state_updated)
+        .count();
 
     lines.push("| metric | count | ratio |".to_string());
     lines.push("| --- | ---: | ---: |".to_string());
@@ -648,6 +657,49 @@ fn build_report(
         "| with failures | {} | {:.1}% |",
         with_failures,
         pct(with_failures, total)
+    ));
+    lines.push(format!(
+        "| with persistent state updated | {} | {:.1}% |",
+        with_state_updated,
+        pct(with_state_updated, total)
+    ));
+    lines.push(String::new());
+
+    // === Persistent State Update Breakdown ===
+    let updated_true_summaries: Vec<_> = summaries
+        .iter()
+        .filter(|s| s.persistent_state_updated)
+        .collect();
+    let updated_false_summaries: Vec<_> = summaries
+        .iter()
+        .filter(|s| !s.persistent_state_updated)
+        .collect();
+    let updated_true_count = updated_true_summaries.len();
+    let updated_false_count = updated_false_summaries.len();
+    let updated_true_success = updated_true_summaries.iter().filter(|s| s.success).count();
+    let updated_false_success = updated_false_summaries.iter().filter(|s| s.success).count();
+    let updated_true_success_rate = if updated_true_count > 0 {
+        updated_true_success as f64 / updated_true_count as f64 * 100.0
+    } else {
+        0.0
+    };
+    let updated_false_success_rate = if updated_false_count > 0 {
+        updated_false_success as f64 / updated_false_count as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    lines.push("## Persistent State Update Breakdown".to_string());
+    lines.push(String::new());
+    lines.push("| updated | traces | success | success_rate |".to_string());
+    lines.push("| --- | ---: | ---: | ---: |".to_string());
+    lines.push(format!(
+        "| true | {} | {} | {:.1}% |",
+        updated_true_count, updated_true_success, updated_true_success_rate
+    ));
+    lines.push(format!(
+        "| false | {} | {} | {:.1}% |",
+        updated_false_count, updated_false_success, updated_false_success_rate
     ));
     lines.push(String::new());
 
@@ -1091,10 +1143,10 @@ fn build_report(
     lines.push("## Per-Trace Detail".to_string());
     lines.push(String::new());
     lines.push(
-        "| run_id | success | baseline | steps | mem(r/i/d) | state | ctx_drop | failures | reasons | input |"
+        "| run_id | success | baseline | steps | mem(r/i/d) | state | state_upd | ctx_drop | failures | reasons | input |"
             .to_string(),
     );
-    lines.push("| --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- |".to_string());
+    lines.push("| --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- |".to_string());
 
     for summary in summaries {
         if only_interesting && !summary.is_interesting {
@@ -1109,7 +1161,7 @@ fn build_report(
             summary.user_input.clone()
         };
         lines.push(format!(
-            "| `{}` | {} | {} | {} | {}/{}/{} | {} | {} | {} | {} | {} |",
+            "| `{}` | {} | {} | {} | {}/{}/{} | {} | {} | {} | {} | {} | {} |",
             &summary.run_id[..8.min(summary.run_id.len())],
             if summary.success { "✓" } else { "✗" },
             if summary.in_baseline { "✓" } else { "·" },
@@ -1118,6 +1170,11 @@ fn build_report(
             summary.memory_injected,
             summary.memory_dropped,
             if summary.state_present { "✓" } else { "·" },
+            if summary.persistent_state_updated {
+                "✓"
+            } else {
+                "·"
+            },
             if summary.context_pack_dropped {
                 "✓"
             } else {
@@ -1162,6 +1219,10 @@ fn build_report(
                 summary.memory_total_chars
             ));
             lines.push(format!("- **session_state**: {}", summary.state_present));
+            lines.push(format!(
+                "- **persistent_state_updated**: {}",
+                summary.persistent_state_updated
+            ));
             lines.push(format!(
                 "- **context_pack**: dropped={}, reasons={:?}",
                 summary.context_pack_dropped, summary.context_pack_drop_reasons
@@ -2286,6 +2347,14 @@ mod tests {
             "| with context pack dropped | 3 | 15.0% |".to_string(),
             "| with llm fallback | 7 | 35.0% |".to_string(),
             "| with failures | 6 | 30.0% |".to_string(),
+            "| with persistent state updated | 2 | 10.0% |".to_string(),
+            String::new(),
+            "## Persistent State Update Breakdown".to_string(),
+            String::new(),
+            "| updated | traces | success | success_rate |".to_string(),
+            "| --- | ---: | ---: | ---: |".to_string(),
+            "| true | 2 | 1 | 50.0% |".to_string(),
+            "| false | 18 | 14 | 77.8% |".to_string(),
             String::new(),
             "## Baseline Coverage".to_string(),
             String::new(),
@@ -2391,6 +2460,7 @@ mod tests {
             in_baseline: false,
             is_interesting: false,
             interest_reasons: Vec::new(),
+            persistent_state_updated: false,
         }
     }
 
@@ -3320,6 +3390,7 @@ mod tests {
             in_baseline: false,
             is_interesting: false,
             interest_reasons: vec![],
+            persistent_state_updated: false,
         };
         let s2 = TraceSummary {
             run_id: "r2".to_string(),
@@ -3365,6 +3436,7 @@ mod tests {
             in_baseline: false,
             is_interesting: false,
             interest_reasons: vec![],
+            persistent_state_updated: false,
         };
         let s3 = TraceSummary {
             run_id: "r3".to_string(),
@@ -3410,6 +3482,7 @@ mod tests {
             in_baseline: false,
             is_interesting: false,
             interest_reasons: vec![],
+            persistent_state_updated: false,
         };
 
         let report = build_report(&[s1, s2, s3], false, &HashSet::new(), None);
@@ -3557,6 +3630,123 @@ mod tests {
             reasons
         );
         assert!(reasons.iter().any(|r| r.contains("样本量")));
+    }
+
+    #[test]
+    fn persistent_state_updated_count_and_ratio() {
+        let mut s1 = make_summary("run-1", vec![]);
+        s1.persistent_state_updated = true;
+        s1.success = true;
+        let mut s2 = make_summary("run-2", vec![]);
+        s2.persistent_state_updated = true;
+        s2.success = false;
+        let mut s3 = make_summary("run-3", vec![]);
+        s3.persistent_state_updated = false;
+        s3.success = true;
+
+        let report = build_report(&[s1, s2, s3], false, &HashSet::new(), None);
+        assert!(
+            report.contains("| with persistent state updated | 2 | 66.7% |"),
+            "report:\n{}",
+            report
+        );
+    }
+
+    #[test]
+    fn persistent_state_updated_breakdown() {
+        let mut s1 = make_summary("run-1", vec![]);
+        s1.persistent_state_updated = true;
+        s1.success = true;
+        let mut s2 = make_summary("run-2", vec![]);
+        s2.persistent_state_updated = true;
+        s2.success = false;
+        let mut s3 = make_summary("run-3", vec![]);
+        s3.persistent_state_updated = false;
+        s3.success = true;
+        let mut s4 = make_summary("run-4", vec![]);
+        s4.persistent_state_updated = false;
+        s4.success = false;
+
+        let report = build_report(&[s1, s2, s3, s4], false, &HashSet::new(), None);
+        // true: 2 traces, 1 success = 50.0%
+        assert!(
+            report.contains("| true | 2 | 1 | 50.0% |"),
+            "report:\n{}",
+            report
+        );
+        // false: 2 traces, 1 success = 50.0%
+        assert!(
+            report.contains("| false | 2 | 1 | 50.0% |"),
+            "report:\n{}",
+            report
+        );
+    }
+
+    #[test]
+    fn missing_persistent_state_updated_defaults_to_false() {
+        // 模拟旧 trace：persistent_state_updated 字段缺失，serde(default) 应设为 false
+        let trace = AgentTrace {
+            trace_version: "agent_trace_v1".to_string(),
+            run_id: "run-old".to_string(),
+            started_at: "2026-04-18T00:00:00Z".to_string(),
+            finished_at: None,
+            duration_ms: Some(100),
+            success: true,
+            error: None,
+            final_output: None,
+            user_input: "test".to_string(),
+            user_input_chars: 4,
+            step_count: 1,
+            llm_fallback_reason: None,
+            recovery_action: None,
+            recovery_result: None,
+            memory_retrieved_count: 0,
+            memory_hit_count: 0,
+            memory_dropped_count: 0,
+            memory_total_chars: 0,
+            memory_ids: vec![],
+            retriever_name: String::new(),
+            retrieval_candidate_count: 0,
+            retrieval_hit_count: 0,
+            retrieval_latency_ms: 0,
+            retrieval_mode: String::new(),
+            retrieval_fallback_reason: None,
+            retrieval_scores_present: false,
+            persistent_state_present: false,
+            persistent_state_source: None,
+            persistent_state_updated: false, // 显式 false 模拟缺失字段的默认值
+            context_pack_present: false,
+            context_pack_drop_reasons: vec![],
+            context_pack_section_count: 0,
+            context_pack_total_chars: 0,
+            decisions: vec![],
+            failures: vec![],
+            recovery_attempts: vec![],
+            llm_calls: vec![],
+            tool_calls: vec![],
+        };
+
+        let summary = summarize_trace(&trace, &HashSet::new());
+        assert!(!summary.persistent_state_updated);
+        assert!(!summary.is_interesting); // 无 failures 等，且 state_updated=false
+
+        let report = build_report(&[summary], false, &HashSet::new(), None);
+        assert!(
+            report.contains("| with persistent state updated | 0 | 0.0% |"),
+            "report:\n{}",
+            report
+        );
+        // Breakdown 中 true=0, false=1
+        assert!(
+            report.contains("| true | 0 | 0 | 0.0% |"),
+            "report:\n{}",
+            report
+        );
+        assert!(
+            report.contains("| false | 1 | 1 | 100.0% |"),
+            "report:\n{}",
+            report
+        );
     }
 
     #[test]

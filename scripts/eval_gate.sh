@@ -13,6 +13,11 @@ echo "  before: $BEFORE"
 echo "  after:  $AFTER"
 echo "  strict: $STRICT"
 
+# Gate 输出协议（按顺序）：
+#   OVERALL=PASS|WARN|FAIL|N/A
+#   STATE_UPDATED=...（人类可读，可能含 N/A）
+#   STATE_UPDATED_RAW=...（机器可解析，缺失为 NA）
+#   REASONS=...（仅当有理由时输出）
 ARGS=(
   --compare-before "$BEFORE"
   --compare-after "$AFTER"

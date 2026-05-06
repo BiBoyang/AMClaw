@@ -1,6 +1,9 @@
 use super::{log_chat_error, log_chat_info, log_chat_warn, summarize_text_for_log};
-use crate::agent_core::AgentRunContext;
+use crate::agent_core::{
+    merge_string_arrays_with_runtime_reserve, AgentRunContext, RuntimeSessionStateSnapshot,
+};
 use crate::session_router::FlushReason;
+use crate::task_store::UserSessionStateRecord;
 use chrono::Utc;
 use serde_json::json;
 
@@ -177,14 +180,18 @@ impl super::WeChatBot {
             .with_context_token_present(self.context_token_map.contains_key(user_id))
             .with_user_session_state(session_state);
 
-        let (reply, run_id, trace_json_path) =
+        let (reply, run_id, trace_json_path, runtime_session_state) =
             self.generate_reply(user_id, merged_text, message_ids, reason, context);
 
-        // C2: agent 完成后刷新 updated_at（最小回写，不推导深状态）
+        // C2: agent 完成后按保守策略 merge runtime session state 并回写持久层
         let mut state_updated = false;
         match self.task_store.load_user_session_state(user_id) {
             Ok(Some(state)) => {
                 let mut updated = state.clone();
+                if let Some(runtime) = runtime_session_state.as_ref() {
+                    state_updated =
+                        merge_runtime_session_state_into_persistent(&mut updated, runtime);
+                }
                 updated.updated_at = Utc::now().to_rfc3339();
                 if let Err(err) = self.task_store.upsert_user_session_state(&updated) {
                     log_chat_warn(
@@ -195,13 +202,13 @@ impl super::WeChatBot {
                             ("detail", json!(err.to_string())),
                         ],
                     );
+                    state_updated = false;
                 } else {
-                    state_updated = true;
                     log_chat_info(
                         "session_state_refreshed",
                         vec![
                             ("user_id", json!(user_id)),
-                            ("state_updated", json!(true)),
+                            ("state_updated", json!(state_updated)),
                             ("v2_slots_populated", json!(updated.populated_slot_count())),
                         ],
                     );
@@ -622,4 +629,97 @@ impl super::WeChatBot {
             }
         }
     }
+}
+
+/// 按保守策略将 runtime session state 合并到持久化记录中。
+/// 返回 true 表示发生了结构化字段写入（不仅是时间戳刷新）。
+pub(crate) fn merge_runtime_session_state_into_persistent(
+    persistent: &mut UserSessionStateRecord,
+    runtime: &RuntimeSessionStateSnapshot,
+) -> bool {
+    // low-signal 保护：空或低信号时不写脏状态
+    if runtime.is_empty() || runtime.is_low_signal() {
+        return false;
+    }
+
+    let mut dirty = false;
+
+    // goal: 已有持久化 goal 时默认保留；为空时才用 runtime 值
+    let before_goal = persistent.goal.clone();
+    if persistent.goal.is_none() && runtime.goal.is_some() {
+        persistent.goal = runtime.goal.clone();
+    }
+    if persistent.goal != before_goal {
+        dirty = true;
+    }
+
+    // current_subtask: runtime 有值则覆盖写入，空值不覆盖旧值
+    if let Some(ref subtask) = runtime.current_subtask {
+        if persistent.current_subtask.as_deref() != Some(subtask.as_str()) {
+            dirty = true;
+        }
+        persistent.current_subtask = Some(subtask.clone());
+    }
+
+    // next_step: runtime 有值则覆盖写入，空值不覆盖旧值
+    if let Some(ref next) = runtime.next_step {
+        if persistent.next_step.as_deref() != Some(next.as_str()) {
+            dirty = true;
+        }
+        persistent.next_step = Some(next.clone());
+    }
+
+    // constraints: 去重合并，最多 4 条，runtime 至少保底 1 条
+    let persistent_items = persistent.constraints();
+    let merged = merge_string_arrays_with_runtime_reserve(
+        persistent_items.clone(),
+        runtime.constraints.clone(),
+        4,
+        1,
+    );
+    if merged != persistent_items {
+        persistent.set_constraints(merged);
+        dirty = true;
+    }
+
+    // confirmed_facts: 去重合并，最多 5 条，runtime 至少保底 1 条
+    let persistent_items = persistent.confirmed_facts();
+    let merged = merge_string_arrays_with_runtime_reserve(
+        persistent_items.clone(),
+        runtime.confirmed_facts.clone(),
+        5,
+        1,
+    );
+    if merged != persistent_items {
+        persistent.set_confirmed_facts(merged);
+        dirty = true;
+    }
+
+    // done_items: 去重合并，最多 3 条，runtime 不保底
+    let persistent_items = persistent.done_items();
+    let merged = merge_string_arrays_with_runtime_reserve(
+        persistent_items.clone(),
+        runtime.done_items.clone(),
+        3,
+        0,
+    );
+    if merged != persistent_items {
+        persistent.set_done_items(merged);
+        dirty = true;
+    }
+
+    // open_questions: 去重合并，最多 3 条，runtime 至少保底 1 条
+    let persistent_items = persistent.open_questions();
+    let merged = merge_string_arrays_with_runtime_reserve(
+        persistent_items.clone(),
+        runtime.open_questions.clone(),
+        3,
+        1,
+    );
+    if merged != persistent_items {
+        persistent.set_open_questions(merged);
+        dirty = true;
+    }
+
+    dirty
 }

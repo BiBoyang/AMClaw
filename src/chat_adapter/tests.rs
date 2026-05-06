@@ -1418,3 +1418,144 @@ fn mark_seen_store_error_is_fail_closed() {
         "mark_seen 在 store 失败时应返回 false，避免重复处理"
     );
 }
+
+#[test]
+fn runtime_session_state_merge_is_conservative() {
+    use crate::agent_core::{GoalSignal, RuntimeSessionStateSnapshot};
+    use crate::chat_adapter::delivery::merge_runtime_session_state_into_persistent;
+    use crate::task_store::UserSessionStateRecord;
+
+    let mut persistent = UserSessionStateRecord {
+        user_id: "user-a".to_string(),
+        last_user_intent: Some("旧意图".to_string()),
+        current_task: Some("task-old".to_string()),
+        next_step: Some("旧步骤".to_string()),
+        blocked_reason: None,
+        goal: Some("已有目标".to_string()),
+        current_subtask: Some("旧子任务".to_string()),
+        constraints_json: Some(r#"["旧约束"]"#.to_string()),
+        confirmed_facts_json: Some(r#"["旧事实"]"#.to_string()),
+        done_items_json: Some(r#"["旧完成项"]"#.to_string()),
+        open_questions_json: Some(r#"["旧问题"]"#.to_string()),
+        updated_at: "2026-04-01T00:00:00Z".to_string(),
+    };
+
+    let runtime = RuntimeSessionStateSnapshot {
+        goal: Some("新目标".to_string()),
+        current_subtask: Some("新子任务".to_string()),
+        constraints: vec!["新约束".to_string()],
+        confirmed_facts: vec!["新事实".to_string()],
+        done_items: vec!["新完成项".to_string()],
+        next_step: Some("新步骤".to_string()),
+        open_questions: vec!["新问题".to_string()],
+        goal_signal: GoalSignal::PersistentHigh,
+    };
+
+    assert!(merge_runtime_session_state_into_persistent(
+        &mut persistent,
+        &runtime
+    ));
+    // goal 应保留已有值（已有持久化 goal 时不覆盖）
+    assert_eq!(persistent.goal, Some("已有目标".to_string()));
+    // current_subtask / next_step 应被覆盖
+    assert_eq!(persistent.current_subtask, Some("新子任务".to_string()));
+    assert_eq!(persistent.next_step, Some("新步骤".to_string()));
+    // 数组应合并（包含旧值和新值）
+    assert!(persistent.constraints().contains(&"旧约束".to_string()));
+    assert!(persistent.constraints().contains(&"新约束".to_string()));
+    assert!(persistent.confirmed_facts().contains(&"旧事实".to_string()));
+    assert!(persistent.confirmed_facts().contains(&"新事实".to_string()));
+    // merge helper 只负责结构化字段，不负责更新时间戳
+    assert_eq!(persistent.updated_at, "2026-04-01T00:00:00Z");
+}
+
+#[test]
+fn low_signal_runtime_state_does_not_overwrite_persistent() {
+    use crate::agent_core::{GoalSignal, RuntimeSessionStateSnapshot};
+    use crate::chat_adapter::delivery::merge_runtime_session_state_into_persistent;
+    use crate::task_store::UserSessionStateRecord;
+
+    let mut persistent = UserSessionStateRecord {
+        user_id: "user-a".to_string(),
+        last_user_intent: None,
+        current_task: None,
+        next_step: None,
+        blocked_reason: None,
+        goal: Some("已有目标".to_string()),
+        current_subtask: None,
+        constraints_json: None,
+        confirmed_facts_json: None,
+        done_items_json: None,
+        open_questions_json: None,
+        updated_at: "2026-04-01T00:00:00Z".to_string(),
+    };
+
+    // low-signal runtime state（空 + RuntimeDefault）
+    let runtime = RuntimeSessionStateSnapshot {
+        goal: None,
+        current_subtask: None,
+        constraints: vec![],
+        confirmed_facts: vec![],
+        done_items: vec![],
+        next_step: None,
+        open_questions: vec![],
+        goal_signal: GoalSignal::RuntimeDefault,
+    };
+
+    assert!(!merge_runtime_session_state_into_persistent(
+        &mut persistent,
+        &runtime
+    ));
+    // 持久状态应保持不变
+    assert_eq!(persistent.goal, Some("已有目标".to_string()));
+    assert_eq!(persistent.updated_at, "2026-04-01T00:00:00Z");
+}
+
+#[test]
+fn runtime_session_state_merge_returns_false_when_equivalent() {
+    use crate::agent_core::{GoalSignal, RuntimeSessionStateSnapshot};
+    use crate::chat_adapter::delivery::merge_runtime_session_state_into_persistent;
+    use crate::task_store::UserSessionStateRecord;
+
+    let mut persistent = UserSessionStateRecord {
+        user_id: "user-a".to_string(),
+        last_user_intent: Some("旧意图".to_string()),
+        current_task: None,
+        next_step: Some("下一步".to_string()),
+        blocked_reason: None,
+        goal: Some("响应当前用户请求：整理任务".to_string()),
+        current_subtask: Some("帮我整理任务".to_string()),
+        constraints_json: Some(r#"["时间有限","避免重复"]"#.to_string()),
+        confirmed_facts_json: Some(r#"["已有2条事实"]"#.to_string()),
+        done_items_json: Some(r#"["已完成初步梳理"]"#.to_string()),
+        open_questions_json: Some(r#"["还缺什么"]"#.to_string()),
+        updated_at: "2026-04-01T00:00:00Z".to_string(),
+    };
+
+    let runtime = RuntimeSessionStateSnapshot {
+        goal: Some("响应当前用户请求：整理任务".to_string()),
+        current_subtask: Some("帮我整理任务".to_string()),
+        constraints: vec!["时间有限".to_string(), "避免重复".to_string()],
+        confirmed_facts: vec!["已有2条事实".to_string()],
+        done_items: vec!["已完成初步梳理".to_string()],
+        next_step: Some("下一步".to_string()),
+        open_questions: vec!["还缺什么".to_string()],
+        goal_signal: GoalSignal::PersistentHigh,
+    };
+
+    assert!(!merge_runtime_session_state_into_persistent(
+        &mut persistent,
+        &runtime
+    ));
+    assert_eq!(
+        persistent.goal,
+        Some("响应当前用户请求：整理任务".to_string())
+    );
+    assert_eq!(persistent.current_subtask, Some("帮我整理任务".to_string()));
+    assert_eq!(persistent.next_step, Some("下一步".to_string()));
+    assert_eq!(persistent.constraints(), vec!["时间有限", "避免重复"]);
+    assert_eq!(persistent.confirmed_facts(), vec!["已有2条事实"]);
+    assert_eq!(persistent.done_items(), vec!["已完成初步梳理"]);
+    assert_eq!(persistent.open_questions(), vec!["还缺什么"]);
+    assert_eq!(persistent.updated_at, "2026-04-01T00:00:00Z");
+}

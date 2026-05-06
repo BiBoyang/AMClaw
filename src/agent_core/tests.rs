@@ -3262,3 +3262,32 @@ fn trace_records_recovery_attempt_action_outcome() {
     assert!(!attempt.escalated);
     assert!(attempt.successful);
 }
+
+#[test]
+fn run_with_context_returns_runtime_session_state() {
+    let root = temp_workspace();
+    let agent = AgentCore::with_scripted_decisions(
+        root.clone(),
+        5,
+        vec![
+            super::AgentDecision::CallTool(super::ToolAction::Create {
+                path: "demo/state.txt".to_string(),
+                content: "hello state".to_string(),
+            }),
+            super::AgentDecision::Final("done".to_string()),
+        ],
+    )
+    .expect("初始化 agent 失败");
+
+    let result = agent
+        .run_with_context("创建文件", AgentRunContext::agent_demo())
+        .expect("应成功");
+
+    assert!(
+        result.runtime_session_state.is_some(),
+        "应返回 runtime_session_state"
+    );
+    let state = result.runtime_session_state.unwrap();
+    assert!(state.goal.is_some());
+    assert!(!state.is_empty());
+}

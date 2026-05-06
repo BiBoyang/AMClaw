@@ -366,6 +366,8 @@ pub struct AgentRunResult {
     pub output: String,
     pub run_id: String,
     pub trace_json_path: Option<PathBuf>,
+    /// 最终步推导出的 runtime session state（用于回写持久层）
+    pub(crate) runtime_session_state: Option<RuntimeSessionStateSnapshot>,
 }
 pub struct AgentCore {
     workspace_root: PathBuf,
@@ -628,6 +630,7 @@ impl AgentCore {
             output,
             run_id,
             trace_json_path,
+            runtime_session_state: trace.final_runtime_session_state.clone(),
         })
     }
 
@@ -1005,6 +1008,7 @@ impl AgentCore {
         if step == 0 && !runtime_session_state.is_empty() {
             trace.record_session_state_snapshot(runtime_session_state.clone());
         }
+        trace.record_final_runtime_session_state(&runtime_session_state);
         let context_pack = build_context_pack(
             trace,
             user_input,

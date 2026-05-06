@@ -61,6 +61,8 @@ pub(crate) struct AgentRunTrace {
     pub(super) llm_calls: Vec<LlmCallTrace>,
     pub(super) tool_calls: Vec<ToolCallTrace>,
     pub(super) session_state_snapshot: Option<RuntimeSessionStateSnapshot>,
+    /// 最终步的 runtime session state（用于回写持久层）
+    pub(super) final_runtime_session_state: Option<RuntimeSessionStateSnapshot>,
     pub(crate) memory_hit_count: usize, // 实际注入 prompt 的记忆条数（= injected）
     pub(crate) memory_injected_count: usize, // 兼容字段：与 memory_hit_count 同值
     pub(crate) memory_retrieved_count: usize, // 从 DB 取出的候选记忆条数
@@ -421,6 +423,7 @@ impl AgentRunTrace {
             llm_calls: Vec::new(),
             tool_calls: Vec::new(),
             session_state_snapshot: None,
+            final_runtime_session_state: None,
             trace_dir_root: workspace_root.join("data").join("agent_traces"),
             memory_hit_count: 0,
             memory_injected_count: 0,
@@ -589,6 +592,13 @@ impl AgentRunTrace {
 
     pub(crate) fn record_session_state_snapshot(&mut self, snapshot: RuntimeSessionStateSnapshot) {
         self.session_state_snapshot = Some(snapshot);
+    }
+
+    pub(crate) fn record_final_runtime_session_state(
+        &mut self,
+        state: &RuntimeSessionStateSnapshot,
+    ) {
+        self.final_runtime_session_state = Some(state.clone());
     }
 
     pub(crate) fn record_observation(&mut self, observation: &AgentObservation) {

@@ -2,7 +2,7 @@ use super::{
     is_agent_command, is_llm_auth_error, log_chat_error, log_chat_info, log_chat_warn,
     sanitize_report_markdown_for_wechat, summarize_text_for_log,
 };
-use crate::agent_core::AgentRunContext;
+use crate::agent_core::{AgentRunContext, RuntimeSessionStateSnapshot};
 use crate::command_router;
 use crate::session_router::FlushReason;
 use crate::task_store::{MarkTaskArchivedInput, TaskStore};
@@ -508,10 +508,20 @@ impl super::WeChatBot {
         message_ids: &[String],
         reason: FlushReason,
         trace_context: AgentRunContext,
-    ) -> (String, Option<String>, Option<std::path::PathBuf>) {
+    ) -> (
+        String,
+        Option<String>,
+        Option<std::path::PathBuf>,
+        Option<RuntimeSessionStateSnapshot>,
+    ) {
         match self.agent_core.run_with_context(user_text, trace_context) {
             Ok(result) => {
-                return (result.output, Some(result.run_id), result.trace_json_path);
+                return (
+                    result.output,
+                    Some(result.run_id),
+                    result.trace_json_path,
+                    result.runtime_session_state,
+                );
             }
             Err(err) => {
                 let err_text = err.to_string();
@@ -527,7 +537,7 @@ impl super::WeChatBot {
                             ("detail", json!(err_text.clone())),
                         ],
                     );
-                    return (format!("执行失败: {err_text}"), None, None);
+                    return (format!("执行失败: {err_text}"), None, None, None);
                 }
                 if is_llm_auth_error(&err_text) {
                     log_chat_warn(
@@ -544,6 +554,7 @@ impl super::WeChatBot {
                     return (
                         "LLM 鉴权失败（401），请检查 MOONSHOT_* / DEEPSEEK_* / OPENAI_* 配置"
                             .to_string(),
+                        None,
                         None,
                         None,
                     );
@@ -566,12 +577,14 @@ impl super::WeChatBot {
                 "你好！我是 iLink Bot Demo（Rust版），有什么可以帮你的？".to_string(),
                 None,
                 None,
+                None,
             );
         }
         if user_text == "时间" || user_text == "几点了" {
             let now = Utc::now().with_timezone(&Shanghai);
             return (
                 format!("现在是 {}", now.format("%Y-%m-%d %H:%M:%S")),
+                None,
                 None,
                 None,
             );
@@ -582,9 +595,10 @@ impl super::WeChatBot {
                     .to_string(),
                 None,
                 None,
+                None,
             );
         }
-        (format!("Echo: {user_text}"), None, None)
+        (format!("Echo: {user_text}"), None, None, None)
     }
 }
 

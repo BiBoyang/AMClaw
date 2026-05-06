@@ -1318,6 +1318,38 @@ fn fmt_optional_rate_delta(before: Option<f64>, after: Option<f64>) -> String {
     }
 }
 
+fn build_state_updated_gate_lines(
+    before_count: usize,
+    after_count: usize,
+    before_rate: Option<f64>,
+    after_rate: Option<f64>,
+) -> (String, String) {
+    let human_readable = format!(
+        "STATE_UPDATED=before_count={} after_count={} before_rate={} after_rate={} delta={}",
+        before_count,
+        after_count,
+        fmt_optional_rate(before_rate),
+        fmt_optional_rate(after_rate),
+        fmt_optional_rate_delta(before_rate, after_rate)
+    );
+    let machine = format!(
+        "STATE_UPDATED_RAW=bc={}|ac={}|br={}|ar={}|d={}",
+        before_count,
+        after_count,
+        before_rate
+            .map(|v| format!("{:.1}", v))
+            .unwrap_or_else(|| "NA".to_string()),
+        after_rate
+            .map(|v| format!("{:.1}", v))
+            .unwrap_or_else(|| "NA".to_string()),
+        match (before_rate, after_rate) {
+            (Some(b), Some(a)) => format!("{:.1}", a - b),
+            _ => "NA".to_string(),
+        }
+    );
+    (human_readable, machine)
+}
+
 /// 计算 latency 的 p50/p95（毫秒）。
 /// 输入为空时返回 (0, 0)。
 fn latency_quantiles(values: &[u128]) -> (u128, u128) {
@@ -2328,17 +2360,14 @@ fn run_compare_mode(
     // Gate mode:精简输出
     if gate_mode {
         println!("OVERALL={}", verdict_str(overall));
-        println!(
-            "STATE_UPDATED=before_count={} after_count={} before_rate={} after_rate={} delta={}",
+        let (state_updated_human, state_updated_machine) = build_state_updated_gate_lines(
             before.persistent_state_updated_count,
             after.persistent_state_updated_count,
-            fmt_optional_rate(before.persistent_state_updated_rate),
-            fmt_optional_rate(after.persistent_state_updated_rate),
-            fmt_optional_rate_delta(
-                before.persistent_state_updated_rate,
-                after.persistent_state_updated_rate
-            )
+            before.persistent_state_updated_rate,
+            after.persistent_state_updated_rate,
         );
+        println!("{}", state_updated_human);
+        println!("{}", state_updated_machine);
         if !reasons.is_empty() {
             println!("REASONS={}", reasons.join("; "));
         }
@@ -3350,6 +3379,31 @@ mod tests {
             "report:\n{}",
             report
         );
+    }
+
+    #[test]
+    fn state_updated_gate_lines_both_present() {
+        let (human, machine) = build_state_updated_gate_lines(2, 5, Some(10.0), Some(22.5));
+        assert!(human.contains("STATE_UPDATED=before_count=2 after_count=5"));
+        assert!(human.contains("before_rate=10.0% after_rate=22.5% delta=+12.5pp"));
+        assert_eq!(
+            machine,
+            "STATE_UPDATED_RAW=bc=2|ac=5|br=10.0|ar=22.5|d=12.5"
+        );
+    }
+
+    #[test]
+    fn state_updated_gate_lines_one_side_missing() {
+        let (human, machine) = build_state_updated_gate_lines(2, 5, None, Some(20.0));
+        assert!(human.contains("before_rate=N/A after_rate=20.0% delta=N/A"));
+        assert_eq!(machine, "STATE_UPDATED_RAW=bc=2|ac=5|br=NA|ar=20.0|d=NA");
+    }
+
+    #[test]
+    fn state_updated_gate_lines_both_missing() {
+        let (human, machine) = build_state_updated_gate_lines(0, 0, None, None);
+        assert!(human.contains("before_rate=N/A after_rate=N/A delta=N/A"));
+        assert_eq!(machine, "STATE_UPDATED_RAW=bc=0|ac=0|br=NA|ar=NA|d=NA");
     }
 
     #[test]

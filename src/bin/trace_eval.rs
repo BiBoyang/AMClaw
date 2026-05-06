@@ -1304,6 +1304,20 @@ fn pct(part: usize, total: usize) -> f64 {
     }
 }
 
+fn fmt_optional_rate(rate: Option<f64>) -> String {
+    match rate {
+        Some(v) => format!("{:.1}%", v),
+        None => "N/A".to_string(),
+    }
+}
+
+fn fmt_optional_rate_delta(before: Option<f64>, after: Option<f64>) -> String {
+    match (before, after) {
+        (Some(b), Some(a)) => format!("{:+.1}pp", a - b),
+        _ => "N/A".to_string(),
+    }
+}
+
 /// 计算 latency 的 p50/p95（毫秒）。
 /// 输入为空时返回 (0, 0)。
 fn latency_quantiles(values: &[u128]) -> (u128, u128) {
@@ -2055,8 +2069,6 @@ fn build_compare_report(
     lines.push(String::new());
     lines.push("| metric | before | after | delta |".to_string());
     lines.push("| --- | ---: | ---: | ---: |".to_string());
-    let state_updated_delta = after.persistent_state_updated_rate.unwrap_or(0.0)
-        - before.persistent_state_updated_rate.unwrap_or(0.0);
     lines.push(format!(
         "| count | {} | {} | {:+} |",
         before.persistent_state_updated_count,
@@ -2065,10 +2077,13 @@ fn build_compare_report(
             - before.persistent_state_updated_count as isize
     ));
     lines.push(format!(
-        "| rate | {:.1}% | {:.1}% | {:+.1}pp |",
-        before.persistent_state_updated_rate.unwrap_or(0.0),
-        after.persistent_state_updated_rate.unwrap_or(0.0),
-        state_updated_delta
+        "| rate | {} | {} | {} |",
+        fmt_optional_rate(before.persistent_state_updated_rate),
+        fmt_optional_rate(after.persistent_state_updated_rate),
+        fmt_optional_rate_delta(
+            before.persistent_state_updated_rate,
+            after.persistent_state_updated_rate
+        )
     ));
 
     // Reasons
@@ -2313,15 +2328,16 @@ fn run_compare_mode(
     // Gate mode:精简输出
     if gate_mode {
         println!("OVERALL={}", verdict_str(overall));
-        let state_updated_delta = after.persistent_state_updated_rate.unwrap_or(0.0)
-            - before.persistent_state_updated_rate.unwrap_or(0.0);
         println!(
-            "STATE_UPDATED=before_count={} after_count={} before_rate={:.1}% after_rate={:.1}% delta={:+.1}pp",
+            "STATE_UPDATED=before_count={} after_count={} before_rate={} after_rate={} delta={}",
             before.persistent_state_updated_count,
             after.persistent_state_updated_count,
-            before.persistent_state_updated_rate.unwrap_or(0.0),
-            after.persistent_state_updated_rate.unwrap_or(0.0),
-            state_updated_delta
+            fmt_optional_rate(before.persistent_state_updated_rate),
+            fmt_optional_rate(after.persistent_state_updated_rate),
+            fmt_optional_rate_delta(
+                before.persistent_state_updated_rate,
+                after.persistent_state_updated_rate
+            )
         );
         if !reasons.is_empty() {
             println!("REASONS={}", reasons.join("; "));
@@ -3277,7 +3293,32 @@ mod tests {
         );
         assert!(report.contains("Persistent State Update Trend"));
         assert!(report.contains("| count | 0 | 0 | +0 |"));
-        assert!(report.contains("| rate | 0.0% | 0.0% | +0.0pp |"));
+        assert!(report.contains("| rate | N/A | N/A | N/A |"));
+    }
+
+    #[test]
+    fn state_updated_one_side_missing_rate_shows_na() {
+        let before = CompareMetrics {
+            total_runs: 20,
+            persistent_state_updated_count: 2,
+            persistent_state_updated_rate: None,
+            ..Default::default()
+        };
+        let after = CompareMetrics {
+            total_runs: 25,
+            persistent_state_updated_count: 5,
+            persistent_state_updated_rate: Some(20.0),
+            ..Default::default()
+        };
+
+        let report = build_compare_report(&before, &after, &[], &[], Verdict::Pass, &[]);
+
+        // before rate 缺失 → N/A；after rate 存在 → 20.0%
+        assert!(
+            report.contains("| rate | N/A | 20.0% | N/A |"),
+            "report:\n{}",
+            report
+        );
     }
 
     #[test]

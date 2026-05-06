@@ -1342,6 +1342,9 @@ struct CompareMetrics {
     total_runs: usize,
     baseline_run_ids: usize,
     baseline_hits: usize,
+    // Persistent state update (observability, not gate)
+    persistent_state_updated_count: usize,
+    persistent_state_updated_rate: Option<f64>,
     // Denominator info (for scenario B)
     recovery_attempt_count: usize,
     total_tool_calls: usize,
@@ -1460,6 +1463,11 @@ fn parse_report(content: &str) -> Result<CompareMetrics, String> {
                         "with context pack dropped" => metrics.context_drop_rate = ratio,
                         "with session state" => metrics.state_present_rate = ratio,
                         "with memory injected" => metrics.memory_injected_rate = ratio,
+                        "with persistent state updated" => {
+                            metrics.persistent_state_updated_rate = ratio;
+                            metrics.persistent_state_updated_count =
+                                extract_usize_from_cell(&row[1]);
+                        }
                         _ => {}
                     }
                 }
@@ -2041,6 +2049,28 @@ fn build_compare_report(
         }
     }
 
+    // Persistent State Update Trend (observability only, not gate)
+    lines.push(String::new());
+    lines.push("## Persistent State Update Trend".to_string());
+    lines.push(String::new());
+    lines.push("| metric | before | after | delta |".to_string());
+    lines.push("| --- | ---: | ---: | ---: |".to_string());
+    let state_updated_delta = after.persistent_state_updated_rate.unwrap_or(0.0)
+        - before.persistent_state_updated_rate.unwrap_or(0.0);
+    lines.push(format!(
+        "| count | {} | {} | {:+} |",
+        before.persistent_state_updated_count,
+        after.persistent_state_updated_count,
+        after.persistent_state_updated_count as isize
+            - before.persistent_state_updated_count as isize
+    ));
+    lines.push(format!(
+        "| rate | {:.1}% | {:.1}% | {:+.1}pp |",
+        before.persistent_state_updated_rate.unwrap_or(0.0),
+        after.persistent_state_updated_rate.unwrap_or(0.0),
+        state_updated_delta
+    ));
+
     // Reasons
     lines.push(String::new());
     lines.push("## 判定依据".to_string());
@@ -2283,6 +2313,16 @@ fn run_compare_mode(
     // Gate mode:精简输出
     if gate_mode {
         println!("OVERALL={}", verdict_str(overall));
+        let state_updated_delta = after.persistent_state_updated_rate.unwrap_or(0.0)
+            - before.persistent_state_updated_rate.unwrap_or(0.0);
+        println!(
+            "STATE_UPDATED=before_count={} after_count={} before_rate={:.1}% after_rate={:.1}% delta={:+.1}pp",
+            before.persistent_state_updated_count,
+            after.persistent_state_updated_count,
+            before.persistent_state_updated_rate.unwrap_or(0.0),
+            after.persistent_state_updated_rate.unwrap_or(0.0),
+            state_updated_delta
+        );
         if !reasons.is_empty() {
             println!("REASONS={}", reasons.join("; "));
         }
@@ -2479,6 +2519,10 @@ mod tests {
         assert!((metrics.context_drop_rate.unwrap() - 15.0).abs() < 0.01);
         assert!((metrics.state_present_rate.unwrap() - 15.0).abs() < 0.01);
         assert!((metrics.memory_injected_rate.unwrap() - 20.0).abs() < 0.01);
+
+        // Persistent state updated
+        assert_eq!(metrics.persistent_state_updated_count, 2);
+        assert!((metrics.persistent_state_updated_rate.unwrap() - 10.0).abs() < 0.01);
 
         // Derived: unknown_failure = 1 / 20 * 100 = 5.0%
         assert!((metrics.unknown_failure_rate.unwrap() - 5.0).abs() < 0.01);
@@ -3022,6 +3066,8 @@ mod tests {
             baseline_hits: 20,
             recovery_attempt_count: 5,
             total_tool_calls: 30,
+            persistent_state_updated_count: 2,
+            persistent_state_updated_rate: Some(10.0),
             failure_type_counts: HashMap::new(),
             missing_fields: Vec::new(),
             report_date: "2026-04-17".to_string(),
@@ -3043,6 +3089,8 @@ mod tests {
             baseline_hits: 19,
             recovery_attempt_count: 6,
             total_tool_calls: 35,
+            persistent_state_updated_count: 5,
+            persistent_state_updated_rate: Some(22.7),
             failure_type_counts: HashMap::new(),
             missing_fields: Vec::new(),
             report_date: "2026-04-18".to_string(),
@@ -3165,6 +3213,24 @@ mod tests {
         assert!(report.contains("2026-04-17"));
         assert!(report.contains("2026-04-18"));
 
+        // Persistent State Update Trend section
+        assert!(
+            report.contains("## Persistent State Update Trend"),
+            "report:\n{}",
+            report
+        );
+        assert!(
+            report.contains("| count | 2 | 5 | +3 |"),
+            "report:\n{}",
+            report
+        );
+        // rate delta = 22.7 - 10.0 = +12.7pp
+        assert!(
+            report.contains("| rate | 10.0% | 22.7% | +12.7pp |"),
+            "report:\n{}",
+            report
+        );
+
         // Verify some verdicts
         let success_v = core_verdicts
             .iter()
@@ -3189,6 +3255,60 @@ mod tests {
             .find(|v| v.metric == "avg_step_count")
             .unwrap();
         assert_eq!(step_v.verdict, Verdict::Warn); // increase 0.5 step = WARN
+    }
+
+    #[test]
+    fn missing_state_updated_field_compatible() {
+        // 老报告不含 with persistent state updated 行，应兼容不崩
+        let old_report = "# Trace Evaluation Report\n\n- generated: 2026-04-18T00:00:00Z\n- total traces: 10\n\n## Summary Statistics\n\n| metric | count | ratio |\n| --- | ---: | ---: |\n| total | 10 | 100% |\n| success | 8 | 80.0% |\n| with memory injected | 2 | 20.0% |\n| with memory dropped | 1 | 10.0% |\n| with session state | 1 | 10.0% |\n| with context pack dropped | 1 | 10.0% |\n| with llm fallback | 2 | 20.0% |\n| with failures | 2 | 20.0% |\n".to_string();
+
+        let metrics = parse_report(&old_report).unwrap();
+        assert_eq!(metrics.persistent_state_updated_count, 0);
+        assert!(metrics.persistent_state_updated_rate.is_none());
+
+        // 用该 metrics 参与 compare report 生成不应 panic
+        let report = build_compare_report(
+            &metrics,
+            &metrics,
+            &[],
+            &[],
+            Verdict::Pass,
+            &["全 PASS".to_string()],
+        );
+        assert!(report.contains("Persistent State Update Trend"));
+        assert!(report.contains("| count | 0 | 0 | +0 |"));
+        assert!(report.contains("| rate | 0.0% | 0.0% | +0.0pp |"));
+    }
+
+    #[test]
+    fn state_updated_delta_computation_correct() {
+        let before = CompareMetrics {
+            total_runs: 20,
+            persistent_state_updated_count: 2,
+            persistent_state_updated_rate: Some(10.0),
+            ..Default::default()
+        };
+        let after = CompareMetrics {
+            total_runs: 25,
+            persistent_state_updated_count: 8,
+            persistent_state_updated_rate: Some(32.0),
+            ..Default::default()
+        };
+
+        let report = build_compare_report(&before, &after, &[], &[], Verdict::Pass, &[]);
+
+        // count delta = 8 - 2 = +6
+        assert!(
+            report.contains("| count | 2 | 8 | +6 |"),
+            "report:\n{}",
+            report
+        );
+        // rate delta = 32.0 - 10.0 = +22.0pp
+        assert!(
+            report.contains("| rate | 10.0% | 32.0% | +22.0pp |"),
+            "report:\n{}",
+            report
+        );
     }
 
     #[test]

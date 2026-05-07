@@ -1,4 +1,4 @@
-.PHONY: trace-compare eval-gate eval-gate-strict
+.PHONY: trace-compare eval-gate eval-gate-strict eval-gate-json
 
 BEFORE ?= notes/agent-eval/baselines/TRACE-EVAL-BASELINE-2026-04-18.md
 AFTER ?= notes/agent-eval/reports/TRACE-EVAL-REPORT.md

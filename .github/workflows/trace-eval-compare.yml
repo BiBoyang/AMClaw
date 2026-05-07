@@ -37,7 +37,11 @@ jobs:
       - name: Soft gate with --gate-json
         continue-on-error: true
         run: |
+          set +e
           GATE_JSON=1 ./scripts/eval_gate.sh > trace-gate.json
+          GATE_EXIT=$?
+          set -e
+
           OVERALL=$(jq -r '.overall' trace-gate.json)
           REASONS=$(jq -r '.reasons | join(", ")' trace-gate.json)
           BC=$(jq -r '.state_updated.before_count' trace-gate.json)
@@ -63,6 +67,8 @@ jobs:
           elif [ "$OVERALL" = "WARN" ]; then
             echo "::warning::trace eval gate verdict is WARN. reasons: ${REASONS}"
           fi
+
+          exit 0
 
       - name: Upload compare report artifact
         if: always()

@@ -7,6 +7,9 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT" || exit 1
 
+# 确保测试在一致环境下运行，不受 CI 环境变量影响
+unset GITHUB_STEP_SUMMARY
+
 FAILED=0
 PASSED=0
 

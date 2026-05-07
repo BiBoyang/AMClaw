@@ -31,6 +31,9 @@ jobs:
       - name: Trace eval unit tests
         run: cargo test --bin trace_eval
 
+      - name: Lint shell scripts
+        run: make lint-scripts
+
       - name: Script regression tests
         run: bash scripts/tests/test_trace_soft_gate.sh
 

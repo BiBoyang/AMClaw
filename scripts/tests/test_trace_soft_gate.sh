@@ -5,7 +5,7 @@ set -uo pipefail
 # 本地运行：bash scripts/tests/test_trace_soft_gate.sh
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-cd "$ROOT"
+cd "$ROOT" || exit 1
 
 FAILED=0
 PASSED=0

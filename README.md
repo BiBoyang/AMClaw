@@ -316,11 +316,12 @@ cargo run --bin trace_eval
 - 支持 `--date`、`--dir`、`--output`、`--baseline`、`--no-baseline`、`--only-interesting` 参数。
 - 支持 `--compare-before <path>`、`--compare-after <path>`、`--compare-output <path>` 对比两份已有报告，输出 PASS/WARN/FAIL 结论。缺少 `--compare-before` 或 `--compare-after` 时报错退出。
 - Gate 模式：`--gate` 输出精简结果并返回退出码（PASS=0, FAIL=1, N/A=2；WARN 默认=0，`--gate-strict` 下 WARN=2）。可用作 CI / 收尾阶段的自动化门禁。规范见 `notes/agent-eval/specs/EVAL-GATE-SPEC-2026-04-20.md`。
-  - 输出协议（按顺序）：
+  - 文本输出协议（按顺序，`--gate`，默认）：
     - `OVERALL=PASS|WARN|FAIL|N/A`
     - `STATE_UPDATED=before_count=... after_count=... before_rate=... after_rate=... delta=...`（人类可读，rate/delta 可能为 `N/A`）
     - `STATE_UPDATED_RAW=bc=...|ac=...|br=...|ar=...|d=...`（机器可解析，缺失值为 `NA`，无单位）
     - `REASONS=...`（仅当有理由时输出）
+  - JSON 输出协议（`--gate --gate-json`）：输出单条 JSON，包含结构化字段，适合程序直接解析。rate/delta 单位为**百分点（0–100）**，缺失时值为 `null`。
 - 推荐收尾命令：
   - `make trace-compare`：生成最新报告并输出对比报告
   - `make eval-gate`：执行宽松门禁（仅 FAIL 阻断）

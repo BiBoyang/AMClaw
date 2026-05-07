@@ -18,6 +18,7 @@ echo "  strict: $STRICT"
 #   STATE_UPDATED=...（人类可读，可能含 N/A）
 #   STATE_UPDATED_RAW=...（机器可解析，缺失为 NA）
 #   REASONS=...（仅当有理由时输出）
+# 或 JSON 单条输出（当 GATE_JSON=1 时）
 ARGS=(
   --compare-before "$BEFORE"
   --compare-after "$AFTER"
@@ -26,6 +27,10 @@ ARGS=(
 
 if [[ "$STRICT" == "1" ]]; then
   ARGS+=(--gate-strict)
+fi
+
+if [[ "${GATE_JSON:-0}" == "1" ]]; then
+  ARGS+=(--gate-json)
 fi
 
 cargo run --bin trace_eval -- "${ARGS[@]}"

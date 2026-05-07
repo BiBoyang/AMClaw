@@ -66,7 +66,7 @@ v1.0 — 2026-04-20
 # 标准 compare 模式（生成完整报告）
 cargo run --bin trace_eval -- --compare-before notes/reports/BEFORE.md --compare-after notes/reports/AFTER.md
 
-# Gate 模式（精简输出 + 退出码）
+# Gate 模式（精简文本输出 + 退出码）
 cargo run --bin trace_eval -- --compare-before notes/reports/BEFORE.md --compare-after notes/reports/AFTER.md --gate
 # 输出示例：
 # OVERALL=PASS
@@ -77,10 +77,16 @@ cargo run --bin trace_eval -- --compare-before notes/reports/BEFORE.md --compare
 # Gate strict 模式（WARN 也返回非0）
 cargo run --bin trace_eval -- --compare-before BEFORE.md --compare-after AFTER.md --gate-strict
 # WARN 时退出码 = 2
+
+# Gate JSON 模式（单条 JSON 输出，适合程序解析）
+cargo run --bin trace_eval -- --compare-before BEFORE.md --compare-after AFTER.md --gate --gate-json
+# 输出示例：
+# {"overall":"PASS","reasons":["全部核心指标 PASS"],"state_updated":{"before_count":2,"after_count":5,"before_rate":10.0,"after_rate":22.5,"delta":12.5}}
 ```
 
 - `STATE_UPDATED` 为人类可读格式（可能出现 `N/A`）。
 - `STATE_UPDATED_RAW` 为机器可解析格式（缺失字段统一 `NA`，数值无单位）。
+- `--gate-json` 输出单条 JSON，`rate`/`delta` 单位为**百分点（0–100）**，缺失时值为 `null`，适合 CI 脚本直接 `jq` 解析。
 
 ## 何时用 --gate-strict
 

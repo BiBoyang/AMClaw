@@ -214,6 +214,7 @@ fn main() {
     let mut compare_output = None;
     let mut gate_mode = false;
     let mut gate_strict = false;
+    let mut gate_json = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -265,6 +266,9 @@ fn main() {
                 gate_mode = true;
                 gate_strict = true;
             }
+            "--gate-json" => {
+                gate_json = true;
+            }
             _ => {}
         }
     }
@@ -292,6 +296,7 @@ fn main() {
             compare_output.as_ref(),
             gate_mode,
             gate_strict,
+            gate_json,
         );
         return;
     }
@@ -1372,6 +1377,48 @@ fn build_gate_output_lines(
     lines
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct GateJsonOutput {
+    overall: String,
+    reasons: Vec<String>,
+    state_updated: GateJsonStateUpdated,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GateJsonStateUpdated {
+    before_count: usize,
+    after_count: usize,
+    before_rate: Option<f64>,
+    after_rate: Option<f64>,
+    delta: Option<f64>,
+}
+
+fn build_gate_json_output(
+    overall: Verdict,
+    reasons: &[String],
+    before: &CompareMetrics,
+    after: &CompareMetrics,
+) -> GateJsonOutput {
+    let delta = match (
+        before.persistent_state_updated_rate,
+        after.persistent_state_updated_rate,
+    ) {
+        (Some(b), Some(a)) => Some(a - b),
+        _ => None,
+    };
+    GateJsonOutput {
+        overall: verdict_str(overall).to_string(),
+        reasons: reasons.to_vec(),
+        state_updated: GateJsonStateUpdated {
+            before_count: before.persistent_state_updated_count,
+            after_count: after.persistent_state_updated_count,
+            before_rate: before.persistent_state_updated_rate,
+            after_rate: after.persistent_state_updated_rate,
+            delta,
+        },
+    }
+}
+
 /// 计算 latency 的 p50/p95（毫秒）。
 /// 输入为空时返回 (0, 0)。
 fn latency_quantiles(values: &[u128]) -> (u128, u128) {
@@ -2223,6 +2270,7 @@ fn run_compare_mode(
     output_path: Option<&PathBuf>,
     gate_mode: bool,
     gate_strict: bool,
+    gate_json: bool,
 ) {
     let before_content = match fs::read_to_string(before_path) {
         Ok(c) => c,
@@ -2381,8 +2429,16 @@ fn run_compare_mode(
 
     // Gate mode:精简输出
     if gate_mode {
-        for line in build_gate_output_lines(overall, &reasons, &before, &after) {
-            println!("{}", line);
+        if gate_json {
+            let output = build_gate_json_output(overall, &reasons, &before, &after);
+            println!(
+                "{}",
+                serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
+            );
+        } else {
+            for line in build_gate_output_lines(overall, &reasons, &before, &after) {
+                println!("{}", line);
+            }
         }
         match overall {
             Verdict::Pass => std::process::exit(0),
@@ -3480,6 +3536,72 @@ mod tests {
         assert!(lines[2].contains("br=NA"));
         assert!(lines[2].contains("ar=NA"));
         assert!(lines[2].contains("d=NA"));
+    }
+
+    #[test]
+    fn gate_json_with_reasons() {
+        let before = CompareMetrics {
+            persistent_state_updated_count: 2,
+            persistent_state_updated_rate: Some(10.0),
+            ..Default::default()
+        };
+        let after = CompareMetrics {
+            persistent_state_updated_count: 5,
+            persistent_state_updated_rate: Some(22.5),
+            ..Default::default()
+        };
+        let output = build_gate_json_output(
+            Verdict::Pass,
+            &["全部核心指标 PASS".to_string()],
+            &before,
+            &after,
+        );
+        assert_eq!(output.overall, "PASS");
+        assert_eq!(output.reasons, vec!["全部核心指标 PASS"]);
+        assert_eq!(output.state_updated.before_count, 2);
+        assert_eq!(output.state_updated.after_count, 5);
+        assert!((output.state_updated.before_rate.unwrap() - 10.0).abs() < 0.01);
+        assert!((output.state_updated.after_rate.unwrap() - 22.5).abs() < 0.01);
+        assert!((output.state_updated.delta.unwrap() - 12.5).abs() < 0.01);
+
+        let json_str = serde_json::to_string(&output).unwrap();
+        assert!(json_str.contains("\"overall\":\"PASS\""));
+        assert!(json_str.contains("\"reasons\":[\"全部核心指标 PASS\"]"));
+    }
+
+    #[test]
+    fn gate_json_without_reasons() {
+        let before = CompareMetrics::default();
+        let after = CompareMetrics::default();
+        let output = build_gate_json_output(Verdict::Pass, &[], &before, &after);
+        assert_eq!(output.overall, "PASS");
+        assert!(output.reasons.is_empty());
+        let json_str = serde_json::to_string(&output).unwrap();
+        assert!(json_str.contains("\"reasons\":[]"));
+    }
+
+    #[test]
+    fn gate_json_state_updated_missing_rate() {
+        let before = CompareMetrics {
+            persistent_state_updated_count: 0,
+            persistent_state_updated_rate: None,
+            ..Default::default()
+        };
+        let after = CompareMetrics {
+            persistent_state_updated_count: 0,
+            persistent_state_updated_rate: None,
+            ..Default::default()
+        };
+        let output = build_gate_json_output(Verdict::Pass, &[], &before, &after);
+        assert!(output.state_updated.before_rate.is_none());
+        assert!(output.state_updated.after_rate.is_none());
+        assert!(output.state_updated.delta.is_none());
+
+        let json_str = serde_json::to_string(&output).unwrap();
+        // JSON 中缺失应为 null，不是 0
+        assert!(json_str.contains("\"before_rate\":null"));
+        assert!(json_str.contains("\"after_rate\":null"));
+        assert!(json_str.contains("\"delta\":null"));
     }
 
     #[test]

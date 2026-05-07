@@ -42,3 +42,47 @@ cd ~/Desktop/AMClaw
 ```
 
 - 默认输出 compare 报告：`notes/agent-eval/reports/TRACE-EVAL-COMPARE.md`
+
+## 评测门禁（本地复现）
+
+### 宽松门禁（仅 FAIL 阻断）
+
+```bash
+make eval-gate
+```
+
+### 严格门禁（WARN/FAIL 都阻断）
+
+```bash
+make eval-gate-strict
+```
+
+### JSON 门禁（适合 CI / 脚本消费）
+
+```bash
+make eval-gate-json
+```
+
+### 本地复现 CI Soft Gate（与 workflow 逻辑一致）
+
+```bash
+set +e
+GATE_JSON=1 ./scripts/eval_gate.sh > trace-gate.json
+GATE_EXIT=$?
+set -e
+./scripts/trace_soft_gate.sh trace-gate.json "$GATE_EXIT"
+```
+
+### 脚本回归测试
+
+```bash
+make test-scripts
+# 或
+bash scripts/tests/test_trace_soft_gate.sh
+```
+
+### 脚本静态检查
+
+```bash
+make lint-scripts
+```

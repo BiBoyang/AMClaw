@@ -327,8 +327,16 @@ cargo run --bin trace_eval
   - `make eval-gate`：执行宽松门禁（仅 FAIL 阻断）
   - `make eval-gate-strict`：执行严格门禁（WARN/FAIL 都阻断）
   - `make eval-gate-json`：输出 JSON 格式门禁结果（适合 CI 或脚本消费）
-  - 本地复现 CI soft gate：`GATE_JSON=1 ./scripts/eval_gate.sh > trace-gate.json && ./scripts/trace_soft_gate.sh trace-gate.json`
-  - 本地跑脚本回归测试：`bash scripts/tests/test_trace_soft_gate.sh` 或 `make test-scripts`
+  - `make lint-scripts`：对 `scripts/*.sh` 和 `scripts/tests/*.sh` 运行 shellcheck
+  - `make test-scripts`：运行脚本回归测试（trace soft gate 等）
+  - 本地复现 CI soft gate（与 workflow 逻辑一致，含 `GATE_EXIT` 传递）：
+    ```bash
+    set +e
+    GATE_JSON=1 ./scripts/eval_gate.sh > trace-gate.json
+    GATE_EXIT=$?
+    set -e
+    ./scripts/trace_soft_gate.sh trace-gate.json "$GATE_EXIT"
+    ```
 
 #### embedding_test（Embedding Provider 端到端验证）
 
@@ -359,7 +367,7 @@ cargo run --bin hybrid_test
 - `AGENTS.md`：仓库或模块级开发约束；修改模块职责或边界时，要同步更新对应目录的 `AGENTS.md`。
 - `CLAUDE.md`：给只识别该文件名的助手使用；内容应与同目录 `AGENTS.md` 保持一致，避免指令漂移。
 - 影响用户可见行为、命令、任务状态或运行方式的改动，必须同步更新 `README.md`。
-- 日常改动后至少执行 `cargo check`；提交前建议再跑 `cargo fmt --check` 和 `cargo clippy --all-targets --all-features`。
+- 日常改动后至少执行 `cargo check`；提交前建议再跑 `cargo fmt --check`、`cargo clippy --all-targets --all-features` 和 `make lint-scripts`。
 - 本地环境文件、运行配置和数据库默认不提交：如 `.env`、`.env.*`、`config.toml`、`data/`；示例模板 `*.example` 除外。
 
 ## 文档说明

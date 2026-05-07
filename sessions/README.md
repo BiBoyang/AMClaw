@@ -9,6 +9,12 @@
 
 ## 索引
 
+> 注：以下索引非全量，仅列出较近期或主题明确的 session；完整列表请直接浏览目录。
+
 - `SESSION-TEMPLATE.md`：每日 session 模板（复制后改名为当日日期）。
 - `SESSION-2026-04-12.md`：HTTP 规则摘要、五分类 page_kind、summary 落库与 reporter 接入等改动记录。
 - `SESSION-2026-04-13.md`：T1-T5 复核、微信日报路径脱敏、README 同步与收尾校验。
+- `SESSION-2026-05-05.md`：B6 收尾（task_store 生命周期函数迁移）与 session-state 持久化。
+- `SESSION-2026-05-06.md`：agent_core Phase C（C0-C8）大文件拆分最终交付。
+- `SESSION-2026-05-07.md`：chat_adapter / task_store 测试模块抽离，A/B 拆分主线闭环。
+- `SESSION-2026-05-08.md`：S17 文档收口（S11~S16 实现同步到 README / DEVELOPMENT.md / agent-eval README / session 记录）。

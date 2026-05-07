@@ -106,6 +106,12 @@ AMCLAW_AGENT_DEMO_COMMAND='读文件 README.md' cargo run
 cargo test
 ```
 
+脚本静态检查（shellcheck）：
+
+```bash
+make lint-scripts
+```
+
 ## 4. 提交改动的基本原则
 
 ### 4.1 优先修根因
@@ -180,6 +186,7 @@ cargo test --test doc_mirrors
 - `cargo test --test doc_mirrors`
 - `cargo fmt --check`
 - `cargo clippy --all-targets --all-features`
+- `make lint-scripts`
 - `cargo test`
 
 ## 7. 哪些改动需要人工回归

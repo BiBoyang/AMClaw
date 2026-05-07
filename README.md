@@ -328,6 +328,7 @@ cargo run --bin trace_eval
   - `make eval-gate-strict`：执行严格门禁（WARN/FAIL 都阻断）
   - `make eval-gate-json`：输出 JSON 格式门禁结果（适合 CI 或脚本消费）
   - 本地复现 CI soft gate：`GATE_JSON=1 ./scripts/eval_gate.sh > trace-gate.json && ./scripts/trace_soft_gate.sh trace-gate.json`
+  - 本地跑脚本回归测试：`bash scripts/tests/test_trace_soft_gate.sh` 或 `make test-scripts`
 
 #### embedding_test（Embedding Provider 端到端验证）
 

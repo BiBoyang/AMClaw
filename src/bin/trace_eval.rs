@@ -1350,6 +1350,28 @@ fn build_state_updated_gate_lines(
     (human_readable, machine)
 }
 
+fn build_gate_output_lines(
+    overall: Verdict,
+    reasons: &[String],
+    before: &CompareMetrics,
+    after: &CompareMetrics,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!("OVERALL={}", verdict_str(overall)));
+    let (state_updated_human, state_updated_machine) = build_state_updated_gate_lines(
+        before.persistent_state_updated_count,
+        after.persistent_state_updated_count,
+        before.persistent_state_updated_rate,
+        after.persistent_state_updated_rate,
+    );
+    lines.push(state_updated_human);
+    lines.push(state_updated_machine);
+    if !reasons.is_empty() {
+        lines.push(format!("REASONS={}", reasons.join("; ")));
+    }
+    lines
+}
+
 /// 计算 latency 的 p50/p95（毫秒）。
 /// 输入为空时返回 (0, 0)。
 fn latency_quantiles(values: &[u128]) -> (u128, u128) {
@@ -2359,17 +2381,8 @@ fn run_compare_mode(
 
     // Gate mode:精简输出
     if gate_mode {
-        println!("OVERALL={}", verdict_str(overall));
-        let (state_updated_human, state_updated_machine) = build_state_updated_gate_lines(
-            before.persistent_state_updated_count,
-            after.persistent_state_updated_count,
-            before.persistent_state_updated_rate,
-            after.persistent_state_updated_rate,
-        );
-        println!("{}", state_updated_human);
-        println!("{}", state_updated_machine);
-        if !reasons.is_empty() {
-            println!("REASONS={}", reasons.join("; "));
+        for line in build_gate_output_lines(overall, &reasons, &before, &after) {
+            println!("{}", line);
         }
         match overall {
             Verdict::Pass => std::process::exit(0),
@@ -3404,6 +3417,69 @@ mod tests {
         let (human, machine) = build_state_updated_gate_lines(0, 0, None, None);
         assert!(human.contains("before_rate=N/A after_rate=N/A delta=N/A"));
         assert_eq!(machine, "STATE_UPDATED_RAW=bc=0|ac=0|br=NA|ar=NA|d=NA");
+    }
+
+    #[test]
+    fn gate_output_contract_pass_with_reasons() {
+        let before = CompareMetrics {
+            persistent_state_updated_count: 2,
+            persistent_state_updated_rate: Some(10.0),
+            ..Default::default()
+        };
+        let after = CompareMetrics {
+            persistent_state_updated_count: 5,
+            persistent_state_updated_rate: Some(22.5),
+            ..Default::default()
+        };
+        let lines = build_gate_output_lines(
+            Verdict::Pass,
+            &["全部核心指标 PASS".to_string()],
+            &before,
+            &after,
+        );
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].starts_with("OVERALL=PASS"));
+        assert!(lines[1].starts_with("STATE_UPDATED="));
+        assert!(lines[2].starts_with("STATE_UPDATED_RAW="));
+        assert!(lines[3].starts_with("REASONS=全部核心指标 PASS"));
+    }
+
+    #[test]
+    fn gate_output_contract_without_reasons() {
+        let before = CompareMetrics::default();
+        let after = CompareMetrics::default();
+        let lines = build_gate_output_lines(Verdict::Pass, &[], &before, &after);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("OVERALL=PASS"));
+        assert!(lines[1].starts_with("STATE_UPDATED="));
+        assert!(lines[2].starts_with("STATE_UPDATED_RAW="));
+        for line in &lines {
+            assert!(!line.starts_with("REASONS="));
+        }
+    }
+
+    #[test]
+    fn gate_output_contract_state_updated_na() {
+        let before = CompareMetrics {
+            persistent_state_updated_count: 0,
+            persistent_state_updated_rate: None,
+            ..Default::default()
+        };
+        let after = CompareMetrics {
+            persistent_state_updated_count: 0,
+            persistent_state_updated_rate: None,
+            ..Default::default()
+        };
+        let lines = build_gate_output_lines(Verdict::Pass, &[], &before, &after);
+        assert_eq!(lines.len(), 3);
+        // 人类可读行含 N/A
+        assert!(lines[1].contains("before_rate=N/A"));
+        assert!(lines[1].contains("after_rate=N/A"));
+        assert!(lines[1].contains("delta=N/A"));
+        // 机器行含 NA
+        assert!(lines[2].contains("br=NA"));
+        assert!(lines[2].contains("ar=NA"));
+        assert!(lines[2].contains("d=NA"));
     }
 
     #[test]

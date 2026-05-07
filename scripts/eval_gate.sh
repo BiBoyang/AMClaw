@@ -8,10 +8,10 @@ BEFORE="${1:-notes/agent-eval/baselines/TRACE-EVAL-BASELINE-2026-04-18.md}"
 AFTER="${2:-notes/agent-eval/reports/TRACE-EVAL-REPORT.md}"
 STRICT="${GATE_STRICT:-0}"
 
-echo "run trace_eval gate:"
-echo "  before: $BEFORE"
-echo "  after:  $AFTER"
-echo "  strict: $STRICT"
+echo "run trace_eval gate:" >&2
+echo "  before: $BEFORE" >&2
+echo "  after:  $AFTER" >&2
+echo "  strict: $STRICT" >&2
 
 # Gate 输出协议（按顺序）：
 #   OVERALL=PASS|WARN|FAIL|N/A

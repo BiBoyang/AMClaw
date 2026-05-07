@@ -12,3 +12,6 @@ eval-gate:
 
 eval-gate-strict:
 	GATE_STRICT=1 ./scripts/eval_gate.sh "$(BEFORE)" "$(AFTER)"
+
+eval-gate-json:
+	GATE_JSON=1 ./scripts/eval_gate.sh "$(BEFORE)" "$(AFTER)"

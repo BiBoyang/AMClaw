@@ -34,11 +34,34 @@ jobs:
       - name: Run trace compare
         run: ./scripts/trace_compare.sh
 
-      - name: Soft gate on compare FAIL
+      - name: Soft gate with --gate-json
+        continue-on-error: true
         run: |
-          REPORT="notes/agent-eval/reports/TRACE-EVAL-COMPARE.md"
-          if grep -q "\*\*综合判定\*\*: FAIL" "$REPORT"; then
-            echo "::warning::trace compare verdict is FAIL (soft gate, not blocking merge)"
+          GATE_JSON=1 ./scripts/eval_gate.sh > trace-gate.json
+          OVERALL=$(jq -r '.overall' trace-gate.json)
+          REASONS=$(jq -r '.reasons | join(", ")' trace-gate.json)
+          BC=$(jq -r '.state_updated.before_count' trace-gate.json)
+          AC=$(jq -r '.state_updated.after_count' trace-gate.json)
+          BR=$(jq -r '.state_updated.before_rate // "null"' trace-gate.json)
+          AR=$(jq -r '.state_updated.after_rate // "null"' trace-gate.json)
+          D=$(jq -r '.state_updated.delta // "null"' trace-gate.json)
+
+          echo "### Trace Eval Gate" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| overall | ${OVERALL} |" >> $GITHUB_STEP_SUMMARY
+          echo "| before_count | ${BC} |" >> $GITHUB_STEP_SUMMARY
+          echo "| after_count | ${AC} |" >> $GITHUB_STEP_SUMMARY
+          echo "| before_rate | ${BR} |" >> $GITHUB_STEP_SUMMARY
+          echo "| after_rate | ${AR} |" >> $GITHUB_STEP_SUMMARY
+          echo "| delta | ${D} |" >> $GITHUB_STEP_SUMMARY
+          echo "| reasons | ${REASONS} |" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$OVERALL" = "FAIL" ]; then
+            echo "::warning::trace eval gate verdict is FAIL (soft gate, not blocking merge). reasons: ${REASONS}"
+          elif [ "$OVERALL" = "WARN" ]; then
+            echo "::warning::trace eval gate verdict is WARN. reasons: ${REASONS}"
           fi
 
       - name: Upload compare report artifact

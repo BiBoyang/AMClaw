@@ -321,11 +321,12 @@ cargo run --bin trace_eval
     - `STATE_UPDATED=before_count=... after_count=... before_rate=... after_rate=... delta=...`（人类可读，rate/delta 可能为 `N/A`）
     - `STATE_UPDATED_RAW=bc=...|ac=...|br=...|ar=...|d=...`（机器可解析，缺失值为 `NA`，无单位）
     - `REASONS=...`（仅当有理由时输出）
-  - JSON 输出协议（`--gate --gate-json`）：输出单条 JSON，包含结构化字段，适合程序直接解析。rate/delta 单位为**百分点（0–100）**，缺失时值为 `null`。
+  - JSON 输出协议（`--gate --gate-json`）：输出单条 JSON，包含结构化字段，适合程序直接解析。rate/delta 单位为**百分点（0–100）**，缺失时值为 `null`。CI workflow 已改用 JSON 做软门禁判断，避免文案变更导致误判。
 - 推荐收尾命令：
   - `make trace-compare`：生成最新报告并输出对比报告
   - `make eval-gate`：执行宽松门禁（仅 FAIL 阻断）
   - `make eval-gate-strict`：执行严格门禁（WARN/FAIL 都阻断）
+  - `make eval-gate-json`：输出 JSON 格式门禁结果（适合 CI 或脚本消费）
 
 #### embedding_test（Embedding Provider 端到端验证）
 

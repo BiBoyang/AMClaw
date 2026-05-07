@@ -42,30 +42,44 @@ jobs:
           GATE_EXIT=$?
           set -e
 
-          OVERALL=$(jq -r '.overall' trace-gate.json)
-          REASONS=$(jq -r '.reasons | join(", ")' trace-gate.json)
-          BC=$(jq -r '.state_updated.before_count' trace-gate.json)
-          AC=$(jq -r '.state_updated.after_count' trace-gate.json)
-          BR=$(jq -r '.state_updated.before_rate // "null"' trace-gate.json)
-          AR=$(jq -r '.state_updated.after_rate // "null"' trace-gate.json)
-          D=$(jq -r '.state_updated.delta // "null"' trace-gate.json)
-
           echo "### Trace Eval Gate" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| overall | ${OVERALL} |" >> $GITHUB_STEP_SUMMARY
-          echo "| before_count | ${BC} |" >> $GITHUB_STEP_SUMMARY
-          echo "| after_count | ${AC} |" >> $GITHUB_STEP_SUMMARY
-          echo "| before_rate | ${BR} |" >> $GITHUB_STEP_SUMMARY
-          echo "| after_rate | ${AR} |" >> $GITHUB_STEP_SUMMARY
-          echo "| delta | ${D} |" >> $GITHUB_STEP_SUMMARY
-          echo "| reasons | ${REASONS} |" >> $GITHUB_STEP_SUMMARY
 
-          if [ "$OVERALL" = "FAIL" ]; then
-            echo "::warning::trace eval gate verdict is FAIL (soft gate, not blocking merge). reasons: ${REASONS}"
-          elif [ "$OVERALL" = "WARN" ]; then
-            echo "::warning::trace eval gate verdict is WARN. reasons: ${REASONS}"
+          if [ ! -s trace-gate.json ]; then
+            echo "⚠️ gate output missing or empty (exit=${GATE_EXIT})" >> $GITHUB_STEP_SUMMARY
+            echo "::warning::trace eval gate produced no JSON output (exit=${GATE_EXIT}). check baseline/report files."
+          elif ! jq -e . trace-gate.json > /dev/null 2>&1; then
+            echo "⚠️ gate output is not valid JSON (exit=${GATE_EXIT})" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            head -n 20 trace-gate.json >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "::warning::trace eval gate produced invalid JSON (exit=${GATE_EXIT})."
+          else
+            OVERALL=$(jq -r '.overall // "N/A"' trace-gate.json)
+            REASONS=$(jq -r '(.reasons // []) | join(", ")' trace-gate.json)
+            BC=$(jq -r '.state_updated.before_count // "N/A"' trace-gate.json)
+            AC=$(jq -r '.state_updated.after_count // "N/A"' trace-gate.json)
+            BR=$(jq -r '.state_updated.before_rate // "null"' trace-gate.json)
+            AR=$(jq -r '.state_updated.after_rate // "null"' trace-gate.json)
+            D=$(jq -r '.state_updated.delta // "null"' trace-gate.json)
+
+            echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+            echo "| overall | ${OVERALL} |" >> $GITHUB_STEP_SUMMARY
+            echo "| before_count | ${BC} |" >> $GITHUB_STEP_SUMMARY
+            echo "| after_count | ${AC} |" >> $GITHUB_STEP_SUMMARY
+            echo "| before_rate | ${BR} |" >> $GITHUB_STEP_SUMMARY
+            echo "| after_rate | ${AR} |" >> $GITHUB_STEP_SUMMARY
+            echo "| delta | ${D} |" >> $GITHUB_STEP_SUMMARY
+            echo "| reasons | ${REASONS} |" >> $GITHUB_STEP_SUMMARY
+
+            if [ "$OVERALL" = "FAIL" ]; then
+              echo "::warning::trace eval gate verdict is FAIL (soft gate, not blocking merge). reasons: ${REASONS}"
+            elif [ "$OVERALL" = "WARN" ]; then
+              echo "::warning::trace eval gate verdict is WARN. reasons: ${REASONS}"
+            elif [ "$OVERALL" = "N/A" ]; then
+              echo "::warning::trace eval gate verdict is N/A (not determinable). reasons: ${REASONS}"
+            fi
           fi
 
           exit 0

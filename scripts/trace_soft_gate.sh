@@ -35,7 +35,11 @@ elif ! jq -e . "$TRACE_JSON_PATH" > /dev/null 2>&1; then
         echo "::warning::trace eval gate produced invalid JSON."
     fi
     write_summary '```'
-    head -n 20 "$TRACE_JSON_PATH" >> "$SUMMARY_FILE" || true
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+        head -n 20 "$TRACE_JSON_PATH" >> "$GITHUB_STEP_SUMMARY" || true
+    else
+        head -n 20 "$TRACE_JSON_PATH" || true
+    fi
     write_summary '```'
 else
     OVERALL=$(jq -r '.overall // "N/A"' "$TRACE_JSON_PATH")

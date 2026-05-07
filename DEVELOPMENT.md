@@ -112,6 +112,16 @@ cargo test
 make lint-scripts
 ```
 
+如果本地提示 `shellcheck: command not found`，可先安装后再重试：
+
+```bash
+# macOS
+brew install shellcheck
+
+# Ubuntu / Debian
+sudo apt-get update && sudo apt-get install -y shellcheck
+```
+
 ## 4. 提交改动的基本原则
 
 ### 4.1 优先修根因

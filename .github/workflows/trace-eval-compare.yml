@@ -31,6 +31,16 @@ jobs:
       - name: Trace eval unit tests
         run: cargo test --bin trace_eval
 
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Show shellcheck version
+        run: |
+          command -v shellcheck
+          shellcheck --version
+
       - name: Lint shell scripts
         run: make lint-scripts
 

@@ -7,10 +7,12 @@ set -euo pipefail
 
 TRACE_JSON_PATH="${1:-trace-gate.json}"
 GATE_EXIT="${2:-}"
-SUMMARY_FILE="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
-
 write_summary() {
-    echo "$1" >> "$SUMMARY_FILE"
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+        echo "$1" >> "$GITHUB_STEP_SUMMARY"
+    else
+        echo "$1"
+    fi
 }
 
 write_summary "### Trace Eval Gate"

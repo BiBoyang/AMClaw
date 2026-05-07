@@ -2,7 +2,7 @@
 
 当前这份文件只记录"接下来最值得做什么"，不重复描述已经完成的能力。当前真实状态请看 `PLAN.md`。
 
-## 本阶段收口（截至 2026-04-12）
+## 本阶段收口（截至 2026-05-08）
 
 以下主线可视为已完成并进入稳定维护：
 
@@ -12,8 +12,13 @@
 - reporter / 日报对 `summary` 的展示接入
 - 发布流程与文档结构整理（`notes/`、`sessions/`）
 - Memory v3：`search_user_memories` 接入 agent_core context 拼装 + 命中回写 + 可观测日志 + 回归测试
+- session state 持久化（dirty-merge + trace 记录）
+- `ContextPack` 结构化上下文包（section budget + 渲染）
+- `trace_eval` gate 结构化输出（`--gate-json` + `STATE_UPDATED_RAW`）
+- CI gate 策略升级（soft/hard 模式、`GATE_MODE` 切换、shellcheck 确定性加固）
+- 文档同步收口（README / DEVELOPMENT / PLAN / NEXT-STEPS / sessions / agent-eval）
 
-结论：v0.3.2 "Context & Memory Minimal" 可以收口。
+结论：v0.3.2 "Context & Memory Minimal" 已收口；v0.3.3 结构性能力（session state / context pack / gate 策略）已落地。
 
 ## v0.3.2 DoD 逐项确认
 
@@ -31,11 +36,10 @@
 
 ### 方向
 
-1. 先收口现有 memory 语义与观测
-2. 再补显式 `session state`
-3. 然后抽结构化 `context pack`
-4. 之后再扩少量高价值长期 memory
-5. 最后用 trace 驱动评测闭环
+1. 收口现有 memory 语义与观测（Phase 1 剩余）
+2. 扩少量高价值长期 memory（Phase 4，当前最优先）
+3. 用 trace 驱动评测闭环稳定化（Phase 5 剩余）
+4. 把 `state/controller` 从 budget 扩到更完整的策略控制
 
 统一路线文档：
 
@@ -52,36 +56,19 @@
 3. 明确 `use_count` 的真实含义
 4. 保持日志、trace、文档三者口径一致
 
-### Phase 2：补显式 `SessionState`
+### Phase 2：补显式 `SessionState` ✅
 
-优先要做：
+- [x] `RuntimeSessionStateSnapshot` 已引入，含 `goal` / `current_subtask` / `constraints` / `confirmed_facts` / `done_items` / `next_step` / `open_questions`
+- [x] 槽位已进入 trace（`session_state_snapshot` / `final_runtime_session_state`）
+- [x] 持久化采用 conservative dirty-merge，无状态时可退化运行
+- [x] `persistent_state_updated` 指标已接入 compare 与 gate
 
-1. 引入最小状态槽位：
-   - `goal`
-   - `current_subtask`
-   - `constraints`
-   - `confirmed_facts`
-   - `done_items`
-   - `next_step`
-   - `open_questions`
-2. 让这些槽位进入 trace 与 prompt
-3. 保证无状态时仍可退化运行
+### Phase 3：抽 `ContextPack` ✅
 
-### Phase 3：抽 `ContextPack`
-
-优先要做：
-
-1. 把“当前喂给模型的内容”抽象成结构体
-2. 拆清来源：
-   - runtime context
-   - session state
-   - business context
-   - memories
-   - latest observation
-   - active plan
-3. 让 trace 同时保留：
-   - 结构化 context pack
-   - 最终渲染 prompt
+- [x] `ContextPack` 结构体已落地（`src/context_pack.rs`）
+- [x] 来源已拆清：`runtime context` / `session state` / `business context` / `memories` / `latest observation` / `active plan`
+- [x] trace 保留结构化 pack（`context_pack_present` / `context_pack_section_count` 等）与最终渲染 prompt
+- [x] section budget 与 trim/drop reason 已可观测
 
 ### Phase 4：扩长期 Memory 类型
 
@@ -91,22 +78,14 @@
 2. `project_fact`
 3. `lesson`
 
-### Phase 5：建立 Trace 驱动评测闭环
+### Phase 5：建立 Trace 驱动评测闭环（部分完成）
 
-优先要做：
-
-1. 从真实 trace 中抽样
-2. 标注失败类型
-3. 比较机制变更前后差异
-4. 一次只验证一个机制
-
-### 不优先做
-
-- 不先上 embedding / 向量库
-- 不先做复杂 memory taxonomy
-- 不先做多用户/多任务架构重构
-- 不先做 `tokio` 全量迁移或 `sqlx` async 化
-- 不回头重写 ReAct / Planning 主框架
+- [x] `trace_eval --gate-json` 已提供结构化输出（机器可解析）
+- [x] CI soft gate 已改为 JSON 消费（替代脆弱 grep）
+- [x] `scripts/trace_soft_gate.sh` 已抽离并带回归测试
+- [x] Gate 策略文档与 `GATE_MODE` 切换机制已落地（S19）
+- [ ] 从真实 trace 中抽样并标注失败类型（`forgot_known_fact` / `missed_retrieval` / `wrong_retrieval` / `state_drift` / `repeated_work`）
+- [ ] 比较机制变更前后差异（需 baseline 完备后启动）
 
 ## 当前明确不优先做
 

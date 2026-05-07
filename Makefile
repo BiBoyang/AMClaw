@@ -1,4 +1,4 @@
-.PHONY: trace-compare eval-gate eval-gate-strict eval-gate-json
+.PHONY: trace-compare eval-gate eval-gate-strict eval-gate-json trace-soft-gate
 
 BEFORE ?= notes/agent-eval/baselines/TRACE-EVAL-BASELINE-2026-04-18.md
 AFTER ?= notes/agent-eval/reports/TRACE-EVAL-REPORT.md
@@ -15,3 +15,6 @@ eval-gate-strict:
 
 eval-gate-json:
 	GATE_JSON=1 ./scripts/eval_gate.sh "$(BEFORE)" "$(AFTER)"
+
+trace-soft-gate:
+	GATE_JSON=1 ./scripts/eval_gate.sh "$(BEFORE)" "$(AFTER)" > trace-gate.json && ./scripts/trace_soft_gate.sh trace-gate.json

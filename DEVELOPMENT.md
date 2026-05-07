@@ -255,7 +255,7 @@ cargo test --test doc_mirrors
 
 ## 11. Trace Compare 门禁策略（Step 3 / 4）
 
-为避免 `trace_eval` 指标回归在合并时被遗漏，约定以下流程：
+为避免 `trace_eval` 指标回归在合并时被遗漏，约定以下流程。完整策略规范见 `notes/agent-eval/specs/GATE-POLICY-SPEC-2026-05-08.md`。
 
 ### 11.1 当前阶段：Soft Gate（告警不阻塞）
 
@@ -264,8 +264,10 @@ PR 流程中执行：
 1. `cargo check`
 2. `cargo test --bin trace_eval`
 3. `./scripts/trace_compare.sh`（生成 `TRACE-EVAL-COMPARE.md`）
+4. `make lint-scripts` 与脚本回归测试
+5. Gate 步骤（`GATE_MODE=soft`，默认）
 
-若 compare 报告出现 `**综合判定**: FAIL`：
+若 gate 判定为 `FAIL` 或 `N/A`：
 
 - 在 CI 输出 warning（可见告警）
 - 上传 compare 报告 artifact
@@ -275,15 +277,30 @@ PR 流程中执行：
 
 满足以下条件后可升级为 Hard Gate：
 
-- 连续 5 次 PR compare 结果稳定、无明显误报；
-- 团队（当前为你自己）确认门槛与误报成本可接受。
+- 连续 **5 次** PR gate 结果稳定、无明显误报；
+- 最近 10 次 gate 中，因口径/基础设施抖动导致的 WARN ≤ 2 次；
+- baseline 样本数 ≥ 20，且最近更新距今 ≤ 30 天；
+- 维护者书面确认误报成本可接受。
+
+升级方式：修改 `.github/workflows/trace-eval-compare.yml` 中 `env.GATE_MODE` 为 `hard`。
 
 Hard Gate 生效后：
 
-- `FAIL`：阻塞合并；
-- `WARN`：不阻塞，但需在 PR 描述中说明原因与后续观察计划。
+- `FAIL` / `N/A`：**阻塞合并**；
+- `WARN`：不阻塞，但需在 PR 描述中说明原因与后续观察计划（人工治理，CI 不强制校验）。
 
-### 11.3 Baseline 更新规则
+### 11.3 回退条件
+
+满足以下任一条件，立即回退到 Soft Gate：
+
+- 连续 2 次 PR 出现非预期 FAIL；
+- baseline 覆盖率下降 > 20pp 或 after 样本 < 20；
+- CI 环境变化导致 gate 链路偶发失败；
+- 维护者主动降级。
+
+回退方式：同一次 PR 内将 `env.GATE_MODE` 改回 `soft`。
+
+### 11.4 Baseline 更新规则
 
 默认不频繁滚动 baseline。仅在以下场景更新：
 

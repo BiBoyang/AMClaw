@@ -1,4 +1,4 @@
-.PHONY: trace-compare eval-gate eval-gate-strict eval-gate-json trace-soft-gate test-scripts lint-scripts
+.PHONY: trace-compare eval-gate eval-gate-strict eval-gate-json trace-soft-gate test-scripts test-gate-mode lint-scripts
 
 BEFORE ?= notes/agent-eval/baselines/TRACE-EVAL-BASELINE-2026-04-18.md
 AFTER ?= notes/agent-eval/reports/TRACE-EVAL-REPORT.md
@@ -21,6 +21,9 @@ trace-soft-gate:
 
 test-scripts:
 	bash scripts/tests/test_trace_soft_gate.sh
+
+test-gate-mode:
+	bash scripts/tests/test_gate_mode.sh
 
 lint-scripts:
 	shellcheck scripts/*.sh scripts/tests/*.sh

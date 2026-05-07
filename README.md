@@ -315,7 +315,7 @@ cargo run --bin trace_eval
 - 默认关联 `notes/agent-eval/baselines/EVAL-BASELINE-SAMPLES-2026-04-18.md` 做 baseline 命中统计。
 - 支持 `--date`、`--dir`、`--output`、`--baseline`、`--no-baseline`、`--only-interesting` 参数。
 - 支持 `--compare-before <path>`、`--compare-after <path>`、`--compare-output <path>` 对比两份已有报告，输出 PASS/WARN/FAIL 结论。缺少 `--compare-before` 或 `--compare-after` 时报错退出。
-- Gate 模式：`--gate` 输出精简结果并返回退出码（PASS=0, FAIL=1, N/A=2；WARN 默认=0，`--gate-strict` 下 WARN=2）。可用作 CI / 收尾阶段的自动化门禁。规范见 `notes/agent-eval/specs/EVAL-GATE-SPEC-2026-04-20.md`。
+- Gate 模式：`--gate` 输出精简结果并返回退出码（PASS=0, FAIL=1, N/A=2；WARN 默认=0，`--gate-strict` 下 WARN=2）。可用作 CI / 收尾阶段的自动化门禁。指标规范见 `notes/agent-eval/specs/EVAL-GATE-SPEC-2026-04-20.md`；策略规范（soft/hard 模式、升级/回退条件）见 `notes/agent-eval/specs/GATE-POLICY-SPEC-2026-05-08.md`。
   - 文本输出协议（按顺序，`--gate`，默认）：
     - `OVERALL=PASS|WARN|FAIL|N/A`
     - `STATE_UPDATED=before_count=... after_count=... before_rate=... after_rate=... delta=...`（人类可读，rate/delta 可能为 `N/A`）
@@ -324,11 +324,12 @@ cargo run --bin trace_eval
   - JSON 输出协议（`--gate --gate-json`）：输出单条 JSON，包含结构化字段，适合程序直接解析。rate/delta 单位为**百分点（0–100）**，缺失时值为 `null`。CI workflow 已改用 JSON 做软门禁判断，避免文案变更导致误判。
 - 推荐收尾命令：
   - `make trace-compare`：生成最新报告并输出对比报告
-  - `make eval-gate`：执行宽松门禁（仅 FAIL 阻断）
+  - `make eval-gate`：执行宽松门禁（FAIL/N/A 阻断，WARN 不阻断）
   - `make eval-gate-strict`：执行严格门禁（WARN/FAIL 都阻断）
   - `make eval-gate-json`：输出 JSON 格式门禁结果（适合 CI 或脚本消费）
   - `make lint-scripts`：对 `scripts/*.sh` 和 `scripts/tests/*.sh` 运行 shellcheck
   - `make test-scripts`：运行脚本回归测试（trace soft gate 等）
+  - `make test-gate-mode`：运行 gate 模式行为矩阵测试（soft/hard × PASS/WARN/FAIL/N/A）
   - 本地复现 CI soft gate（与 workflow 逻辑一致，含 `GATE_EXIT` 传递）：
     ```bash
     set +e

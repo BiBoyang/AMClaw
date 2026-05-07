@@ -5,6 +5,9 @@ on:
     branches:
       - main
 
+env:
+  GATE_MODE: soft   # 可选：soft / hard；见 notes/agent-eval/specs/GATE-POLICY-SPEC-2026-05-08.md
+
 jobs:
   trace-compare:
     runs-on: ubuntu-latest
@@ -50,14 +53,20 @@ jobs:
       - name: Run trace compare
         run: ./scripts/trace_compare.sh
 
-      - name: Soft gate with --gate-json
-        continue-on-error: true
+      - name: Gate with --gate-json
         run: |
+          if [ "$GATE_MODE" != "soft" ] && [ "$GATE_MODE" != "hard" ]; then
+            echo "::error::Invalid GATE_MODE: $GATE_MODE (expected: soft or hard)"
+            exit 2
+          fi
           set +e
           GATE_JSON=1 ./scripts/eval_gate.sh > trace-gate.json
           GATE_EXIT=$?
           set -e
-          ./scripts/trace_soft_gate.sh trace-gate.json "$GATE_EXIT"
+          ./scripts/trace_soft_gate.sh trace-gate.json "$GATE_EXIT" || true
+          if [ "$GATE_MODE" = "hard" ]; then
+            exit "$GATE_EXIT"
+          fi
           exit 0
 
       - name: Upload compare report artifact

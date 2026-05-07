@@ -21,7 +21,7 @@ v1.0 — 2026-05-08
 
 - **行为**：CI 输出 warning，上传报告 artifact，**不阻断合并**。
 - **适用阶段**：策略初期验证、基线不稳定、团队对误报成本尚未充分评估。
-- **退出码处理**：`trace_eval` 的退出码被 CI `continue-on-error: true` 吸收，workflow 不失败。
+- **退出码处理**：步骤脚本最终以 `exit 0` 结束，实现上可不依赖 `continue-on-error`，由脚本内部分支统一控制。
 
 ### Hard Gate（硬门禁）
 
@@ -73,8 +73,8 @@ env:
 
 Soft Gate 步骤根据 `GATE_MODE` 决定：
 
-- **`soft`**：`continue-on-error: true`，步骤脚本最终以 `exit 0` 结束，workflow 不失败。
-- **`hard`**：移除 `continue-on-error`；步骤脚本在执行 `trace_soft_gate.sh` 后，**必须以 `eval_gate.sh` 的原始退出码结束**（例如 `exit "$GATE_EXIT"`），确保 `FAIL`/`N/A` 能真正阻断 workflow。仅去掉 `continue-on-error` 而保留 `exit 0` 会导致 Hard Gate 失效。
+- **`soft`**：步骤脚本最终以 `exit 0` 结束，workflow 不失败。实现上可不依赖 `continue-on-error`，由脚本内部分支统一控制。
+- **`hard`**：步骤脚本在执行 `trace_soft_gate.sh` 后，**必须以 `eval_gate.sh` 的原始退出码结束**（例如 `exit "$GATE_EXIT"`），确保 `FAIL`/`N/A` 能真正阻断 workflow。
 
 Hard 模式步骤脚本示例：
 

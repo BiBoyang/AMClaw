@@ -45,7 +45,7 @@ cd ~/Desktop/AMClaw
 
 ## 评测门禁（本地复现）
 
-### 宽松门禁（仅 FAIL 阻断）
+### 宽松门禁（FAIL/N/A 阻断，WARN 不阻断）
 
 ```bash
 make eval-gate
@@ -79,6 +79,13 @@ set -e
 make test-scripts
 # 或
 bash scripts/tests/test_trace_soft_gate.sh
+```
+
+### Gate 模式行为矩阵测试
+
+```bash
+make test-gate-mode
+# 验证 soft/hard × PASS/WARN/FAIL/N/A 的退出码行为
 ```
 
 ### 脚本静态检查

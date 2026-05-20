@@ -110,7 +110,6 @@ impl super::TaskStore {
             CREATE INDEX IF NOT EXISTS idx_tasks_article_id ON tasks(article_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
             CREATE INDEX IF NOT EXISTS idx_tasks_updated_at ON tasks(updated_at);
-            CREATE INDEX IF NOT EXISTS idx_tasks_status_lease ON tasks(status, lease_until);
             CREATE INDEX IF NOT EXISTS idx_inbound_messages_received_at ON inbound_messages(received_at);
 
             CREATE TABLE IF NOT EXISTS outbound_pending_chunks (
@@ -125,13 +124,17 @@ impl super::TaskStore {
             "#,
             )
             .context("初始化 SQLite 表结构失败")?;
+        // ensure_column_exists must run before any index that references the column
+        ensure_column_exists(&self.conn, "tasks", "lease_until", "DATETIME")?;
         ensure_column_exists(&self.conn, "tasks", "content_source", "TEXT")?;
         ensure_column_exists(&self.conn, "tasks", "page_kind", "TEXT")?;
         ensure_column_exists(&self.conn, "tasks", "output_path", "TEXT")?;
         ensure_column_exists(&self.conn, "tasks", "snapshot_path", "TEXT")?;
         ensure_column_exists(&self.conn, "tasks", "worker_id", "TEXT")?;
         ensure_column_exists(&self.conn, "tasks", "processing_started_at", "DATETIME")?;
-        ensure_column_exists(&self.conn, "tasks", "lease_until", "DATETIME")?;
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_status_lease ON tasks(status, lease_until);",
+        )?;
         ensure_column_exists(&self.conn, "articles", "summary", "TEXT")?;
         ensure_column_exists(
             &self.conn,

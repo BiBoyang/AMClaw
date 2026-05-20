@@ -124,7 +124,10 @@ impl TaskExecutor {
             guard.insert(task_id.clone());
         }
         self.pending_count.fetch_add(1, Ordering::SeqCst);
-        let sender = self.sender.as_ref().expect("TaskExecutor sender already dropped");
+        let sender = self
+            .sender
+            .as_ref()
+            .expect("TaskExecutor sender already dropped");
         if let Err(err) = sender.send(task_id.clone()) {
             self.inflight.lock().unwrap().remove(&task_id);
             self.pending_count.fetch_sub(1, Ordering::SeqCst);
@@ -335,7 +338,11 @@ fn archive_success(
     Ok(())
 }
 
-crate::define_module_loggers!(info = log_task_executor_info, warn = log_task_executor_warn, error = log_task_executor_error);
+crate::define_module_loggers!(
+    info = log_task_executor_info,
+    warn = log_task_executor_warn,
+    error = log_task_executor_error
+);
 
 #[cfg(test)]
 mod tests {

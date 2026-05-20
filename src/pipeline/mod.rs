@@ -408,6 +408,13 @@ impl Pipeline {
         } else {
             &self.http_client_with_redirect
         };
+        // 最后一次 DNS 校验，防止 TOCTOU（提交时检查到 fetch 之间 DNS 可能变化）
+        if crate::task_store::is_private_url(url) {
+            return Err((
+                PipelineTaskError::failed(format!("安全拦截: DNS 解析到私有地址 {url}")),
+                false,
+            ));
+        }
         let response = match client.get(url).send() {
             Ok(resp) => resp,
             Err(err) => {

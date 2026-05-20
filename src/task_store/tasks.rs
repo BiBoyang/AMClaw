@@ -578,10 +578,7 @@ impl super::TaskStore {
         if updated > 0 {
             super::log_task_store_info(
                 "expired_leases_reset",
-                vec![
-                    ("count", json!(updated)),
-                    ("check_time", json!(&now)),
-                ],
+                vec![("count", json!(updated)), ("check_time", json!(&now))],
             );
         }
         Ok(())

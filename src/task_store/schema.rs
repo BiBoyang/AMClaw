@@ -222,6 +222,8 @@ impl super::TaskStore {
     }
 }
 
+/// 幂等添加列。**重要**: `table`、`column`、`column_def` 必须是硬编码字面量，
+/// 不可接受外部输入（内部使用 `format!` 拼接 DDL，未参数化）。
 pub(super) fn ensure_column_exists(
     conn: &Connection,
     table: &str,

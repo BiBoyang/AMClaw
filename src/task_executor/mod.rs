@@ -15,10 +15,21 @@ use uuid::Uuid;
 /// TaskExecutor 把 pipeline 任务执行从 poll_loop 主线程解耦到独立 worker 线程。
 /// poll_loop 只负责 enqueue task_id，worker 负责实际的抓取与归档。
 pub struct TaskExecutor {
-    sender: Sender<String>,
     pending_count: Arc<AtomicUsize>,
     inflight: Arc<Mutex<HashSet<String>>>,
-    _worker: JoinHandle<()>,
+    sender: Option<Sender<String>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Drop for TaskExecutor {
+    fn drop(&mut self) {
+        // Drop sender first to signal the worker thread to shut down
+        self.sender.take();
+        // Join the worker thread so we don't detach it
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl TaskExecutor {
@@ -42,6 +53,13 @@ impl TaskExecutor {
                     return;
                 }
             };
+            // 启动时清理过期 lease，避免 crash 后 stuck 5 分钟
+            if let Err(err) = task_store.reset_expired_leases() {
+                log_task_executor_warn(
+                    "reset_expired_leases_failed",
+                    vec![("detail", json!(err.to_string()))],
+                );
+            }
             while let Ok(task_id) = receiver.recv() {
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     process_task(&pipeline, &mut task_store, &task_id, &worker_id)
@@ -81,10 +99,10 @@ impl TaskExecutor {
             log_task_executor_info("worker_shutdown", vec![]);
         });
         Self {
-            sender,
+            sender: Some(sender),
             pending_count,
             inflight,
-            _worker: worker,
+            worker: Some(worker),
         }
     }
 
@@ -106,7 +124,8 @@ impl TaskExecutor {
             guard.insert(task_id.clone());
         }
         self.pending_count.fetch_add(1, Ordering::SeqCst);
-        if let Err(err) = self.sender.send(task_id.clone()) {
+        let sender = self.sender.as_ref().expect("TaskExecutor sender already dropped");
+        if let Err(err) = sender.send(task_id.clone()) {
             self.inflight.lock().unwrap().remove(&task_id);
             self.pending_count.fetch_sub(1, Ordering::SeqCst);
             log_task_executor_error(
@@ -316,17 +335,7 @@ fn archive_success(
     Ok(())
 }
 
-fn log_task_executor_info(event: &str, fields: Vec<(&str, serde_json::Value)>) {
-    crate::logging::emit_structured_log("info", event, fields);
-}
-
-fn log_task_executor_warn(event: &str, fields: Vec<(&str, serde_json::Value)>) {
-    crate::logging::emit_structured_log("warn", event, fields);
-}
-
-fn log_task_executor_error(event: &str, fields: Vec<(&str, serde_json::Value)>) {
-    crate::logging::emit_structured_log("error", event, fields);
-}
+crate::define_module_loggers!(info = log_task_executor_info, warn = log_task_executor_warn, error = log_task_executor_error);
 
 #[cfg(test)]
 mod tests {

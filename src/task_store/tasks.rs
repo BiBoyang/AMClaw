@@ -561,6 +561,32 @@ impl super::TaskStore {
         Ok(updated > 0)
     }
 
+    /// 启动时将 lease 已过期的 processing 任务重置为 pending。
+    /// 避免进程崩溃重启后 stuck 任务等待完整 lease 周期（5 分钟）。
+    pub fn reset_expired_leases(&mut self) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE tasks SET status = 'pending', worker_id = NULL, \
+                 processing_started_at = NULL, lease_until = NULL, updated_at = ?1 \
+                 WHERE status = 'processing' AND lease_until IS NOT NULL \
+                 AND datetime(lease_until) < datetime(?1)",
+                params![&now],
+            )
+            .context("重置过期 lease 失败")?;
+        if updated > 0 {
+            super::log_task_store_info(
+                "expired_leases_reset",
+                vec![
+                    ("count", json!(updated)),
+                    ("check_time", json!(&now)),
+                ],
+            );
+        }
+        Ok(())
+    }
+
     pub fn mark_task_archived(
         &mut self,
         task_id: &str,

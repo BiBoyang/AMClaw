@@ -2,6 +2,52 @@ use chrono::Utc;
 use chrono_tz::Asia::Shanghai;
 use serde_json::{json, Map, Value};
 
+/// Generates module-level structured-logging wrappers that delegate to
+/// [`emit_structured_log`].  Each arm defines one or two functions; the
+/// caller picks the combination it actually needs so unused variants
+/// aren't generated.
+///
+/// # Examples
+///
+/// ```ignore
+/// define_module_loggers!(pub(crate) info = log_foo_info, warn = log_foo_warn, error = log_foo_error);
+/// define_module_loggers!(pub(crate) info = log_bar_info, warn = log_bar_warn);
+/// define_module_loggers!(info = log_baz_info, error = log_baz_error);
+/// ```
+#[macro_export]
+macro_rules! define_module_loggers {
+    // info + warn + error
+    ($vis:vis info = $info:ident, warn = $warn:ident, error = $error:ident $(,)?) => {
+        $vis fn $info(event: &str, fields: Vec<(&str, serde_json::Value)>) {
+            $crate::logging::emit_structured_log("info", event, fields);
+        }
+        $vis fn $warn(event: &str, fields: Vec<(&str, serde_json::Value)>) {
+            $crate::logging::emit_structured_log("warn", event, fields);
+        }
+        $vis fn $error(event: &str, fields: Vec<(&str, serde_json::Value)>) {
+            $crate::logging::emit_structured_log("error", event, fields);
+        }
+    };
+    // info + warn only
+    ($vis:vis info = $info:ident, warn = $warn:ident $(,)?) => {
+        $vis fn $info(event: &str, fields: Vec<(&str, serde_json::Value)>) {
+            $crate::logging::emit_structured_log("info", event, fields);
+        }
+        $vis fn $warn(event: &str, fields: Vec<(&str, serde_json::Value)>) {
+            $crate::logging::emit_structured_log("warn", event, fields);
+        }
+    };
+    // info + error only
+    ($vis:vis info = $info:ident, error = $error:ident $(,)?) => {
+        $vis fn $info(event: &str, fields: Vec<(&str, serde_json::Value)>) {
+            $crate::logging::emit_structured_log("info", event, fields);
+        }
+        $vis fn $error(event: &str, fields: Vec<(&str, serde_json::Value)>) {
+            $crate::logging::emit_structured_log("error", event, fields);
+        }
+    };
+}
+
 pub(crate) fn build_structured_log_payload(
     level: &str,
     event: &str,

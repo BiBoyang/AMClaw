@@ -1,16 +1,7 @@
+#[cfg(test)]
 use serde_json::Value;
 
-pub(crate) fn log_agent_info(event: &str, fields: Vec<(&str, Value)>) {
-    log_agent_event("info", event, fields);
-}
-
-pub(crate) fn log_agent_warn(event: &str, fields: Vec<(&str, Value)>) {
-    log_agent_event("warn", event, fields);
-}
-
-fn log_agent_event(level: &str, event: &str, fields: Vec<(&str, Value)>) {
-    crate::logging::emit_structured_log(level, event, fields);
-}
+crate::define_module_loggers!(pub(crate) info = log_agent_info, warn = log_agent_warn);
 
 #[cfg(test)]
 pub(crate) fn build_agent_log_payload(

@@ -3,7 +3,7 @@ use crate::reporter::{DailyReportOutput, DailyReporter, WeeklyReportOutput};
 use anyhow::{bail, Context, Result};
 use chrono::{Datelike, Timelike, Utc};
 use chrono_tz::Tz;
-use serde_json::{json, Value};
+use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -303,13 +303,7 @@ fn should_run_for_week(
     now.hour() > hour || (now.hour() == hour && now.minute() >= minute)
 }
 
-fn log_scheduler_info(event: &str, fields: Vec<(&str, Value)>) {
-    crate::logging::emit_structured_log("info", event, fields);
-}
-
-fn log_scheduler_error(event: &str, fields: Vec<(&str, Value)>) {
-    crate::logging::emit_structured_log("error", event, fields);
-}
+crate::define_module_loggers!(info = log_scheduler_info, error = log_scheduler_error);
 
 #[cfg(test)]
 mod tests {

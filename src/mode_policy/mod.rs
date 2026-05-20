@@ -1,5 +1,3 @@
-use serde_json::Value;
-
 /// Agent 运行模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentMode {
@@ -79,16 +77,6 @@ pub fn check_url(mode: AgentMode, url: &str) -> PolicyDecision {
             PolicyDecision::allow("restricted 模式下允许的 URL")
         }
     }
-}
-
-#[allow(dead_code)]
-fn log_policy_info(event: &str, fields: Vec<(&str, Value)>) {
-    crate::logging::emit_structured_log("info", event, fields);
-}
-
-#[allow(dead_code)]
-fn log_policy_warn(event: &str, fields: Vec<(&str, Value)>) {
-    crate::logging::emit_structured_log("warn", event, fields);
 }
 
 #[cfg(test)]

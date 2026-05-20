@@ -146,9 +146,6 @@ impl AgentRunContext {
     }
 }
 
-#[allow(dead_code)]
-pub type RunContext = AgentRunContext;
-
 #[derive(Debug, Clone)]
 pub(crate) struct AgentObservation {
     step: usize,

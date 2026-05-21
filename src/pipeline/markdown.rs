@@ -1,14 +1,19 @@
 pub(crate) fn html_fragment_to_markdown(fragment: &str) -> String {
-    let (fragment, placeholders) = replace_pre_blocks(fragment);
+    let (fragment, placeholders, nonce) = replace_pre_blocks(fragment);
     let fragment = replace_anchor_blocks(&fragment);
     let fragment = replace_img_tags(&fragment);
     let result = normalize_fragment_text(&fragment);
-    restore_code_placeholders(&result, &placeholders)
+    restore_code_placeholders(&result, &placeholders, &nonce)
 }
 
-/// Replaces `<pre>...</pre>` blocks with `__AMCLAW_CODE_{N}__` placeholders.
-/// Returns (transformed_fragment, vec_of_code_block_strings).
-pub(crate) fn replace_pre_blocks(fragment: &str) -> (String, Vec<String>) {
+/// Replaces `<pre>...</pre>` blocks with `__AMCLAW_CODE_{nonce}_{N}__` placeholders.
+/// Returns (transformed_fragment, vec_of_code_block_strings, nonce).
+pub(crate) fn replace_pre_blocks(fragment: &str) -> (String, Vec<String>, String) {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .to_string();
     let mut out = String::with_capacity(fragment.len());
     let mut placeholders: Vec<String> = Vec::new();
     let mut cursor = 0;
@@ -20,7 +25,7 @@ pub(crate) fn replace_pre_blocks(fragment: &str) -> (String, Vec<String>) {
         };
         let start = cursor + rel_start;
         let after_tag = &fragment[start + 4..];
-        if !after_tag.starts_with('>') && !after_tag.starts_with(' ') {
+        if !after_tag.starts_with('>') && !after_tag.starts_with(|c: char| c.is_whitespace()) {
             out.push_str(&fragment[cursor..start + 4]);
             cursor = start + 4;
             continue;
@@ -30,13 +35,13 @@ pub(crate) fn replace_pre_blocks(fragment: &str) -> (String, Vec<String>) {
 
         let Some(rel_tag_end) = fragment[start..].find('>') else {
             out.push_str(&fragment[start..]);
-            return (out, placeholders);
+            return (out, placeholders, nonce);
         };
         let tag_end = start + rel_tag_end;
 
         let Some(rel_close) = lower[tag_end + 1..].find("</pre>") else {
             out.push_str(&fragment[start..]);
-            return (out, placeholders);
+            return (out, placeholders, nonce);
         };
         let close = tag_end + 1 + rel_close;
 
@@ -47,28 +52,32 @@ pub(crate) fn replace_pre_blocks(fragment: &str) -> (String, Vec<String>) {
 
         let code = text
             .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.trim_end().to_string())
             .collect::<Vec<_>>()
             .join("\n");
 
         if !code.is_empty() {
             let idx = placeholders.len();
             placeholders.push(format!("\n\n```\n{}\n```\n\n", code));
-            out.push_str(&format!("__AMCLAW_CODE_{idx}__"));
+            out.push_str(&format!("__AMCLAW_CODE_{nonce}_{idx}__"));
         }
 
         cursor = close + 6;
     }
 
     out.push_str(&fragment[cursor..]);
-    (out, placeholders)
+    (out, placeholders, nonce)
 }
 
-pub(crate) fn restore_code_placeholders(text: &str, placeholders: &[String]) -> String {
+pub(crate) fn restore_code_placeholders(
+    text: &str,
+    placeholders: &[String],
+    nonce: &str,
+) -> String {
     let mut result = text.to_string();
     for (i, block) in placeholders.iter().enumerate() {
-        result = result.replace(&format!("__AMCLAW_CODE_{i}__"), block);
+        result = result.replace(&format!("__AMCLAW_CODE_{nonce}_{i}__"), block);
     }
     result
 }
@@ -105,7 +114,7 @@ pub(crate) fn decode_entities_in_text(text: &str) -> String {
         }
         if in_entity {
             if ch == ';' {
-                out.push_str(decode_html_entity(&entity));
+                out.push_str(&decode_html_entity(&entity));
                 in_entity = false;
             } else {
                 entity.push(ch);
@@ -140,7 +149,7 @@ fn normalize_fragment_text(fragment: &str) -> String {
         }
         if in_entity {
             if ch == ';' {
-                out.push_str(decode_html_entity(&entity));
+                out.push_str(&decode_html_entity(&entity));
                 entity.clear();
                 in_entity = false;
             } else {
@@ -240,14 +249,31 @@ fn extract_attribute_value(tag: &str, attr: &str) -> Option<String> {
     })
 }
 
-pub(crate) fn decode_html_entity(entity: &str) -> &str {
+pub(crate) fn decode_html_entity(entity: &str) -> String {
     match entity {
-        "nbsp" => " ",
-        "amp" => "&",
-        "lt" => "<",
-        "gt" => ">",
-        "quot" => "\"",
-        "#39" => "'",
-        _ => "",
+        "nbsp" => " ".to_string(),
+        "amp" => "&".to_string(),
+        "lt" => "<".to_string(),
+        "gt" => ">".to_string(),
+        "quot" => "\"".to_string(),
+        "apos" => "'".to_string(),
+        "#39" => "'".to_string(),
+        _ => {
+            if let Some(hex) = entity.strip_prefix("#x") {
+                if let Ok(code) = u32::from_str_radix(hex, 16) {
+                    if let Some(c) = char::from_u32(code) {
+                        return c.to_string();
+                    }
+                }
+            } else if let Some(dec) = entity.strip_prefix('#') {
+                if let Ok(code) = dec.parse::<u32>() {
+                    if let Some(c) = char::from_u32(code) {
+                        return c.to_string();
+                    }
+                }
+            }
+            // Preserve unknown entities as-is
+            format!("&{entity};")
+        }
     }
 }

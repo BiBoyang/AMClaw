@@ -1687,10 +1687,10 @@ mod tests {
     #[test]
     fn pre_block_converts_to_code_fence() {
         let html = "<div>text before</div><pre><code>fn main() {</code><code>    println!(\"hello\");</code><code>}</code></pre><div>text after</div>";
-        let (result, blocks) = replace_pre_blocks(html);
-        let restored = restore_code_placeholders(&result, &blocks);
+        let (result, blocks, nonce) = replace_pre_blocks(html);
+        let restored = restore_code_placeholders(&result, &blocks, &nonce);
         assert!(
-            restored.contains("```\nfn main() {\nprintln!(\"hello\");\n}\n```"),
+            restored.contains("fn main() {\n    println!(\"hello\");\n}"),
             "got: {restored}"
         );
     }
@@ -1699,8 +1699,8 @@ mod tests {
     fn pre_block_wechat_code_snippets() {
         // Simulates WeChat article code block HTML with span-based syntax highlighting
         let html = "<pre><code><span class=\"code-snippet__keyword\">void</span>&nbsp;PrebuiltObjC::<span class=\"code-snippet__title\">generateHashTables</span>(RuntimeState&amp; state)</code><code><span>{</span></code><code>&nbsp;&nbsp;<span class=\"code-snippet__comment\">// comment</span></code></pre>";
-        let (result, blocks) = replace_pre_blocks(html);
-        let restored = restore_code_placeholders(&result, &blocks);
+        let (result, blocks, nonce) = replace_pre_blocks(html);
+        let restored = restore_code_placeholders(&result, &blocks, &nonce);
         assert!(
             restored.contains("void PrebuiltObjC::generateHashTables(RuntimeState& state)"),
             "got: {restored}"
@@ -1718,5 +1718,84 @@ mod tests {
             "code content should be present, got: {md}"
         );
         assert!(md.contains("```"), "should contain code fence, got: {md}");
+    }
+
+    // --- regression / new coverage tests ---
+
+    #[test]
+    fn pre_block_preserves_indentation() {
+        let html =
+            "<pre><code>def foo():</code><code>    x = 1</code><code>    return x</code></pre>";
+        let (result, blocks, nonce) = replace_pre_blocks(html);
+        let restored = restore_code_placeholders(&result, &blocks, &nonce);
+        assert!(
+            restored.contains("def foo():\n    x = 1\n    return x"),
+            "indentation should be preserved, got: {restored}"
+        );
+    }
+
+    #[test]
+    fn restore_code_placeholders_ignores_user_text_collision() {
+        // User text contains a literal placeholder-like string that should NOT be replaced
+        let user_text =
+            "Some text __AMCLAW_CODE_0__ that looks like a placeholder __AMCLAW_CODE_1__ end.";
+        let blocks = vec!["```\ncode0\n```".to_string(), "```\ncode1\n```".to_string()];
+        let nonce = "test_nonce_123";
+        let restored = restore_code_placeholders(user_text, &blocks, nonce);
+        // The literal __AMCLAW_CODE_0__ (without nonce) should NOT be replaced
+        assert!(
+            restored.contains("__AMCLAW_CODE_0__"),
+            "user text collision should be ignored, got: {restored}"
+        );
+        assert!(
+            restored.contains("__AMCLAW_CODE_1__"),
+            "user text collision should be ignored, got: {restored}"
+        );
+    }
+
+    #[test]
+    fn decode_entities_preserves_unknown_entity() {
+        // Unknown entity like &xyz; should stay as-is, not disappear
+        let result = decode_entities_in_text("hello &xyz; world");
+        assert_eq!(result, "hello &xyz; world");
+        // Also check that valid entities still decode
+        let result2 = decode_entities_in_text("a &amp; b &unknown; c");
+        assert_eq!(result2, "a & b &unknown; c");
+    }
+
+    #[test]
+    fn decode_entities_supports_numeric_decimal_and_hex() {
+        // Decimal: &#60; = <, &#62; = >, &#39; = '
+        assert!(decode_entities_in_text("&#60;tag&#62;").contains("<tag>"));
+        // Hex: &#x27; = ', &#x3C; = <
+        assert!(decode_entities_in_text("&#x27;hello&#x27;").contains("'hello'"));
+        assert!(decode_entities_in_text("&#x3C;tag&#x3E;").contains("<tag>"));
+        // apos named entity
+        assert!(decode_entities_in_text("&apos;hello&apos;").contains("'hello'"));
+    }
+
+    #[test]
+    fn empty_pre_block_behavior() {
+        let html = "<div>text</div><pre></pre><div>after</div>";
+        let (result, blocks, _nonce) = replace_pre_blocks(html);
+        assert!(
+            blocks.is_empty(),
+            "empty pre should produce no placeholder, got {} blocks",
+            blocks.len()
+        );
+        assert!(result.contains("text"));
+        assert!(result.contains("after"));
+    }
+
+    #[test]
+    fn pre_block_with_whitespace_attrs() {
+        // <pre class="..."> with space after tag name should be recognized
+        let html = "<pre class=\"brush: python;\"><code>x = 1</code></pre>";
+        let (_result, blocks, _nonce) = replace_pre_blocks(html);
+        assert!(!blocks.is_empty(), "should recognize <pre class=...>");
+        // Also test with newline after <pre
+        let html2 = "<pre\nclass=\"brush: python;\"><code>y = 2</code></pre>";
+        let (_result2, blocks2, _nonce2) = replace_pre_blocks(html2);
+        assert!(!blocks2.is_empty(), "should recognize <pre\\nclass=...>");
     }
 }

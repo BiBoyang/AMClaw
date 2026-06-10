@@ -9,7 +9,7 @@
 2. 现在主要在推进哪一层
 3. 下一步最值得继续做什么
 
-关于更长期的 `core/runtime` 与 `skill` 分层路线，不在本文件展开，统一记录在 `CORE-SKILL-ROADMAP.md`。
+关于更长期的 `core/runtime` 与 `skill` 分层路线，不在本文件展开，统一记录在 `docs/architecture/CORE-SKILL-ROADMAP.md`。
 
 ## 项目定位
 

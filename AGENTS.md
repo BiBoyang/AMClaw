@@ -42,7 +42,7 @@
 1. `README.md` 用于描述当前可运行能力、命令、环境要求与验证方式；涉及用户可见行为变更时必须同步更新。
 2. 每个目录下的 `CLAUDE.md` 应与同目录 `AGENTS.md` 保持一致，避免不同助手读取到相互矛盾的约束。
 3. 如果模块职责、边界或“不做事项”发生变化，必须同步修改对应目录的 `AGENTS.md` / `CLAUDE.md`。
-4. `DESIGN-0.1.0.md`、`PLAN.md`、`NEXT-STEPS.md` 属于设计与路线材料，不应用来覆盖 `README.md` 中对“当前实现”的描述。
+4. `docs/architecture/`、`docs/roadmap/`、`PLAN.md`、`NEXT-STEPS.md` 属于设计与路线材料，不应用来覆盖 `README.md` 中对“当前实现”的描述。
 
 ## 目录索引
 

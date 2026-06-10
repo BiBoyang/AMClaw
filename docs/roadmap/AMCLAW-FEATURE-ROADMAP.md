@@ -13,8 +13,8 @@
 - `README.md`：当前能跑什么
 - `PLAN.md`：当前真实状态
 - `NEXT-STEPS.md`：下一轮先做什么
-- `CORE-SKILL-ROADMAP.md`：整体分层路线
-- `AGENT-RUNTIME-IMPLEMENTATION-PLAN.md`：runtime 实施计划
+- `../architecture/CORE-SKILL-ROADMAP.md`：整体分层路线
+- `../architecture/AGENT-RUNTIME-IMPLEMENTATION-PLAN.md`：runtime 实施计划
 - 本文档：**未来功能路线**
 
 ## 一、产品方向重新定义

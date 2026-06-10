@@ -33,7 +33,7 @@
 1. `README.md` 中“当前实现”
 2. 根目录与模块目录下的 `AGENTS.md`
 3. 实际代码行为
-4. `PLAN.md` / `DESIGN-0.1.0.md` 中的未来规划
+4. `PLAN.md` / `docs/architecture/` / `docs/roadmap/` 中的未来规划
 
 ## 2. 环境要求
 

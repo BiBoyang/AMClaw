@@ -4,6 +4,7 @@
 
 ## 子目录
 
+- `archive/`：已完成计划、历史 review、review prompt 等归档记录；默认不作为当前状态来源。
 - `runtime-evolution/`：Agent runtime 方案演进与阶段记录（`AGENT-RUNTIME-01~04`）。
 - `retros/`：阶段复盘记录（如 sprint retro）。
 - `constraints/`：实验中的约束与规则记录。
@@ -13,4 +14,5 @@
 ## 说明
 
 - 这些文档主要用于回溯与讨论，默认不作为“当前实现状态”的唯一来源。
+- 已执行完的任务计划与 review 记录优先放入 `archive/`，避免与当前计划混在一起。
 - 当前实现能力与可运行方式仍以 `README.md` 为准。

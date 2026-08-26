@@ -19,3 +19,4 @@
 - `SESSION-2026-05-07.md`：chat_adapter / task_store 测试模块抽离，A/B 拆分主线闭环。
 - `SESSION-2026-05-08.md`：S17 文档收口（S11~S16 实现同步到 README / DEVELOPMENT.md / agent-eval README / session 记录）。
 - `SESSION-2026-06-13.md`：S21 文档整理、S22 task_store 测试拆分、S23 agent_core 测试拆分 checkpoint 收尾。
+- `SESSION-2026-08-26.md`：S23-4 retriever_selection 测试拆分、Phase 4 新 Memory 类型写入入口、文档口径收口。

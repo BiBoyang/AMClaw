@@ -146,6 +146,72 @@ struct ToolCallTrace {
     error: Option<String>,
 }
 
+/// 当前支持的 trace schema 版本白名单（lib 端写入值见 src/agent_core/trace.rs）。
+/// 加载时不认识的版本不丢弃，计入 TraceLoadStats.unsupported_version_count 并在报告展示。
+const SUPPORTED_TRACE_VERSIONS: &[&str] = &["agent_trace_v1"];
+
+/// 缺字段疑似漂移检测覆盖的核心字段（JSON 存在性检查，与 serde default 无关）。
+/// success/step_count/trace_version 缺失时反序列化会失败（走既有"解析失败"路径），
+/// llm_calls/failures 等带 serde default 的字段缺失会静默清零统计，正是本告警要捕获的场景。
+const CORE_TRACE_FIELDS: &[&str] = &[
+    "trace_version",
+    "success",
+    "step_count",
+    "llm_calls",
+    "failures",
+];
+
+/// L1 失败分类（taxonomy）全集，
+/// 见 notes/agent-eval/specs/EVAL-FAILURE-TAXONOMY-2026-04-18.md §2。
+const L1_FAILURE_TYPES: &[&str] = &[
+    "llm_auth_error",
+    "llm_transport_error",
+    "tool_call_error",
+    "context_overtrim",
+    "memory_conflict",
+    "session_state_missing_or_stale",
+    "planning_stall_or_drift",
+    "done_rule_validation_fail",
+    "fallback_exhausted",
+    "unknown_failure",
+];
+
+/// 运行时 failure kind（src/agent_core/recovery.rs `StepFailureKind::as_str()`）→ L1 taxonomy
+/// 的显式映射，全表集中于此。只收录 spec 明确给出的对应关系（§2.G）：
+/// `stalled_trajectory` / `trajectory_drift` → `planning_stall_or_drift`。
+/// 其余运行时 kind 暂无 spec 对应，按 spec §1.4 约定收敛到 `unknown_failure` 待人工补字典。
+const RUNTIME_FAILURE_KIND_TO_L1: &[(&str, &str)] = &[
+    ("stalled_trajectory", "planning_stall_or_drift"),
+    ("trajectory_drift", "planning_stall_or_drift"),
+];
+
+/// 把 trace 中的 failure type 归一到 L1 taxonomy：
+/// - 已是 L1 名（旧合成 baseline 直接写 L1 名）→ 原样返回，保证幂等；
+/// - 命中运行时映射表 → 对应 L1 类；
+/// - 其余（未映射的运行时 kind、空串、未知字符串）→ `unknown_failure`。
+fn map_failure_kind_to_l1(raw: &str) -> String {
+    let kind = raw.trim();
+    if L1_FAILURE_TYPES.contains(&kind) {
+        return kind.to_string();
+    }
+    if let Some((_, l1)) = RUNTIME_FAILURE_KIND_TO_L1
+        .iter()
+        .find(|(runtime_kind, _)| *runtime_kind == kind)
+    {
+        return (*l1).to_string();
+    }
+    "unknown_failure".to_string()
+}
+
+/// trace 加载阶段的 schema 健康度统计（trace_version 门禁 + 缺字段疑似漂移）。
+#[derive(Debug, Clone, Default)]
+struct TraceLoadStats {
+    /// trace_version 不在 SUPPORTED_TRACE_VERSIONS 白名单内的 trace 数（仍加载，不中断）。
+    unsupported_version_count: usize,
+    /// 核心字段缺失计数：key 为字段名，value 为缺该字段的 trace 文件数。
+    missing_core_field_counts: BTreeMap<String, usize>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct TraceSummary {
     run_id: String,
@@ -301,10 +367,11 @@ fn main() {
         return;
     }
 
+    let mut load_stats = TraceLoadStats::default();
     let traces = if let Some(ref d) = date {
-        load_traces_for_date(&trace_dir, d)
+        load_traces_for_date(&trace_dir, d, &mut load_stats)
     } else {
-        load_all_traces(&trace_dir)
+        load_all_traces(&trace_dir, &mut load_stats)
     };
 
     if traces.is_empty() {
@@ -330,10 +397,11 @@ fn main() {
         only_interesting,
         &baseline_run_ids,
         baseline_path.as_deref(),
+        &load_stats,
     );
     fs::write(&output_path, report).expect("写入报告失败");
     // 同步写 JSON sidecar（同名 .json），供 compare 结构化消费；markdown 内容不变
-    let sidecar = build_report_sidecar(&summaries, &baseline_run_ids);
+    let sidecar = build_report_sidecar(&summaries, &baseline_run_ids, &load_stats);
     let sidecar_json = serde_json::to_string_pretty(&sidecar).expect("序列化报告 sidecar 失败");
     let sidecar_file = sidecar_path(&output_path);
     fs::write(&sidecar_file, sidecar_json).expect("写入报告 sidecar 失败");
@@ -346,12 +414,12 @@ fn main() {
     );
 }
 
-fn load_traces_for_date(root: &Path, date: &str) -> Vec<AgentTrace> {
+fn load_traces_for_date(root: &Path, date: &str, stats: &mut TraceLoadStats) -> Vec<AgentTrace> {
     let dir = root.join(date);
-    load_traces_from_dir(&dir)
+    load_traces_from_dir(&dir, stats)
 }
 
-fn load_all_traces(root: &Path) -> Vec<AgentTrace> {
+fn load_all_traces(root: &Path, stats: &mut TraceLoadStats) -> Vec<AgentTrace> {
     let mut traces = Vec::new();
     let Ok(entries) = fs::read_dir(root) else {
         return traces;
@@ -359,13 +427,13 @@ fn load_all_traces(root: &Path) -> Vec<AgentTrace> {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            traces.extend(load_traces_from_dir(&path));
+            traces.extend(load_traces_from_dir(&path, stats));
         }
     }
     traces
 }
 
-fn load_traces_from_dir(dir: &Path) -> Vec<AgentTrace> {
+fn load_traces_from_dir(dir: &Path, stats: &mut TraceLoadStats) -> Vec<AgentTrace> {
     let mut traces = Vec::new();
     let Ok(entries) = fs::read_dir(dir) else {
         return traces;
@@ -382,8 +450,36 @@ fn load_traces_from_dir(dir: &Path) -> Vec<AgentTrace> {
             Ok(c) => c,
             Err(_) => continue,
         };
-        match serde_json::from_str::<AgentTrace>(&content) {
-            Ok(trace) => traces.push(trace),
+        // 先按 JSON Value 做核心字段存在性统计（serde default 会把缺字段静默清零），
+        // 再反序列化为结构体；Value 都解析不出来时走既有"解析失败"路径。
+        let value = match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!("解析失败 {}: {}", path.display(), err);
+                continue;
+            }
+        };
+        for field in CORE_TRACE_FIELDS {
+            if value.get(field).is_none() {
+                *stats
+                    .missing_core_field_counts
+                    .entry((*field).to_string())
+                    .or_insert(0) += 1;
+            }
+        }
+        match serde_json::from_value::<AgentTrace>(value) {
+            Ok(trace) => {
+                if !SUPPORTED_TRACE_VERSIONS.contains(&trace.trace_version.as_str()) {
+                    stats.unsupported_version_count += 1;
+                    eprintln!(
+                        "trace_version={} 不在支持白名单 {:?}，仍加载: {}",
+                        trace.trace_version,
+                        SUPPORTED_TRACE_VERSIONS,
+                        path.display()
+                    );
+                }
+                traces.push(trace);
+            }
             Err(err) => eprintln!("解析失败 {}: {}", path.display(), err),
         }
     }
@@ -443,10 +539,12 @@ fn summarize_trace(trace: &AgentTrace, baseline_run_ids: &HashSet<String>) -> Tr
 
     let is_interesting = !interest_reasons.is_empty();
     let mut seen_types = std::collections::HashSet::new();
+    // 统一归一到 L1 taxonomy 后再去重：运行时 kind（stalled_trajectory 等）先映射，
+    // 已是 L1 名的旧数据幂等不变；未映射的运行时 kind 收敛为 unknown_failure。
     let failure_types: Vec<String> = trace
         .failures
         .iter()
-        .map(|failure| failure.failure_type.clone())
+        .map(|failure| map_failure_kind_to_l1(&failure.failure_type))
         .filter(|ft| seen_types.insert(ft.clone()))
         .collect();
 
@@ -580,6 +678,7 @@ fn build_report(
     only_interesting: bool,
     baseline_run_ids: &HashSet<String>,
     baseline_path: Option<&Path>,
+    load_stats: &TraceLoadStats,
 ) -> String {
     let mut lines = vec![
         "# Trace Evaluation Report".to_string(),
@@ -674,6 +773,33 @@ fn build_report(
         with_state_updated,
         pct(with_state_updated, total)
     ));
+    lines.push(String::new());
+
+    // === Trace Schema Health（版本门禁 + 缺字段疑似漂移；仅观测告警，不中断加载）===
+    lines.push("## Trace Schema Health".to_string());
+    lines.push(String::new());
+    lines.push("| metric | count |".to_string());
+    lines.push("| --- | ---: |".to_string());
+    lines.push(format!(
+        "| unsupported_version_count | {} |",
+        load_stats.unsupported_version_count
+    ));
+    for field in CORE_TRACE_FIELDS {
+        let missing = load_stats
+            .missing_core_field_counts
+            .get(*field)
+            .copied()
+            .unwrap_or(0);
+        lines.push(format!("| missing_field:{} | {} |", field, missing));
+    }
+    let missing_field_total: usize = load_stats.missing_core_field_counts.values().sum();
+    if load_stats.unsupported_version_count > 0 || missing_field_total > 0 {
+        lines.push(String::new());
+        lines.push(format!(
+            "> ⚠ 检测到 schema 疑似漂移：{} 条 trace 版本不在白名单 {:?}，核心字段缺失 {} 处；请核对 lib 端 trace 结构是否改名/删字段。",
+            load_stats.unsupported_version_count, SUPPORTED_TRACE_VERSIONS, missing_field_total
+        ));
+    }
     lines.push(String::new());
 
     // === Persistent State Update Breakdown ===
@@ -1507,6 +1633,9 @@ struct CompareMetrics {
     // Persistent state update (observability, not gate)
     persistent_state_updated_count: usize,
     persistent_state_updated_rate: Option<f64>,
+    // Trace schema health（observability, not gate；gate 判定路径不消费这两个字段）
+    unsupported_version_count: usize,
+    missing_core_field_count: usize,
     // Denominator info (for scenario B)
     recovery_attempt_count: usize,
     total_tool_calls: usize,
@@ -1736,6 +1865,21 @@ fn parse_report(content: &str) -> Result<CompareMetrics, String> {
                     }
                 }
             }
+            // 旧报告没有该小节：跳过即为 0，不影响既有指标解析
+            "Trace Schema Health" => {
+                let rows = parse_markdown_table(&body);
+                for row in rows {
+                    if row.len() < 2 {
+                        continue;
+                    }
+                    let name = row[0].trim();
+                    if name == "unsupported_version_count" {
+                        metrics.unsupported_version_count = extract_usize_from_cell(&row[1]);
+                    } else if name.starts_with("missing_field:") {
+                        metrics.missing_core_field_count += extract_usize_from_cell(&row[1]);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1912,6 +2056,11 @@ struct ReportSidecar {
     avg_step_count: f64,
     failure_type_counts: BTreeMap<String, usize>,
     rates: BTreeMap<String, RateMetric>,
+    // schema 健康度（新增字段带 serde default：旧 sidecar 缺字段时按 0 兼容，不触发回退）
+    #[serde(default)]
+    unsupported_version_count: usize,
+    #[serde(default)]
+    missing_core_field_counts: BTreeMap<String, usize>,
 }
 
 /// 报告路径对应的 JSON sidecar 路径（`REPORT.md` -> `REPORT.json`）。
@@ -1958,6 +2107,7 @@ fn insert_rate_metric(
 fn build_report_sidecar(
     summaries: &[TraceSummary],
     baseline_run_ids: &HashSet<String>,
+    load_stats: &TraceLoadStats,
 ) -> ReportSidecar {
     let total = summaries.len();
     let mut rates = BTreeMap::new();
@@ -2059,6 +2209,8 @@ fn build_report_sidecar(
         avg_step_count,
         failure_type_counts,
         rates,
+        unsupported_version_count: load_stats.unsupported_version_count,
+        missing_core_field_counts: load_stats.missing_core_field_counts.clone(),
     }
 }
 
@@ -2090,6 +2242,8 @@ fn compare_metrics_from_sidecar(sidecar: &ReportSidecar) -> CompareMetrics {
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect(),
+        unsupported_version_count: sidecar.unsupported_version_count,
+        missing_core_field_count: sidecar.missing_core_field_counts.values().sum(),
         ..Default::default()
     };
     for (name, sample) in &sidecar.rates {
@@ -2537,6 +2691,21 @@ fn build_compare_report(
             before.persistent_state_updated_rate,
             after.persistent_state_updated_rate
         )
+    ));
+
+    // Trace Schema Health (observability only, not gate)
+    lines.push(String::new());
+    lines.push("## Trace Schema Health (observability only, not gate)".to_string());
+    lines.push(String::new());
+    lines.push("| metric | before | after |".to_string());
+    lines.push("| --- | ---: | ---: |".to_string());
+    lines.push(format!(
+        "| unsupported_version_count | {} | {} |",
+        before.unsupported_version_count, after.unsupported_version_count
+    ));
+    lines.push(format!(
+        "| missing_core_field_count | {} | {} |",
+        before.missing_core_field_count, after.missing_core_field_count
     ));
 
     // Reasons
@@ -3031,7 +3200,13 @@ mod tests {
         s2.tool_call_count = 2;
         s2.tool_success_count = 1;
 
-        let report = build_report(&[s1, s2], false, &HashSet::new(), None);
+        let report = build_report(
+            &[s1, s2],
+            false,
+            &HashSet::new(),
+            None,
+            &TraceLoadStats::default(),
+        );
         assert!(report.contains("Wilson99"), "report:\n{}", report);
 
         let metrics = parse_report(&report).unwrap();
@@ -3091,13 +3266,19 @@ mod tests {
     fn test_sidecar_roundtrip_matches_markdown_parse() {
         // sidecar 写出 -> 读回，与同一批 summaries 的 markdown 解析结果一致
         let summaries = sidecar_sample_summaries();
-        let sidecar = build_report_sidecar(&summaries, &HashSet::new());
+        let sidecar = build_report_sidecar(&summaries, &HashSet::new(), &TraceLoadStats::default());
         assert_eq!(sidecar.schema_version, REPORT_SIDECAR_SCHEMA_VERSION);
 
         let json = serde_json::to_string_pretty(&sidecar).unwrap();
         let from_sidecar = parse_sidecar(&json).unwrap();
-        let from_markdown =
-            parse_report(&build_report(&summaries, false, &HashSet::new(), None)).unwrap();
+        let from_markdown = parse_report(&build_report(
+            &summaries,
+            false,
+            &HashSet::new(),
+            None,
+            &TraceLoadStats::default(),
+        ))
+        .unwrap();
 
         assert_eq!(from_sidecar.total_runs, from_markdown.total_runs);
         assert_eq!(
@@ -3180,7 +3361,8 @@ mod tests {
             .rate_samples
             .contains_key("persistent_state_updated_rate"));
         let success_metric =
-            &build_report_sidecar(&summaries, &HashSet::new()).rates["success_rate"];
+            &build_report_sidecar(&summaries, &HashSet::new(), &TraceLoadStats::default()).rates
+                ["success_rate"];
         assert!(success_metric.wilson99_bound.is_some());
         let recovery_metric = &sidecar.rates["recovery_success_rate"];
         assert!(recovery_metric.wilson99_bound.is_none());
@@ -3209,7 +3391,11 @@ mod tests {
     #[test]
     fn test_sidecar_unknown_schema_version_falls_back() {
         // schema_version 不认识：parse_sidecar 明确报错，load 回退 markdown（更安全的选项）
-        let sidecar = build_report_sidecar(&sidecar_sample_summaries(), &HashSet::new());
+        let sidecar = build_report_sidecar(
+            &sidecar_sample_summaries(),
+            &HashSet::new(),
+            &TraceLoadStats::default(),
+        );
         let json = serde_json::to_string(&sidecar)
             .unwrap()
             .replace(REPORT_SIDECAR_SCHEMA_VERSION, "trace_eval_report_v999");
@@ -3249,7 +3435,11 @@ mod tests {
         let dir = temp_test_dir("prefer");
         let report_path = dir.join("report.md");
         fs::write(&report_path, "故意写非报告内容，证明未被读取").unwrap();
-        let sidecar = build_report_sidecar(&sidecar_sample_summaries(), &HashSet::new());
+        let sidecar = build_report_sidecar(
+            &sidecar_sample_summaries(),
+            &HashSet::new(),
+            &TraceLoadStats::default(),
+        );
         fs::write(
             report_path.with_extension("json"),
             serde_json::to_string_pretty(&sidecar).unwrap(),
@@ -3326,7 +3516,13 @@ mod tests {
             }],
         );
 
-        let report = build_report(&[summary1, summary2], false, &HashSet::new(), None);
+        let report = build_report(
+            &[summary1, summary2],
+            false,
+            &HashSet::new(),
+            None,
+            &TraceLoadStats::default(),
+        );
 
         assert!(report.contains("| tool_call_error | 2 | 1 | 1 |"));
         assert!(report.contains("| planning_stall_or_drift | 1 | 0 | 1 |"));
@@ -3829,6 +4025,8 @@ mod tests {
             rate_samples: HashMap::new(),
             persistent_state_updated_count: 2,
             persistent_state_updated_rate: Some(10.0),
+            unsupported_version_count: 0,
+            missing_core_field_count: 0,
             failure_type_counts: HashMap::new(),
             missing_fields: Vec::new(),
             report_date: "2026-04-17".to_string(),
@@ -3853,6 +4051,8 @@ mod tests {
             rate_samples: HashMap::new(),
             persistent_state_updated_count: 5,
             persistent_state_updated_rate: Some(22.7),
+            unsupported_version_count: 0,
+            missing_core_field_count: 0,
             failure_type_counts: HashMap::new(),
             missing_fields: Vec::new(),
             report_date: "2026-04-18".to_string(),
@@ -4280,7 +4480,13 @@ mod tests {
             }],
         );
 
-        let report = build_report(&[summary1, summary2], false, &HashSet::new(), None);
+        let report = build_report(
+            &[summary1, summary2],
+            false,
+            &HashSet::new(),
+            None,
+            &TraceLoadStats::default(),
+        );
         // 4 attempts, 2 successes = 50% recovery success rate（新格式带分母与 Wilson99 下界）
         assert!(
             report.contains("| recovery_success | 2 | 50.0% (2/4), Wilson99 下界 12.1% |"),
@@ -4404,7 +4610,13 @@ mod tests {
         assert_eq!(summary.retrieval_hit_count, 0);
         assert_eq!(summary.retrieval_latency_ms, 0);
 
-        let report = build_report(&[summary], false, &HashSet::new(), None);
+        let report = build_report(
+            &[summary],
+            false,
+            &HashSet::new(),
+            None,
+            &TraceLoadStats::default(),
+        );
         // 空 retriever_name 应显示为 (unknown)
         assert!(report.contains("(unknown)"));
     }
@@ -4550,7 +4762,13 @@ mod tests {
             persistent_state_updated: false,
         };
 
-        let report = build_report(&[s1, s2, s3], false, &HashSet::new(), None);
+        let report = build_report(
+            &[s1, s2, s3],
+            false,
+            &HashSet::new(),
+            None,
+            &TraceLoadStats::default(),
+        );
         // rule_v1: 2 traces, avg_candidates=9.0, avg_hits=4.5, avg_latency=17.5
         assert!(
             report.contains("| rule_v1 | 2 | 9.0 | 4.5 | 17.5 |"),
@@ -4709,7 +4927,13 @@ mod tests {
         s3.persistent_state_updated = false;
         s3.success = true;
 
-        let report = build_report(&[s1, s2, s3], false, &HashSet::new(), None);
+        let report = build_report(
+            &[s1, s2, s3],
+            false,
+            &HashSet::new(),
+            None,
+            &TraceLoadStats::default(),
+        );
         assert!(
             report.contains("| with persistent state updated | 2 | 66.7% |"),
             "report:\n{}",
@@ -4732,7 +4956,13 @@ mod tests {
         s4.persistent_state_updated = false;
         s4.success = false;
 
-        let report = build_report(&[s1, s2, s3, s4], false, &HashSet::new(), None);
+        let report = build_report(
+            &[s1, s2, s3, s4],
+            false,
+            &HashSet::new(),
+            None,
+            &TraceLoadStats::default(),
+        );
         // true: 2 traces, 1 success = 50.0%
         assert!(
             report.contains("| true | 2 | 1 | 50.0% |"),
@@ -4795,7 +5025,13 @@ mod tests {
         assert!(!summary.persistent_state_updated);
         assert!(!summary.is_interesting); // 无 failures 等，且 state_updated=false
 
-        let report = build_report(&[summary], false, &HashSet::new(), None);
+        let report = build_report(
+            &[summary],
+            false,
+            &HashSet::new(),
+            None,
+            &TraceLoadStats::default(),
+        );
         assert!(
             report.contains("| with persistent state updated | 0 | 0.0% |"),
             "report:\n{}",
@@ -4845,5 +5081,313 @@ mod tests {
             reasons
         );
         assert!(reasons.iter().any(|r| r.contains("baseline 覆盖率下降")));
+    }
+
+    // -----------------------------------------------------------------------
+    // Runtime failure kind -> L1 taxonomy mapping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn runtime_to_l1_mapping_covers_spec_pairs() {
+        // spec §2.G 明确给出的映射对：stalled/drift -> planning_stall_or_drift
+        assert_eq!(
+            map_failure_kind_to_l1("stalled_trajectory"),
+            "planning_stall_or_drift"
+        );
+        assert_eq!(
+            map_failure_kind_to_l1("trajectory_drift"),
+            "planning_stall_or_drift"
+        );
+        // 映射表所有目标必须是合法 L1 名（防止表内笔误）
+        for (runtime_kind, l1) in RUNTIME_FAILURE_KIND_TO_L1 {
+            assert!(
+                L1_FAILURE_TYPES.contains(l1),
+                "映射目标 {} -> {} 不是合法 L1 名",
+                runtime_kind,
+                l1
+            );
+        }
+    }
+
+    #[test]
+    fn l1_failure_types_map_to_themselves() {
+        // 幂等：旧数据/合成 baseline 已是 L1 名，映射后行为不变
+        for l1 in L1_FAILURE_TYPES {
+            assert_eq!(map_failure_kind_to_l1(l1), *l1);
+        }
+    }
+
+    #[test]
+    fn unmapped_runtime_kinds_fall_back_to_unknown_failure() {
+        // spec 未给出对应关系的其余 8 种运行时 kind（StepFailureKind::as_str 全集减去 stalled/drift）
+        // 及任意未知字符串，统一收敛到 unknown_failure（spec §1.4 未知类型约定）
+        for kind in [
+            "transient",
+            "expectation",
+            "low_value_observation",
+            "repeated_action",
+            "budget_exhausted",
+            "manual_intervention",
+            "semantic",
+            "irrecoverable",
+        ] {
+            assert_eq!(
+                map_failure_kind_to_l1(kind),
+                "unknown_failure",
+                "kind={}",
+                kind
+            );
+        }
+        assert_eq!(map_failure_kind_to_l1("brand_new_kind"), "unknown_failure");
+        assert_eq!(map_failure_kind_to_l1(""), "unknown_failure");
+    }
+
+    // -----------------------------------------------------------------------
+    // Trace schema health（版本门禁 + 缺字段疑似漂移）
+    // -----------------------------------------------------------------------
+
+    /// 字段齐全的最小合法 trace JSON（含带 serde default 的 llm_calls/failures）。
+    fn minimal_trace_json() -> serde_json::Value {
+        serde_json::json!({
+            "trace_version": "agent_trace_v1",
+            "run_id": "run-minimal",
+            "started_at": "2026-08-26T08:00:00Z",
+            "success": true,
+            "user_input": "hi",
+            "user_input_chars": 2,
+            "step_count": 1,
+            "llm_calls": [],
+            "failures": []
+        })
+    }
+
+    fn trace_from_json(value: serde_json::Value) -> AgentTrace {
+        serde_json::from_value(value).expect("测试 trace JSON 应能反序列化为 AgentTrace")
+    }
+
+    fn write_trace_file(dir: &Path, name: &str, value: serde_json::Value) {
+        fs::write(
+            dir.join(name),
+            serde_json::to_string_pretty(&value).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn summarize_maps_runtime_failure_kinds_to_l1() {
+        let mut value = minimal_trace_json();
+        value["success"] = serde_json::json!(false);
+        value["failures"] = serde_json::json!([
+            { "step": 3, "kind": "stalled_trajectory", "detail": "no progress over 3 steps" },
+            { "step": 4, "kind": "trajectory_drift", "detail": "actions diverged from plan" }
+        ]);
+        let trace = trace_from_json(value);
+        let summary = summarize_trace(&trace, &HashSet::new());
+        // 两个运行时 kind 映射到同一 L1 类，trace 内去重后只剩 1 项
+        assert_eq!(
+            summary.failure_types,
+            vec!["planning_stall_or_drift".to_string()]
+        );
+    }
+
+    #[test]
+    fn summarize_keeps_l1_failure_types_idempotent() {
+        // 旧合成数据直接写 L1 名：映射后行为不变
+        let mut value = minimal_trace_json();
+        value["failures"] =
+            serde_json::json!([{ "step": 1, "kind": "tool_call_error", "detail": "tool failed" }]);
+        let trace = trace_from_json(value);
+        let summary = summarize_trace(&trace, &HashSet::new());
+        assert_eq!(summary.failure_types, vec!["tool_call_error".to_string()]);
+    }
+
+    #[test]
+    fn runtime_stall_kinds_count_into_planning_stall_rate() {
+        // 真实运行时 kind（stalled_trajectory）现在能计入 planning_stall_rate（修复前恒 0）
+        let mut stalled = minimal_trace_json();
+        stalled["run_id"] = serde_json::json!("run-stalled");
+        stalled["success"] = serde_json::json!(false);
+        stalled["failures"] =
+            serde_json::json!([{ "step": 3, "kind": "stalled_trajectory", "detail": "x" }]);
+        let mut ok = minimal_trace_json();
+        ok["run_id"] = serde_json::json!("run-ok");
+        let summaries = vec![
+            summarize_trace(&trace_from_json(stalled), &HashSet::new()),
+            summarize_trace(&trace_from_json(ok), &HashSet::new()),
+        ];
+        let load_stats = TraceLoadStats::default();
+
+        let report = build_report(&summaries, false, &HashSet::new(), None, &load_stats);
+        assert!(
+            report.contains("| planning_stall_or_drift | 1 |"),
+            "report:\n{}",
+            report
+        );
+        assert!(
+            report.contains("| stall_or_drift hits | 1 |"),
+            "report:\n{}",
+            report
+        );
+
+        let metrics = parse_report(&report).unwrap();
+        assert!((metrics.planning_stall_rate.unwrap() - 50.0).abs() < 0.01);
+
+        let sidecar = build_report_sidecar(&summaries, &HashSet::new(), &load_stats);
+        assert_eq!(sidecar.rates["planning_stall_rate"].hits, 1);
+        assert_eq!(sidecar.failure_type_counts["planning_stall_or_drift"], 1);
+    }
+
+    #[test]
+    fn load_counts_unsupported_version_without_dropping_trace() {
+        let dir = temp_test_dir("unsupported_version");
+        let mut ok = minimal_trace_json();
+        ok["run_id"] = serde_json::json!("run-ok");
+        let mut future = minimal_trace_json();
+        future["run_id"] = serde_json::json!("run-future");
+        future["trace_version"] = serde_json::json!("agent_trace_v9");
+        write_trace_file(&dir, "a.json", ok);
+        write_trace_file(&dir, "b.json", future);
+
+        let mut stats = TraceLoadStats::default();
+        let traces = load_traces_from_dir(&dir, &mut stats);
+        // 不认识的版本不中断加载，但计入告警
+        assert_eq!(traces.len(), 2);
+        assert_eq!(stats.unsupported_version_count, 1);
+        assert!(stats.missing_core_field_counts.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_counts_missing_core_fields_as_suspected_drift() {
+        let dir = temp_test_dir("missing_core_fields");
+        write_trace_file(&dir, "a.json", minimal_trace_json());
+        // 缺 llm_calls / failures：serde default 静默补空，加载成功但应被计数
+        let mut drifted = minimal_trace_json();
+        drifted["run_id"] = serde_json::json!("run-drifted");
+        let obj = drifted.as_object_mut().unwrap();
+        obj.remove("llm_calls");
+        obj.remove("failures");
+        write_trace_file(&dir, "b.json", drifted);
+
+        let mut stats = TraceLoadStats::default();
+        let traces = load_traces_from_dir(&dir, &mut stats);
+        assert_eq!(traces.len(), 2);
+        assert_eq!(stats.unsupported_version_count, 0);
+        assert_eq!(stats.missing_core_field_counts.get("llm_calls"), Some(&1));
+        assert_eq!(stats.missing_core_field_counts.get("failures"), Some(&1));
+        assert_eq!(stats.missing_core_field_counts.get("success"), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_shows_trace_schema_health_section() {
+        let summary = make_summary("run-1", vec![]);
+        let load_stats = TraceLoadStats {
+            unsupported_version_count: 2,
+            missing_core_field_counts: BTreeMap::from([("llm_calls".to_string(), 3)]),
+        };
+
+        let report = build_report(&[summary], false, &HashSet::new(), None, &load_stats);
+        assert!(
+            report.contains("## Trace Schema Health"),
+            "report:\n{}",
+            report
+        );
+        assert!(
+            report.contains("| unsupported_version_count | 2 |"),
+            "report:\n{}",
+            report
+        );
+        assert!(
+            report.contains("| missing_field:llm_calls | 3 |"),
+            "report:\n{}",
+            report
+        );
+        // 未缺失的字段也展示为 0，保证表格行稳定可解析
+        assert!(
+            report.contains("| missing_field:failures | 0 |"),
+            "report:\n{}",
+            report
+        );
+        // 有计数时附带疑似漂移告警行
+        assert!(report.contains("schema 疑似漂移"), "report:\n{}", report);
+    }
+
+    #[test]
+    fn schema_health_roundtrip_sidecar_and_markdown() {
+        let summaries = sidecar_sample_summaries();
+        let load_stats = TraceLoadStats {
+            unsupported_version_count: 1,
+            missing_core_field_counts: BTreeMap::from([("failures".to_string(), 2)]),
+        };
+
+        let sidecar = build_report_sidecar(&summaries, &HashSet::new(), &load_stats);
+        assert_eq!(sidecar.unsupported_version_count, 1);
+        assert_eq!(sidecar.missing_core_field_counts.get("failures"), Some(&2));
+
+        // compare 两条消费路径（sidecar 优先 / markdown 回退）都能读出新计数
+        let json = serde_json::to_string_pretty(&sidecar).unwrap();
+        let from_sidecar = parse_sidecar(&json).unwrap();
+        assert_eq!(from_sidecar.unsupported_version_count, 1);
+        assert_eq!(from_sidecar.missing_core_field_count, 2);
+
+        let from_markdown = parse_report(&build_report(
+            &summaries,
+            false,
+            &HashSet::new(),
+            None,
+            &load_stats,
+        ))
+        .unwrap();
+        assert_eq!(from_markdown.unsupported_version_count, 1);
+        assert_eq!(from_markdown.missing_core_field_count, 2);
+    }
+
+    #[test]
+    fn old_sidecar_and_markdown_without_schema_health_parse_as_zero() {
+        // 旧 sidecar（无新字段）：serde default 兜底为 0，不触发 markdown 回退
+        let sidecar = build_report_sidecar(
+            &sidecar_sample_summaries(),
+            &HashSet::new(),
+            &TraceLoadStats::default(),
+        );
+        let mut value = serde_json::to_value(&sidecar).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("unsupported_version_count");
+        obj.remove("missing_core_field_counts");
+        let metrics = parse_sidecar(&serde_json::to_string(&value).unwrap()).unwrap();
+        assert_eq!(metrics.unsupported_version_count, 0);
+        assert_eq!(metrics.missing_core_field_count, 0);
+
+        // 旧 markdown 报告（无 Trace Schema Health 小节）：解析不受影响
+        let metrics = parse_report(&minimal_report()).unwrap();
+        assert_eq!(metrics.unsupported_version_count, 0);
+        assert_eq!(metrics.missing_core_field_count, 0);
+    }
+
+    #[test]
+    fn compare_report_shows_schema_health_observability() {
+        let before = CompareMetrics {
+            unsupported_version_count: 1,
+            missing_core_field_count: 2,
+            ..Default::default()
+        };
+        let after = CompareMetrics::default();
+        let report = build_compare_report(&before, &after, &[], &[], Verdict::Pass, &[]);
+        assert!(
+            report.contains("## Trace Schema Health (observability only, not gate)"),
+            "report:\n{}",
+            report
+        );
+        assert!(
+            report.contains("| unsupported_version_count | 1 | 0 |"),
+            "report:\n{}",
+            report
+        );
+        assert!(
+            report.contains("| missing_core_field_count | 2 | 0 |"),
+            "report:\n{}",
+            report
+        );
     }
 }

@@ -6,6 +6,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+crate::define_module_loggers!(
+    info = log_embedding_cache_info,
+    warn = log_embedding_cache_warn
+);
+
 /// 带持久化缓存的 EmbeddingProvider 装饰器。
 ///
 /// 设计约束：
@@ -49,32 +54,54 @@ impl CachedEmbeddingProvider {
         &self.model_name
     }
 
+    /// 缓存 DB 打开失败时打 warn 结构化日志，随后按 cache miss 处理（不阻塞主流程）。
+    fn log_cache_open_failure(&self, op: &str, err: &anyhow::Error) {
+        log_embedding_cache_warn(
+            "embedding_cache_db_open_failed",
+            vec![
+                ("op", json!(op)),
+                ("model_name", json!(self.cache_model_name())),
+                ("db_path", json!(self.db_path.display().to_string())),
+                ("error", json!(err.to_string())),
+            ],
+        );
+    }
+
     /// 内部辅助：打开 task_store 连接读取缓存。
     fn get_cached(&self, text: &str) -> Option<Vec<f32>> {
-        let store = TaskStore::open(&self.db_path).ok()?;
-        store.get_embedding(text, self.cache_model_name())
+        match TaskStore::open(&self.db_path) {
+            Ok(store) => store.get_embedding(text, self.cache_model_name()),
+            Err(err) => {
+                self.log_cache_open_failure("get", &err);
+                None
+            }
+        }
     }
 
     /// 内部辅助：打开 task_store 连接写入缓存。
     fn put_cached(&self, text: &str, vector: &[f32]) {
-        if let Ok(store) = TaskStore::open(&self.db_path) {
-            store.put_embedding(text, self.cache_model_name(), vector);
+        match TaskStore::open(&self.db_path) {
+            Ok(store) => store.put_embedding(text, self.cache_model_name(), vector),
+            Err(err) => self.log_cache_open_failure("put", &err),
         }
     }
 
     /// 内部辅助：批量读取缓存。
     fn get_cached_batch(&self, texts: &[String]) -> Vec<Option<Vec<f32>>> {
-        let store = match TaskStore::open(&self.db_path) {
-            Ok(s) => s,
-            Err(_) => return vec![None; texts.len()],
-        };
-        store.get_embeddings_batch(texts, self.cache_model_name())
+        match TaskStore::open(&self.db_path) {
+            Ok(store) => store.get_embeddings_batch(texts, self.cache_model_name()),
+            Err(err) => {
+                self.log_cache_open_failure("get_batch", &err);
+                vec![None; texts.len()]
+            }
+        }
     }
 
     /// 内部辅助：批量写入缓存。
     fn put_cached_batch(&self, texts: &[String], vectors: &[Vec<f32>]) {
-        if let Ok(store) = TaskStore::open(&self.db_path) {
-            store.put_embeddings_batch(texts, self.cache_model_name(), vectors);
+        match TaskStore::open(&self.db_path) {
+            Ok(store) => store.put_embeddings_batch(texts, self.cache_model_name(), vectors),
+            Err(err) => self.log_cache_open_failure("put_batch", &err),
         }
     }
 }
@@ -97,8 +124,7 @@ impl EmbeddingProvider for CachedEmbeddingProvider {
         self.miss_count.fetch_add(1, Ordering::SeqCst);
 
         // 4. 记录 miss 日志（含实际 latency，用于计算命中收益）
-        crate::logging::emit_structured_log(
-            "info",
+        log_embedding_cache_info(
             "embedding_cache_miss",
             vec![
                 ("model_name", json!(self.cache_model_name())),
@@ -122,8 +148,7 @@ impl EmbeddingProvider for CachedEmbeddingProvider {
         if miss_count == 0 {
             // 全部命中
             self.hit_count.fetch_add(texts.len(), Ordering::SeqCst);
-            crate::logging::emit_structured_log(
-                "info",
+            log_embedding_cache_info(
                 "embedding_cache_hit_batch",
                 vec![
                     ("model_name", json!(self.cache_model_name())),
@@ -170,8 +195,7 @@ impl EmbeddingProvider for CachedEmbeddingProvider {
             result[original_idx] = Some(vec);
         }
 
-        crate::logging::emit_structured_log(
-            "info",
+        log_embedding_cache_info(
             "embedding_cache_miss_batch",
             vec![
                 ("model_name", json!(self.cache_model_name())),
@@ -290,6 +314,25 @@ mod tests {
         let result = cached.embed_query("test").unwrap();
         assert_eq!(result.len(), 4);
         assert_eq!(cached.miss_count(), 1);
+    }
+
+    #[test]
+    fn cached_provider_batch_survives_db_missing() {
+        // 批量读写缓存 DB 打开失败：打 warn 后按全量 miss 处理，不影响 inner provider
+        let bad_path = "/nonexistent/dir/test.db";
+        let cached = CachedEmbeddingProvider::new(Box::new(FakeProvider), bad_path);
+
+        let texts = vec!["a".to_string(), "b".to_string()];
+        let results = cached.embed_documents(&texts).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(cached.hit_count(), 0);
+        assert_eq!(cached.miss_count(), 2);
+
+        // 第二次调用仍走 miss（缓存写入失败，不会留下脏数据）
+        let results = cached.embed_documents(&texts).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(cached.miss_count(), 4);
     }
 
     #[test]

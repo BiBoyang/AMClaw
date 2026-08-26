@@ -1,10 +1,8 @@
 use crate::retriever::rule::RuleRetriever;
-use crate::retriever::{
-    embedding::EmbeddingProvider, RetrieveQuery, RetrieveResult, RetrievedItem, Retriever,
-};
-use anyhow::{Context, Result};
+use crate::retriever::semantic_common::{self, RerankConfig};
+use crate::retriever::{embedding::EmbeddingProvider, RetrieveQuery, RetrieveResult, Retriever};
+use anyhow::Result;
 use std::path::PathBuf;
-use std::time::Instant;
 
 const SEMANTIC_COARSE_LIMIT: usize = 1000;
 
@@ -18,6 +16,8 @@ const SEMANTIC_COARSE_LIMIT: usize = 1000;
 /// 与 HybridRetriever 的区别：
 /// - Hybrid：规则召回量小（limit*3 或 15），最终分数 = α * 语义 + (1-α) * 规则
 /// - Semantic：规则召回量大（1000），最终分数 = 纯语义相似度
+///
+/// 具体实现共享自 [`semantic_common`]，本结构只表达 semantic 的差异配置。
 ///
 /// 容错：
 /// - provider 报错 / query_text 为空 -> 回退到 rule（retriever_name 带 semantic_fallback）
@@ -44,194 +44,31 @@ impl SemanticRetriever {
         self.name = name.into();
         self
     }
-
-    /// 计算余弦相似度。
-    /// 输入向量未归一化时自动除以模长。
-    fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
-        if a.len() != b.len() || a.is_empty() {
-            return 0.0;
-        }
-        let mut dot = 0.0f64;
-        let mut norm_a = 0.0f64;
-        let mut norm_b = 0.0f64;
-        for (av, bv) in a.iter().zip(b.iter()) {
-            let av64 = *av as f64;
-            let bv64 = *bv as f64;
-            dot += av64 * bv64;
-            norm_a += av64 * av64;
-            norm_b += bv64 * bv64;
-        }
-        if norm_a == 0.0 || norm_b == 0.0 {
-            return 0.0;
-        }
-        (dot / (norm_a.sqrt() * norm_b.sqrt())).clamp(-1.0, 1.0)
-    }
-
-    /// 执行语义检索，失败时回退到 rule。
-    fn retrieve_with_fallback(&self, query: &RetrieveQuery) -> Result<RetrieveResult> {
-        let started = Instant::now();
-        let limit = if query.limit > 0 { query.limit } else { 15 };
-
-        // --- coarse 召回：取大量候选供语义排序 ---
-        let coarse_query = RetrieveQuery {
-            user_id: query.user_id.clone(),
-            query_text: query.query_text.clone(),
-            limit: SEMANTIC_COARSE_LIMIT,
-            context_hints: query.context_hints.clone(),
-        };
-        let coarse_result = self
-            .rule_retriever
-            .retrieve(&coarse_query)
-            .with_context(|| "SemanticRetriever coarse 召回失败")?;
-
-        // --- 检查 query_text ---
-        let query_text = match query.query_text.as_deref() {
-            Some(text) if !text.trim().is_empty() => text.trim(),
-            _ => {
-                return Ok(self.fallback_to_rule(
-                    coarse_result,
-                    "query_text_empty",
-                    started,
-                    limit,
-                ));
-            }
-        };
-
-        // --- embedding 编码 ---
-        let query_vec = match self.embedding_provider.embed_query(query_text) {
-            Ok(v) => v,
-            Err(err) => {
-                return Ok(self.fallback_to_rule(
-                    coarse_result,
-                    &format!("embedding_error: {}", err),
-                    started,
-                    limit,
-                ));
-            }
-        };
-
-        if coarse_result.candidates.is_empty() {
-            return Ok(RetrieveResult {
-                candidates: Vec::new(),
-                hit_count: 0,
-                dropped_count: 0,
-                latency_ms: started.elapsed().as_millis().max(1),
-                retriever_name: self.name.clone(),
-            });
-        }
-
-        let contents: Vec<String> = coarse_result
-            .candidates
-            .iter()
-            .map(|item| item.content.clone())
-            .collect();
-
-        let doc_vecs = match self.embedding_provider.embed_documents(&contents) {
-            Ok(v) => v,
-            Err(err) => {
-                return Ok(self.fallback_to_rule(
-                    coarse_result,
-                    &format!("embedding_documents_error: {}", err),
-                    started,
-                    limit,
-                ));
-            }
-        };
-
-        if doc_vecs.len() != coarse_result.candidates.len() {
-            return Ok(self.fallback_to_rule(
-                coarse_result,
-                "embedding_documents_count_mismatch",
-                started,
-                limit,
-            ));
-        }
-
-        // --- 纯语义打分并排序 ---
-        let mut scored: Vec<(usize, f64)> = coarse_result
-            .candidates
-            .iter()
-            .zip(doc_vecs.iter())
-            .enumerate()
-            .map(|(idx, (_item, doc_vec))| {
-                let semantic_score = Self::cosine_similarity(&query_vec, doc_vec).clamp(0.0, 1.0);
-                (idx, semantic_score)
-            })
-            .collect();
-
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(limit);
-
-        // --- 构建结果，补 metadata ---
-        let model_name = self.embedding_provider.model_name().to_string();
-        let mut candidates = Vec::with_capacity(scored.len());
-        for (original_idx, semantic_score) in scored {
-            let mut item = coarse_result.candidates[original_idx].clone();
-
-            item.score = Some(semantic_score);
-            item.metadata.insert(
-                "semantic_score".to_string(),
-                format!("{:.4}", semantic_score),
-            );
-            item.metadata
-                .insert("retrieval_mode".to_string(), "semantic".to_string());
-            item.metadata
-                .insert("embedding_model".to_string(), model_name.clone());
-
-            candidates.push(item);
-        }
-
-        Ok(RetrieveResult {
-            candidates,
-            hit_count: 0,
-            dropped_count: 0,
-            latency_ms: started.elapsed().as_millis().max(1),
-            retriever_name: self.name.clone(),
-        })
-    }
-
-    /// 回退到 rule 结果，限制条数并标记 fallback。
-    fn fallback_to_rule(
-        &self,
-        coarse_result: RetrieveResult,
-        reason: &str,
-        started: Instant,
-        limit: usize,
-    ) -> RetrieveResult {
-        let candidates: Vec<RetrievedItem> = coarse_result
-            .candidates
-            .into_iter()
-            .take(limit)
-            .map(|mut item| {
-                item.metadata.insert(
-                    "retrieval_mode".to_string(),
-                    "semantic_fallback".to_string(),
-                );
-                item.metadata
-                    .insert("fallback_reason".to_string(), reason.to_string());
-                item
-            })
-            .collect();
-
-        RetrieveResult {
-            candidates,
-            hit_count: 0,
-            dropped_count: 0,
-            latency_ms: started.elapsed().as_millis().max(1),
-            retriever_name: format!("{}_fallback", self.name),
-        }
-    }
 }
 
 impl Retriever for SemanticRetriever {
     fn retrieve(&self, query: &RetrieveQuery) -> Result<RetrieveResult> {
-        self.retrieve_with_fallback(query)
+        semantic_common::retrieve_with_fallback(
+            &self.rule_retriever,
+            self.embedding_provider.as_ref(),
+            query,
+            RerankConfig {
+                display_name: "SemanticRetriever",
+                name: &self.name,
+                mode: "semantic",
+                coarse_limit: SEMANTIC_COARSE_LIMIT,
+                blend: |_rule_score, semantic_score| semantic_score,
+                include_blend_metadata: false,
+            },
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::retriever::hybrid::HybridRetriever;
+    use crate::retriever::test_common::{FailingEmbeddingProvider, FakeEmbeddingProvider};
     use crate::retriever::Retriever;
     use crate::task_store::{MemoryType, TaskStore};
     use std::env::temp_dir;
@@ -239,49 +76,6 @@ mod tests {
 
     fn temp_db_path() -> PathBuf {
         temp_dir().join(format!("amclaw_semantic_test_{}.db", Uuid::new_v4()))
-    }
-
-    /// 一个假的 EmbeddingProvider，用于测试。
-    /// embed_query 返回基于文本 hash 的固定向量。
-    /// embed_documents 返回基于每个文本 hash 的固定向量。
-    struct FakeEmbeddingProvider;
-
-    impl EmbeddingProvider for FakeEmbeddingProvider {
-        fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
-            let hash = text
-                .bytes()
-                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-            let mut vec = vec![0.0f32; 4];
-            for (i, slot) in vec.iter_mut().enumerate() {
-                *slot = ((hash.wrapping_add(i as u64)) % 1000) as f32 / 1000.0;
-            }
-            Ok(vec)
-        }
-
-        fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            texts.iter().map(|text| self.embed_query(text)).collect()
-        }
-
-        fn model_name(&self) -> &str {
-            "fake_test_model"
-        }
-    }
-
-    /// 总是返回错误的 FakeProvider，用于测试 fallback。
-    struct FailingEmbeddingProvider;
-
-    impl EmbeddingProvider for FailingEmbeddingProvider {
-        fn embed_query(&self, _text: &str) -> Result<Vec<f32>> {
-            anyhow::bail!("simulated embedding failure")
-        }
-
-        fn embed_documents(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            anyhow::bail!("simulated embedding failure")
-        }
-
-        fn model_name(&self) -> &str {
-            "failing_model"
-        }
     }
 
     #[test]
@@ -347,6 +141,43 @@ mod tests {
             result.candidates[0].metadata.get("retrieval_mode"),
             Some(&"semantic_fallback".to_string())
         );
+    }
+
+    #[test]
+    fn semantic_fallback_metadata_matches_hybrid_fallback() {
+        // 同样的失败 provider 下，两种实现的 fallback metadata 口径应一致
+        let db_path = temp_db_path();
+        let mut store = TaskStore::open(&db_path).expect("初始化失败");
+        store
+            .add_user_memory_typed("user-sem-fb", "测试内容", MemoryType::Auto, 70)
+            .expect("写入失败");
+
+        let query = RetrieveQuery::new("user-sem-fb", 5).with_query_text("测试");
+
+        let semantic = SemanticRetriever::new(&db_path, Box::new(FailingEmbeddingProvider));
+        let sem_result = semantic.retrieve(&query).expect("检索应成功（fallback）");
+        let hybrid = HybridRetriever::new(&db_path, Box::new(FailingEmbeddingProvider));
+        let hyb_result = hybrid.retrieve(&query).expect("检索应成功（fallback）");
+
+        for (mode, item) in [
+            ("semantic_fallback", &sem_result.candidates[0]),
+            ("hybrid_fallback", &hyb_result.candidates[0]),
+        ] {
+            assert_eq!(item.metadata.get("retrieval_mode"), Some(&mode.to_string()));
+            assert!(
+                item.metadata.contains_key("fallback_reason"),
+                "{mode} 应有 fallback_reason"
+            );
+            assert!(
+                item.metadata.contains_key("rule_score"),
+                "{mode} 应补 rule_score"
+            );
+            assert_eq!(
+                item.metadata.get("embedding_model"),
+                Some(&"failing_model".to_string()),
+                "{mode} 应补 embedding_model"
+            );
+        }
     }
 
     #[test]

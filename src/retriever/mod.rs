@@ -53,8 +53,8 @@ pub struct RetrievedItem {
 /// 单次检索的完整结果。
 ///
 /// candidates: 原始候选列表（未经过预算裁剪）
-/// hit_count: 实际命中/注入的条数（由上层 SessionState 裁剪后决定）
-/// dropped_count: 被裁剪掉的条数
+/// hit_count / dropped_count: 预留字段，当前所有实现恒返回 0，无消费方读取；
+///   实际的命中/裁剪统计由 agent_core 的 SessionState / trace 另行计算，不经由此字段。
 /// latency_ms: 检索耗时（毫秒）
 /// retriever_name: 实现标识，用于 trace 与 A/B 对比
 #[derive(Debug, Clone)]
@@ -94,4 +94,7 @@ pub mod guarded;
 pub mod hybrid;
 pub mod rule;
 pub mod semantic;
+pub(crate) mod semantic_common;
 pub mod shadow;
+#[cfg(test)]
+pub(crate) mod test_common;

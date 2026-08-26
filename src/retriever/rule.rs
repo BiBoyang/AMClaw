@@ -52,7 +52,7 @@ impl Retriever for RuleRetriever {
 
         Ok(RetrieveResult {
             candidates,
-            hit_count: 0,     // 由上层 SessionState 裁剪后回填
+            hit_count: 0,     // 预留字段，恒为 0（见 RetrieveResult 文档）
             dropped_count: 0, // 同上
             latency_ms,
             retriever_name: self.name.clone(),

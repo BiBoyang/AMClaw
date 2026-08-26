@@ -90,6 +90,7 @@ ORDER BY priority DESC,
 | AgentRunTrace JSON | `memory_retrieved_count` | DB 取出条数 |
 | AgentRunTrace JSON | `memory_total_chars` | 注入总字符数 |
 | AgentRunTrace JSON | `memory_injected_total_chars` | 注入总字符数（兼容字段） |
+| AgentRunTrace JSON | `memory_dropped` | 被裁剪记忆明细（id/preview/reason） |
 | AgentRunTrace Markdown | `memory_hit_count (injected)` | 注入条数（标注语义） |
 | AgentRunTrace Markdown | `memory_retrieved_count` | DB 取出条数 |
 | AgentRunTrace Markdown | `memory_total_chars (injected)` | 注入总字符数（标注语义） |

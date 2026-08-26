@@ -37,7 +37,7 @@
 | 标签 | 定义 | 判定线索（先看什么字段） |
 |---|---|---|
 | `forgot_known_fact` | 事实就在注入的 context/memory 里，输出却与之矛盾或未使用 | `context_pack` 渲染内容 / `memory_ids` 注入内容 vs `final_output` |
-| `missed_retrieval` | 该取的记忆没取到（DB 里有相关记忆，但 injected 里没有） | DB 中该 user 的 active 记忆 vs `memory_retrieved_count` / `memory_ids` |
+| `missed_retrieval` | 该取的记忆没取到（DB 里有相关记忆，但 injected 里没有） | DB 中该 user 的 active 记忆 vs `memory_retrieved_count` / `memory_ids` / `memory_dropped` |
 | `wrong_retrieval` | 取到了，但取错了（注入了无关记忆，盖过或混淆了正确信息） | 注入记忆内容与 `user_input` 的相关性 |
 | `state_drift` | session state 与对话实际进展脱节（goal/constraints/next_step 过期或错误） | `session_state_snapshot` / `final_runtime_session_state` 逐步对比 |
 | `repeated_work` | 重复做已完成的事（重复调用、重复计划、返工无进展） | `tool_calls` 序列 / `replan_count` / step 间的重复模式 |
@@ -47,7 +47,7 @@
 **易混边界**：
 
 - `missed` vs `wrong`：DB 里**有**该取的没取到 → missed；取到了**不该取的**或取错对象 → wrong。两者同时发生，以"对最终结果伤害更大的"为主因，另一个写进 notes。
-- `forgot_known_fact` vs `missed_retrieval`：事实**已在注入内容里**但没用上 → forgot；事实**不在注入内容里**（压根没检索到）→ missed。判这个边界需要看清渲染后 prompt 实际内容——若 trace 只有计数没有内容切片，标 `uncertain` 并记录字段缺口（这正是"eval 反向塑造 trace"的反馈点）。
+- `forgot_known_fact` vs `missed_retrieval`：事实**已在注入内容里**但没用上 → forgot；事实**不在注入内容里**（压根没检索到）→ missed。判这个边界需要看清渲染后 prompt 实际内容：注入内容看 `llm_calls[].prompt.user_prompt` 全文与 `context_sections[].content`，被预算裁剪的记忆看 `memory_dropped` 明细；若这些字段都缺失，标 `uncertain` 并记录字段缺口（这正是"eval 反向塑造 trace"的反馈点）。
 - `state_drift` vs `repeated_work`：状态过期**导致**的重复劳动，主因记 `state_drift`；状态正确但行为层面重复 → `repeated_work`。
 
 ## 4) 标注格式纪律

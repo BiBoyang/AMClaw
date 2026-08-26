@@ -11,6 +11,7 @@
 1. 聚合当日归档文章。
 2. 生成 `daily-YYYY-MM-DD.md` 报告内容。
 3. 产出可回传微信的精简摘要。
+4. 提供报告快照路径约定（`daily_report_path` / `weekly_report_path`，位于 `root_dir/reports/`），供 chat_adapter 查询与定时推送读优先复用已生成快照；生成写入与读优先共用同一路径函数。
 
 ## 不做事项
 

@@ -18,7 +18,7 @@
 3. 公众号链接浏览器抓取、截图、正文归档
 4. 抓取失败转入 `awaiting_manual_input` 并支持人工补正文
 5. 任务重试、最近任务、待补录任务查询
-6. 本地日报生成、微信内日报查询与最小自动回传
+6. 本地日报 / 周报生成（scheduler 单点定时触发）、微信内快照查询与定时回传（失败段落落库补发）
 7. 最小会话恢复、用户记忆与主题/偏好自动提炼
 8. Plan-aware ReAct runtime、失败语义与最小 watchdog
 
@@ -81,7 +81,7 @@
 14. `src/tool_registry/`
     - 现有实现：工具白名单、工作区路径边界校验与统一执行入口
 15. `src/mode_policy/`
-    - 现有实现：restricted / unrestricted 工具动作与 URL 门禁
+    - 现有实现：restricted / unrestricted URL 门禁
 16. `src/reporter/`
     - 现有实现：日报 / 周报 Markdown 生成与摘要
 17. `src/bin/`

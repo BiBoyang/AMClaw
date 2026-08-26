@@ -59,16 +59,31 @@ impl DailyReporter {
         format_week_key(now.iso_week().year(), now.iso_week().week())
     }
 
+    /// 报告快照目录（root_dir/reports），生成写入与读优先复用同一约定。
+    fn reports_dir(&self) -> PathBuf {
+        self.root_dir.join("reports")
+    }
+
+    /// 日报快照路径：root_dir/reports/daily-{day}.md。
+    pub fn daily_report_path(&self, day: &str) -> PathBuf {
+        self.reports_dir().join(format!("daily-{day}.md"))
+    }
+
+    /// 周报快照路径：root_dir/reports/weekly-{week}.md（week 需为归一化后的 YYYY-WW）。
+    pub fn weekly_report_path(&self, week: &str) -> PathBuf {
+        self.reports_dir().join(format!("weekly-{week}.md"))
+    }
+
     pub fn generate_for_day(&self, day: &str) -> Result<DailyReportOutput> {
         let store = TaskStore::open(&self.db_path)?;
         let (start, end) =
             day_range(day, self.timezone).with_context(|| format!("无法计算日期范围: {day}"))?;
         let entries = store.list_archived_tasks_in_range(&start, &end, 500)?;
 
-        let reports_dir = self.root_dir.join("reports");
+        let reports_dir = self.reports_dir();
         fs::create_dir_all(&reports_dir)
             .with_context(|| format!("创建报告目录失败: {}", reports_dir.display()))?;
-        let markdown_path = reports_dir.join(format!("daily-{day}.md"));
+        let markdown_path = self.daily_report_path(day);
         let content = render_daily_report_markdown(day, &entries);
         fs::write(&markdown_path, content)
             .with_context(|| format!("写入日报失败: {}", markdown_path.display()))?;
@@ -97,10 +112,10 @@ impl DailyReporter {
             week_range(&week, self.timezone).with_context(|| format!("无法计算周范围: {week}"))?;
         let entries = store.list_archived_tasks_in_range(&start, &end, 2000)?;
 
-        let reports_dir = self.root_dir.join("reports");
+        let reports_dir = self.reports_dir();
         fs::create_dir_all(&reports_dir)
             .with_context(|| format!("创建报告目录失败: {}", reports_dir.display()))?;
-        let markdown_path = reports_dir.join(format!("weekly-{week}.md"));
+        let markdown_path = self.weekly_report_path(&week);
         let content = render_weekly_report_markdown(&week, &entries);
         fs::write(&markdown_path, content)
             .with_context(|| format!("写入周报失败: {}", markdown_path.display()))?;
@@ -694,5 +709,48 @@ timezone = "Asia/Shanghai"
             output.summary.contains("Boundary 1") || output.summary.contains("Boundary 2"),
             "返回的数据应是边界内的两条"
         );
+    }
+
+    #[test]
+    fn report_path_helpers_match_generated_markdown_paths() {
+        let root = temp_root();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[storage]
+root_dir = "./data"
+
+[agent]
+timezone = "Asia/Shanghai"
+"#,
+        )
+        .expect("写入配置失败");
+        let config = AppConfig::load_or_create(&config_path).expect("加载配置失败");
+        let reporter = DailyReporter::from_config(&config).expect("初始化 reporter 失败");
+        let day = reporter.current_day();
+        let week = reporter.current_week();
+
+        // 路径约定：root_dir/reports/{daily,weekly}-*.md
+        assert_eq!(
+            reporter.daily_report_path(&day),
+            root.join("data")
+                .join("reports")
+                .join(format!("daily-{day}.md"))
+        );
+        assert_eq!(
+            reporter.weekly_report_path(&week),
+            root.join("data")
+                .join("reports")
+                .join(format!("weekly-{week}.md"))
+        );
+
+        // 生成写入的路径与读优先使用的路径必须一致，否则读优先永远落空
+        let daily = reporter.generate_for_day(&day).expect("生成日报失败");
+        assert_eq!(daily.markdown_path, reporter.daily_report_path(&day));
+        let weekly = reporter
+            .generate_weekly_for_week(&week)
+            .expect("生成周报失败");
+        assert_eq!(weekly.markdown_path, reporter.weekly_report_path(&week));
     }
 }

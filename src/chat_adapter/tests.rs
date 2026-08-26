@@ -667,6 +667,182 @@ fn weekly_report_query_builds_reply() {
     assert!(!reply.contains("output_path:"));
 }
 
+/// 写入一份快照文件，返回其路径。
+fn write_report_snapshot(path: &Path, content: &str) {
+    std::fs::create_dir_all(path.parent().expect("快照路径应有父目录")).expect("创建快照目录失败");
+    std::fs::write(path, content).expect("写入快照失败");
+}
+
+#[test]
+fn daily_report_query_prefers_existing_snapshot() {
+    let db_path = temp_db_path();
+    let bot = test_bot(&db_path);
+    let day = bot.reporter.current_day();
+    write_report_snapshot(
+        &bot.reporter.daily_report_path(&day),
+        &format!("# AMClaw Daily Report {day}\n\n- archived_count: 7\n\n## Archived Tasks\n\nSNAPSHOT_SENTINEL\n"),
+    );
+
+    let reply = bot.build_daily_report_query_reply(Some(&day));
+
+    // 命中快照：直接读文件返回，不重新生成
+    // （DB 为空，若走了生成路径 archived_count 会是 0 且不含 sentinel）
+    assert!(reply.contains("SNAPSHOT_SENTINEL"));
+    assert!(reply.contains("archived_count: 7"));
+}
+
+#[test]
+fn daily_report_query_generates_only_when_snapshot_for_requested_day_missing() {
+    let db_path = temp_db_path();
+    let mut bot = test_bot(&db_path);
+    let created = bot
+        .task_store
+        .record_link_submission("https://example.com/fresh-item")
+        .expect("写入任务失败");
+    bot.task_store
+        .claim_task(&created.task_id, "test-worker", 300)
+        .expect("claim 失败");
+    bot.task_store
+        .mark_task_archived(
+            &created.task_id,
+            MarkTaskArchivedInput {
+                output_path: "/tmp/fresh-item.md",
+                title: Some("Fresh Item"),
+                page_kind: Some("article"),
+                snapshot_path: None,
+                content_source: Some("http"),
+                summary: None,
+            },
+        )
+        .expect("更新 archived 状态失败");
+
+    // 预写"昨天"的快照：不影响今天的查询
+    let yesterday = (chrono::Utc::now().with_timezone(&chrono_tz::Asia::Shanghai)
+        - chrono::TimeDelta::try_days(1).expect("一天应可表示"))
+    .format("%Y-%m-%d")
+    .to_string();
+    write_report_snapshot(
+        &bot.reporter.daily_report_path(&yesterday),
+        &format!("# AMClaw Daily Report {yesterday}\n\n- archived_count: 9\n\nSTALE_SENTINEL\n"),
+    );
+
+    // 今天无快照 → 回退现生成，包含真实归档内容
+    let today = bot.reporter.current_day();
+    let reply_today = bot.build_daily_report_query_reply(Some(&today));
+    assert!(reply_today.contains("Fresh Item"));
+    assert!(reply_today.contains("archived_count: 1"));
+    assert!(!reply_today.contains("STALE_SENTINEL"));
+
+    // 昨天有快照 → 读快照，不重新生成
+    let reply_yesterday = bot.build_daily_report_query_reply(Some(&yesterday));
+    assert!(reply_yesterday.contains("STALE_SENTINEL"));
+    assert!(reply_yesterday.contains("archived_count: 9"));
+}
+
+#[test]
+fn weekly_report_query_prefers_existing_snapshot() {
+    let db_path = temp_db_path();
+    let bot = test_bot(&db_path);
+    let week = bot.reporter.current_week();
+    write_report_snapshot(
+        &bot.reporter.weekly_report_path(&week),
+        &format!(
+            "# AMClaw Weekly Report {week}\n\n- archived_count: 3\n\nWEEKLY_SNAPSHOT_SENTINEL\n"
+        ),
+    );
+
+    let reply = bot.build_weekly_report_query_reply(Some(&week));
+
+    assert!(reply.contains("WEEKLY_SNAPSHOT_SENTINEL"));
+    assert!(reply.contains("archived_count: 3"));
+}
+
+#[test]
+fn snapshot_reply_truncates_with_parsed_archived_count() {
+    let db_path = temp_db_path();
+    let bot = test_bot(&db_path);
+    let day = bot.reporter.current_day();
+    let mut content = format!("# AMClaw Daily Report {day}\n\n- archived_count: 42\n\n");
+    content.push_str(&"长".repeat(5000));
+    write_report_snapshot(&bot.reporter.daily_report_path(&day), &content);
+
+    let reply = bot.build_daily_report_query_reply(Some(&day));
+
+    // 截断提示中的条数来自快照头部的 archived_count（读路径无 generate 输出可用）
+    assert!(reply.contains("已截断，共 42 条"));
+}
+
+#[test]
+fn remaining_chunks_after_failure_returns_one_based_tail() {
+    let chunks: Vec<String> = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+
+    // 第 2 段（idx=1）失败：剩余段为 2、3，索引保持 1-based
+    let remaining = super::delivery::remaining_chunks_after_failure(&chunks, 1);
+    assert_eq!(
+        remaining,
+        vec![(2, 3, "b".to_string()), (3, 3, "c".to_string())]
+    );
+
+    // 第 1 段就失败：全部段落待补发
+    let all = super::delivery::remaining_chunks_after_failure(&chunks, 0);
+    assert_eq!(
+        all,
+        vec![
+            (1, 3, "a".to_string()),
+            (2, 3, "b".to_string()),
+            (3, 3, "c".to_string())
+        ]
+    );
+}
+
+#[test]
+fn scheduled_push_partial_failure_persists_remaining_chunks() {
+    let db_path = temp_db_path();
+    let mut bot = test_bot(&db_path);
+    let chunks: Vec<String> = vec![
+        "（1/4）段一".to_string(),
+        "（2/4）段二".to_string(),
+        "（3/4）段三".to_string(),
+        "（4/4）段四".to_string(),
+    ];
+
+    // 第 2 段（idx=1）发送失败 → 2/3/4 段落补发队列，已发的第 1 段不重复
+    let handled = bot.persist_remaining_report_chunks(
+        super::delivery::ReportPushKind::Daily,
+        "2026-08-26",
+        "user-push",
+        "ctx-token-1",
+        &chunks,
+        1,
+    );
+    assert!(handled, "落库成功时本周期应视为已处理");
+
+    let pending = bot
+        .task_store
+        .list_pending_chunks(10)
+        .expect("查询 pending chunks 失败");
+    assert_eq!(pending.len(), 3);
+    for (expected_idx, chunk) in pending.iter().enumerate() {
+        assert_eq!(chunk.user_id, "user-push");
+        assert_eq!(chunk.context_token, "ctx-token-1");
+        assert_eq!(chunk.chunk_index, expected_idx + 2);
+        assert_eq!(chunk.chunk_total, 4);
+        assert_eq!(chunk.chunk_text, chunks[expected_idx + 1]);
+    }
+
+    // 模拟补发循环：发送成功后逐条删除，队列清空即补发完成
+    for chunk in &pending {
+        bot.task_store
+            .delete_pending_chunk(chunk.id)
+            .expect("删除 pending chunk 失败");
+    }
+    let remaining = bot
+        .task_store
+        .list_pending_chunks(10)
+        .expect("查询 pending chunks 失败");
+    assert!(remaining.is_empty());
+}
+
 #[test]
 fn pending_chat_session_is_persisted() {
     let db_path = temp_db_path();

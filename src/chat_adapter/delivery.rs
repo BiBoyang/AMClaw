@@ -93,6 +93,44 @@ pub(super) fn should_send_processing_ack(user_text: &str) -> bool {
     user_text.trim().chars().count() >= super::PROCESSING_ACK_MIN_INPUT_CHARS
 }
 
+/// 定时报告推送类型（区分 daily / weekly 的日志事件与状态字段）。
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ReportPushKind {
+    Daily,
+    Weekly,
+}
+
+impl ReportPushKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Daily => "daily",
+            Self::Weekly => "weekly",
+        }
+    }
+
+    /// 日志字段名：日报用 day、周报用 week。
+    fn period_field(self) -> &'static str {
+        match self {
+            Self::Daily => "day",
+            Self::Weekly => "week",
+        }
+    }
+}
+
+/// 计算分段发送在 failed_idx（0-based）处失败后需要持久化补发的剩余段，
+/// 返回 (1-based chunk_index, chunk_total, chunk_text) 列表。
+pub(super) fn remaining_chunks_after_failure(
+    chunks: &[String],
+    failed_idx: usize,
+) -> Vec<(usize, usize, String)> {
+    let chunk_total = chunks.len();
+    chunks[failed_idx..]
+        .iter()
+        .enumerate()
+        .map(|(offset, text)| (failed_idx + offset + 1, chunk_total, text.clone()))
+        .collect()
+}
+
 impl super::WeChatBot {
     pub(super) fn next_poll_timeout(&self) -> std::time::Duration {
         self.session_router
@@ -339,14 +377,7 @@ impl super::WeChatBot {
             );
         } else if let Some(failed_idx) = failed_idx {
             // 把剩余未发送段持久化，供后续补发
-            let remaining: Vec<(usize, usize, String)> = chunks[failed_idx..]
-                .iter()
-                .enumerate()
-                .map(|(offset, text)| {
-                    let idx = failed_idx + offset;
-                    (idx + 1, chunk_total, text.clone())
-                })
-                .collect();
+            let remaining = remaining_chunks_after_failure(&chunks, failed_idx);
             if let Err(err) = self
                 .task_store
                 .insert_pending_chunks(user_id, &token, &remaining)
@@ -444,77 +475,14 @@ impl super::WeChatBot {
         else {
             return;
         };
-        let reply = self.build_daily_report_query_reply(Some(&day));
-        let target_user_id = schedule.report_to_user_id().to_string();
-        let token = self
-            .context_token_map
-            .get(&target_user_id)
-            .cloned()
-            .or_else(|| {
-                self.task_store
-                    .get_context_token(&target_user_id)
-                    .ok()
-                    .flatten()
-            });
-        let Some(token) = token else {
-            log_chat_warn(
-                "scheduler_daily_report_skipped",
-                vec![
-                    ("day", json!(day)),
-                    ("user_id", json!(target_user_id)),
-                    ("error_kind", json!("missing_context_token")),
-                ],
-            );
+        // 未配置推送目标时静默跳过（调度仍可正常生成快照）
+        let Some(target_user_id) = schedule.report_to_user_id().map(str::to_string) else {
             return;
         };
-
-        // 日报正文可能较长，复用分段发送
-        let chunks = split_reply_into_chunks(&reply, super::WECHAT_REPLY_CHUNK_MAX_CHARS);
-        let chunk_total = chunks.len();
-        let mut all_ok = true;
-        for (idx, chunk) in chunks.iter().enumerate() {
-            match self
-                .client
-                .send_text_message(&target_user_id, chunk, &token)
-            {
-                Ok(()) => log_chat_info(
-                    "scheduler_daily_report_chunk_sent",
-                    vec![
-                        ("day", json!(&day)),
-                        ("user_id", json!(&target_user_id)),
-                        ("chunk_index", json!(idx + 1)),
-                        ("chunk_total", json!(chunk_total)),
-                        ("chunk_chars", json!(chunk.chars().count())),
-                    ],
-                ),
-                Err(err) => {
-                    all_ok = false;
-                    log_chat_error(
-                        "scheduler_daily_report_send_failed",
-                        vec![
-                            ("day", json!(&day)),
-                            ("user_id", json!(&target_user_id)),
-                            ("chunk_index", json!(idx + 1)),
-                            ("chunk_total", json!(chunk_total)),
-                            ("error_kind", json!("scheduler_daily_report_send_failed")),
-                            ("detail", json!(err.to_string())),
-                        ],
-                    );
-                    break;
-                }
-            }
-        }
-        if all_ok {
-            self.last_daily_report_push_day = Some(day.clone());
-            log_chat_info(
-                "scheduler_daily_report_sent",
-                vec![
-                    ("day", json!(day)),
-                    ("user_id", json!(target_user_id)),
-                    ("reply_chars", json!(reply.chars().count())),
-                    ("chunk_total", json!(chunk_total)),
-                ],
-            );
+        // 读优先：scheduler 线程生成的快照存在时直接复用，缺失才现生成
+        let reply = self.build_daily_report_query_reply(Some(&day));
+        if self.push_scheduled_report(ReportPushKind::Daily, &day, &target_user_id, &reply) {
+            self.last_daily_report_push_day = Some(day);
         }
     }
 
@@ -527,77 +495,150 @@ impl super::WeChatBot {
         else {
             return;
         };
+        // 未配置推送目标时静默跳过（调度仍可正常生成快照）
+        let Some(target_user_id) = schedule.report_to_user_id().map(str::to_string) else {
+            return;
+        };
+        // 读优先：scheduler 线程生成的快照存在时直接复用，缺失才现生成
         let reply = self.build_weekly_report_query_reply(Some(&week));
-        let target_user_id = schedule.report_to_user_id().to_string();
+        if self.push_scheduled_report(ReportPushKind::Weekly, &week, &target_user_id, &reply) {
+            self.last_weekly_report_push_week = Some(week);
+        }
+    }
+
+    /// 定时报告推送共用实现：取 context_token → 分段发送。
+    ///
+    /// 返回 true 表示本周期已处理完毕（调用方推进 last_push 状态）：
+    /// - 全部发送成功；
+    /// - 中途失败但未发段落已成功落入 pending_chunks（由 resend_pending_chunks 补发，
+    ///   已发段不重复、未发段不丢失）。
+    ///
+    /// 返回 false 表示本周期未处理完，下个 poll 周期整体重试：
+    /// - 无可用 context_token（尚未发送任何段落）；
+    /// - 中途失败且 pending_chunks 落库失败（宁可整份重发产生重复段，也不丢段）。
+    fn push_scheduled_report(
+        &mut self,
+        kind: ReportPushKind,
+        period_key: &str,
+        target_user_id: &str,
+        reply: &str,
+    ) -> bool {
+        let kind_str = kind.as_str();
+        let period_field = kind.period_field();
         let token = self
             .context_token_map
-            .get(&target_user_id)
+            .get(target_user_id)
             .cloned()
             .or_else(|| {
                 self.task_store
-                    .get_context_token(&target_user_id)
+                    .get_context_token(target_user_id)
                     .ok()
                     .flatten()
             });
         let Some(token) = token else {
             log_chat_warn(
-                "scheduler_weekly_report_skipped",
+                &format!("scheduler_{kind_str}_report_skipped"),
                 vec![
-                    ("week", json!(week)),
+                    (period_field, json!(period_key)),
                     ("user_id", json!(target_user_id)),
                     ("error_kind", json!("missing_context_token")),
                 ],
             );
-            return;
+            return false;
         };
 
-        let chunks = split_reply_into_chunks(&reply, super::WECHAT_REPLY_CHUNK_MAX_CHARS);
+        // 报告正文可能较长，复用分段发送
+        let chunks = split_reply_into_chunks(reply, super::WECHAT_REPLY_CHUNK_MAX_CHARS);
         let chunk_total = chunks.len();
-        let mut all_ok = true;
         for (idx, chunk) in chunks.iter().enumerate() {
-            match self
-                .client
-                .send_text_message(&target_user_id, chunk, &token)
-            {
+            match self.client.send_text_message(target_user_id, chunk, &token) {
                 Ok(()) => log_chat_info(
-                    "scheduler_weekly_report_chunk_sent",
+                    &format!("scheduler_{kind_str}_report_chunk_sent"),
                     vec![
-                        ("week", json!(&week)),
-                        ("user_id", json!(&target_user_id)),
+                        (period_field, json!(period_key)),
+                        ("user_id", json!(target_user_id)),
                         ("chunk_index", json!(idx + 1)),
                         ("chunk_total", json!(chunk_total)),
                         ("chunk_chars", json!(chunk.chars().count())),
                     ],
                 ),
                 Err(err) => {
-                    all_ok = false;
                     log_chat_error(
-                        "scheduler_weekly_report_send_failed",
+                        &format!("scheduler_{kind_str}_report_send_failed"),
                         vec![
-                            ("week", json!(&week)),
-                            ("user_id", json!(&target_user_id)),
+                            (period_field, json!(period_key)),
+                            ("user_id", json!(target_user_id)),
                             ("chunk_index", json!(idx + 1)),
                             ("chunk_total", json!(chunk_total)),
-                            ("error_kind", json!("scheduler_weekly_report_send_failed")),
+                            (
+                                "error_kind",
+                                json!(format!("scheduler_{kind_str}_report_send_failed")),
+                            ),
                             ("detail", json!(err.to_string())),
                         ],
                     );
-                    break;
+                    // 中途失败：未发段落落 pending_chunks 供补发，与用户回复路径同一机制
+                    return self.persist_remaining_report_chunks(
+                        kind,
+                        period_key,
+                        target_user_id,
+                        &token,
+                        &chunks,
+                        idx,
+                    );
                 }
             }
         }
-        if all_ok {
-            self.last_weekly_report_push_week = Some(week.clone());
-            log_chat_info(
-                "scheduler_weekly_report_sent",
+        log_chat_info(
+            &format!("scheduler_{kind_str}_report_sent"),
+            vec![
+                (period_field, json!(period_key)),
+                ("user_id", json!(target_user_id)),
+                ("reply_chars", json!(reply.chars().count())),
+                ("chunk_total", json!(chunk_total)),
+            ],
+        );
+        true
+    }
+
+    /// 报告推送中途失败时，把未发段落写入补发队列。
+    /// 落库成功返回 true（本周期视为已处理，剩余段由补发循环送达）；
+    /// 落库失败返回 false（调用方不推进 last_push，下个周期整份重试）。
+    pub(super) fn persist_remaining_report_chunks(
+        &mut self,
+        kind: ReportPushKind,
+        period_key: &str,
+        target_user_id: &str,
+        token: &str,
+        chunks: &[String],
+        failed_idx: usize,
+    ) -> bool {
+        let remaining = remaining_chunks_after_failure(chunks, failed_idx);
+        if let Err(err) = self
+            .task_store
+            .insert_pending_chunks(target_user_id, token, &remaining)
+        {
+            log_chat_error(
+                "pending_chunks_insert_failed",
                 vec![
-                    ("week", json!(week)),
                     ("user_id", json!(target_user_id)),
-                    ("reply_chars", json!(reply.chars().count())),
-                    ("chunk_total", json!(chunk_total)),
+                    ("error_kind", json!("chunk_persist_failed")),
+                    ("detail", json!(err.to_string())),
                 ],
             );
+            return false;
         }
+        log_chat_warn(
+            &format!("scheduler_{}_report_partially_sent", kind.as_str()),
+            vec![
+                (kind.period_field(), json!(period_key)),
+                ("user_id", json!(target_user_id)),
+                ("chunk_total", json!(chunks.len())),
+                ("sent_chunk_count", json!(failed_idx)),
+                ("pending_chunks", json!(remaining.len())),
+            ],
+        );
+        true
     }
 
     pub(super) fn process_pending_tasks(&mut self) {

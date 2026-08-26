@@ -16,6 +16,8 @@
 6. 支持待人工补录任务的查询与恢复命令接线。
 7. 当前同时承担组合根职责：在 `WeChatBot::new` 装配 `agent_core` / `pipeline` / `task_executor` / `reporter` / 调度器，并在 `poll_loop` 中驱动后台任务。
 8. 记忆命令（显式写入 / 屏蔽 / 标记有用 / 自动提炼）、日报与周报查询等业务 handler 当前集中在 `command_handlers.rs`，中长期随 `chat_gateway` 演进逐步外迁。
+9. 日报 / 周报查询与定时推送采用读优先：优先复用 reporter 已生成的快照（scheduler 线程为唯一主动生成点），快照缺失时才现生成兜底。
+10. 定时推送分片中途失败时，未发段落写入 `outbound_pending_chunks` 由 `resend_pending_chunks` 补发；落库成功后推进 last_push 状态，已发段不重复送达。
 
 ## 演进约束
 

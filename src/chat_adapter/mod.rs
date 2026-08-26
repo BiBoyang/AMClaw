@@ -6,9 +6,9 @@ mod ingest;
 mod session_flow;
 mod types;
 use self::helpers::{
-    assert_ok, compact_json, first_non_empty, get_i64, get_str, is_agent_command,
-    is_llm_auth_error, is_poll_timeout_error, log_chat_error, log_chat_info, log_chat_warn,
-    sanitize_report_markdown_for_wechat, summarize_text_for_log, truncate_for_log, value_to_string,
+    assert_ok, compact_json, first_non_empty, get_i64, get_str, is_poll_timeout_error,
+    log_chat_error, log_chat_info, log_chat_warn, sanitize_report_markdown_for_wechat,
+    summarize_text_for_log, truncate_for_log, value_to_string,
 };
 
 use self::ilink_client::ILinkClient;

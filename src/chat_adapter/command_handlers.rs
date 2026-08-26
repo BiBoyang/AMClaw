@@ -1,13 +1,13 @@
 use super::{
-    is_agent_command, is_llm_auth_error, log_chat_error, log_chat_info, log_chat_warn,
-    sanitize_report_markdown_for_wechat, summarize_text_for_log,
+    log_chat_error, log_chat_info, log_chat_warn, sanitize_report_markdown_for_wechat,
+    summarize_text_for_log,
 };
-use crate::agent_core::{AgentRunContext, RuntimeSessionStateSnapshot};
+use crate::agent_core::{
+    is_agent_command, is_llm_auth_error, AgentRunContext, RuntimeSessionStateSnapshot,
+};
 use crate::command_router;
 use crate::session_router::FlushReason;
 use crate::task_store::{MarkTaskArchivedInput, TaskStore};
-use chrono::Utc;
-use chrono_tz::Asia::Shanghai;
 use serde_json::json;
 
 pub(super) fn build_link_submission_reply(
@@ -335,6 +335,11 @@ impl super::WeChatBot {
 
     pub(super) fn build_daily_report_query_reply(&self, day: Option<&str>) -> String {
         let day = normalize_report_query_target(day, self.reporter.current_day());
+        // 读优先：scheduler 线程是报告的唯一主动生成点，查询/推送优先复用
+        // 已生成快照，避免每次查询都重写 daily-{day}.md；快照缺失时才现生成兜底。
+        if let Some(reply) = read_existing_report_reply(&self.reporter.daily_report_path(&day)) {
+            return reply;
+        }
         match self.reporter.generate_for_day(&day) {
             Ok(report) => render_report_reply_for_wechat(
                 &report.markdown_path,
@@ -347,6 +352,10 @@ impl super::WeChatBot {
 
     pub(super) fn build_weekly_report_query_reply(&self, week: Option<&str>) -> String {
         let week = normalize_report_query_target(week, self.reporter.current_week());
+        // 读优先：同日报，优先复用 weekly-{week}.md 快照，缺失时才现生成。
+        if let Some(reply) = read_existing_report_reply(&self.reporter.weekly_report_path(&week)) {
+            return reply;
+        }
         match self.reporter.generate_weekly_for_week(&week) {
             Ok(report) => render_report_reply_for_wechat(
                 &report.markdown_path,
@@ -490,14 +499,12 @@ impl super::WeChatBot {
         Option<RuntimeSessionStateSnapshot>,
     ) {
         match self.agent_core.run_with_context(user_text, trace_context) {
-            Ok(result) => {
-                return (
-                    result.output,
-                    Some(result.run_id),
-                    result.trace_json_path,
-                    result.runtime_session_state,
-                );
-            }
+            Ok(result) => (
+                result.output,
+                Some(result.run_id),
+                result.trace_json_path,
+                result.runtime_session_state,
+            ),
             Err(err) => {
                 let err_text = err.to_string();
                 if is_agent_command(user_text) {
@@ -527,8 +534,7 @@ impl super::WeChatBot {
                         ],
                     );
                     return (
-                        "LLM 鉴权失败（401），请检查 MOONSHOT_* / DEEPSEEK_* / OPENAI_* 配置"
-                            .to_string(),
+                        "LLM 鉴权失败，请检查 MOONSHOT_* / DEEPSEEK_* / OPENAI_* 配置".to_string(),
                         None,
                         None,
                         None,
@@ -542,38 +548,14 @@ impl super::WeChatBot {
                         ("message_ids", json!(message_ids)),
                         ("message_count", json!(message_ids.len())),
                         ("error_kind", json!("agent_run_failed")),
-                        ("detail", json!(err_text)),
+                        ("detail", json!(err_text.clone())),
                     ],
                 );
+                // pre-agent 时代的 hello/时间/帮助/echo 硬编码 fallback 已删除：
+                // agent 失败直接向用户报错误信息，不再用脱节文案兜底。
+                (format!("执行失败: {err_text}"), None, None, None)
             }
         }
-        if user_text == "hello" || user_text == "你好" {
-            return (
-                "你好！我是 iLink Bot Demo（Rust版），有什么可以帮你的？".to_string(),
-                None,
-                None,
-                None,
-            );
-        }
-        if user_text == "时间" || user_text == "几点了" {
-            let now = Utc::now().with_timezone(&Shanghai);
-            return (
-                format!("现在是 {}", now.format("%Y-%m-%d %H:%M:%S")),
-                None,
-                None,
-                None,
-            );
-        }
-        if user_text == "帮助" || user_text == "help" {
-            return (
-                "可用命令:\n- hello / 你好\n- 时间\n- 帮助 / help\n- 发送链接或 收藏 <url>\n- 状态 <task_id>\n- 最近任务\n- 日报 [YYYY-MM-DD] / 今日整理\n- 周报 [YYYY-WW]\n- 记住 <content>\n- 我的记忆\n- 有用 <memory_id>\n- 重试 <task_id>\n- /context [text]\n- /context verbose [text]\n- 其他文字我会 echo 回复"
-                    .to_string(),
-                None,
-                None,
-                None,
-            );
-        }
-        (format!("Echo: {user_text}"), None, None, None)
     }
 }
 
@@ -586,25 +568,48 @@ fn normalize_report_query_target(input: Option<&str>, fallback: String) -> Strin
         .unwrap_or(fallback)
 }
 
+/// 读优先加载已生成的报告快照并渲染为微信回复；文件不存在或读取失败返回 None。
+fn read_existing_report_reply(markdown_path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(markdown_path).ok()?;
+    let item_count = parse_archived_count(&content);
+    Some(render_report_content_for_wechat(&content, item_count))
+}
+
+/// 从报告内容头解析 archived_count（reporter 写入的固定格式 "- archived_count: N"）。
+fn parse_archived_count(content: &str) -> Option<usize> {
+    content.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("- archived_count: ")?
+            .trim()
+            .parse()
+            .ok()
+    })
+}
+
 /// 渲染报告回复：优先读 markdown 全文并适配微信（超长截断），读不到时回退 summary。
 fn render_report_reply_for_wechat(
     markdown_path: &std::path::Path,
     summary: &str,
     item_count: usize,
 ) -> String {
-    let detailed = std::fs::read_to_string(markdown_path)
-        .ok()
-        .map(|content| sanitize_report_markdown_for_wechat(&content));
-    if let Some(content) = detailed {
-        // 微信单条消息限制约 4096 字符，截断到安全长度
-        if content.chars().count() > 3800 {
-            let truncated: String = content.chars().take(3800).collect();
-            format!("{truncated}\n\n...(已截断，共 {item_count} 条)")
-        } else {
-            content
+    match std::fs::read_to_string(markdown_path) {
+        Ok(content) => render_report_content_for_wechat(&content, Some(item_count)),
+        Err(_) => summary.to_string(),
+    }
+}
+
+/// 报告正文适配微信：去掉服务器路径字段，超长截断（截断提示附 archived_count）。
+fn render_report_content_for_wechat(content: &str, item_count: Option<usize>) -> String {
+    let content = sanitize_report_markdown_for_wechat(content);
+    // 微信单条消息限制约 4096 字符，截断到安全长度
+    if content.chars().count() > 3800 {
+        let truncated: String = content.chars().take(3800).collect();
+        match item_count {
+            Some(item_count) => format!("{truncated}\n\n...(已截断，共 {item_count} 条)"),
+            None => format!("{truncated}\n\n...(已截断)"),
         }
     } else {
-        summary.to_string()
+        content
     }
 }
 

@@ -19,10 +19,7 @@ pub(crate) fn replace_pre_blocks(fragment: &str) -> (String, Vec<String>, String
     let mut cursor = 0;
     let lower = fragment.to_ascii_lowercase();
 
-    loop {
-        let Some(rel_start) = lower[cursor..].find("<pre") else {
-            break;
-        };
+    while let Some(rel_start) = lower[cursor..].find("<pre") {
         let start = cursor + rel_start;
         let after_tag = &fragment[start + 4..];
         if !after_tag.starts_with('>') && !after_tag.starts_with(|c: char| c.is_whitespace()) {

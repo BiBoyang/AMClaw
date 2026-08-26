@@ -151,7 +151,7 @@ fn build_markdown_report(
     let mut lines = vec![
         "# Session Summary Strategy Evaluation".to_string(),
         String::new(),
-        format!("- date: 2026-04-17"),
+        "- date: 2026-04-17".to_string(),
         format!("- samples: {}", samples.len()),
         format!("- max_chars: {}", max_chars),
         String::new(),

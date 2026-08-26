@@ -19,4 +19,4 @@
 - `SESSION-2026-05-07.md`：chat_adapter / task_store 测试模块抽离，A/B 拆分主线闭环。
 - `SESSION-2026-05-08.md`：S17 文档收口（S11~S16 实现同步到 README / DEVELOPMENT.md / agent-eval README / session 记录）。
 - `SESSION-2026-06-13.md`：S21 文档整理、S22 task_store 测试拆分、S23 agent_core 测试拆分 checkpoint 收尾。
-- `SESSION-2026-08-26.md`：S23 测试拆分全线闭环、Phase 4 Memory 写入入口与遗留清尾、Phase 5 标注基建（指引 + Wilson 界 + 重校纪律 + memory_dropped 明细）。
+- `SESSION-2026-08-26.md`：S23 测试拆分闭环、Phase 4 写入入口与清尾、Phase 5 标注基建、trace_eval JSON sidecar 与 clippy 清零。

@@ -629,14 +629,14 @@ fn build_report(
     lines.push("| --- | ---: | ---: |".to_string());
     lines.push(format!("| total | {} | 100% |", total));
     lines.push(format!(
-        "| success | {} | {:.1}% |",
+        "| success | {} | {} |",
         success_count,
-        pct(success_count, total)
+        ratio_cell(success_count, total, Direction::HigherIsBetter)
     ));
     lines.push(format!(
-        "| with memory injected | {} | {:.1}% |",
+        "| with memory injected | {} | {} |",
         with_memory,
-        pct(with_memory, total)
+        ratio_cell(with_memory, total, Direction::HigherIsBetter)
     ));
     lines.push(format!(
         "| with memory dropped | {} | {:.1}% |",
@@ -644,19 +644,19 @@ fn build_report(
         pct(with_dropped, total)
     ));
     lines.push(format!(
-        "| with session state | {} | {:.1}% |",
+        "| with session state | {} | {} |",
         with_state,
-        pct(with_state, total)
+        ratio_cell(with_state, total, Direction::HigherIsBetter)
     ));
     lines.push(format!(
-        "| with context pack dropped | {} | {:.1}% |",
+        "| with context pack dropped | {} | {} |",
         with_ctx_drop,
-        pct(with_ctx_drop, total)
+        ratio_cell(with_ctx_drop, total, Direction::LowerIsBetter)
     ));
     lines.push(format!(
-        "| with llm fallback | {} | {:.1}% |",
+        "| with llm fallback | {} | {} |",
         with_fallback,
-        pct(with_fallback, total)
+        ratio_cell(with_fallback, total, Direction::LowerIsBetter)
     ));
     lines.push(format!(
         "| with failures | {} | {:.1}% |",
@@ -887,12 +887,12 @@ fn build_report(
         let mut pairs = failure_counter.into_iter().collect::<Vec<_>>();
         pairs.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
         for (failure_type, count) in pairs {
-            lines.push(format!(
-                "| {} | {} | {:.1}% |",
-                failure_type,
-                count,
-                pct(count, total)
-            ));
+            let ratio = if failure_type == "unknown_failure" {
+                ratio_cell(count, total, Direction::LowerIsBetter)
+            } else {
+                format!("{:.1}%", pct(count, total))
+            };
+            lines.push(format!("| {} | {} | {} |", failure_type, count, ratio));
         }
     }
     lines.push(String::new());
@@ -904,11 +904,6 @@ fn build_report(
     let total_tool_calls: usize = summaries.iter().map(|s| s.tool_call_count).sum();
     let total_tool_success: usize = summaries.iter().map(|s| s.tool_success_count).sum();
     let total_tool_failure = total_tool_calls.saturating_sub(total_tool_success);
-    let tool_success_rate = if total_tool_calls > 0 {
-        (total_tool_success as f64 / total_tool_calls as f64) * 100.0
-    } else {
-        0.0
-    };
     let tool_failure_rate = if total_tool_calls > 0 {
         (total_tool_failure as f64 / total_tool_calls as f64) * 100.0
     } else {
@@ -923,8 +918,13 @@ fn build_report(
     ));
     lines.push(format!("| total tool calls | {} | - |", total_tool_calls));
     lines.push(format!(
-        "| tool success | {} | {:.1}% |",
-        total_tool_success, tool_success_rate
+        "| tool success | {} | {} |",
+        total_tool_success,
+        ratio_cell(
+            total_tool_success,
+            total_tool_calls,
+            Direction::HigherIsBetter
+        )
     ));
     lines.push(format!(
         "| tool failure | {} | {:.1}% |",
@@ -1003,7 +1003,11 @@ fn build_report(
         "| unfinished_plan (failed + steps > 5) | {} |",
         unfinished_count
     ));
-    lines.push(format!("| stall_or_drift hits | {} |", stall_drift_count));
+    lines.push(format!(
+        "| stall_or_drift hits | {} | {} |",
+        stall_drift_count,
+        ratio_cell(stall_drift_count, total, Direction::LowerIsBetter)
+    ));
     lines.push(String::new());
 
     // Step count distribution
@@ -1042,11 +1046,6 @@ fn build_report(
     let recovery_attempts: usize = summaries.iter().map(|s| s.recovery_attempt_count).sum();
     let recovery_successes: usize = summaries.iter().map(|s| s.recovery_success_count).sum();
     let recovery_failures = recovery_attempts.saturating_sub(recovery_successes);
-    let recovery_success_rate = if recovery_attempts > 0 {
-        (recovery_successes as f64 / recovery_attempts as f64) * 100.0
-    } else {
-        0.0
-    };
     let recovery_failure_rate = if recovery_attempts > 0 {
         (recovery_failures as f64 / recovery_attempts as f64) * 100.0
     } else {
@@ -1064,8 +1063,13 @@ fn build_report(
         recovery_attempts
     ));
     lines.push(format!(
-        "| recovery_success | {} | {:.1}% |",
-        recovery_successes, recovery_success_rate
+        "| recovery_success | {} | {} |",
+        recovery_successes,
+        ratio_cell(
+            recovery_successes,
+            recovery_attempts,
+            Direction::HigherIsBetter
+        )
     ));
     lines.push(format!(
         "| recovery_failure | {} | {:.1}% |",
@@ -1309,6 +1313,43 @@ fn pct(part: usize, total: usize) -> f64 {
     }
 }
 
+/// 单侧 99% 置信界使用的 z 值。
+const WILSON_Z_99: f64 = 2.326;
+
+/// 单侧 Wilson score 置信界（返回比例，0..1）。
+/// HigherIsBetter 指标取下界，LowerIsBetter 指标取上界；total=0 时返回 None。
+fn wilson_bound_99(hits: usize, total: usize, direction: Direction) -> Option<f64> {
+    if total == 0 {
+        return None;
+    }
+    let n = total as f64;
+    let p = hits as f64 / n;
+    let z2 = WILSON_Z_99 * WILSON_Z_99;
+    let denom = 1.0 + z2 / n;
+    let center = (p + z2 / (2.0 * n)) / denom;
+    let half = (WILSON_Z_99 / denom) * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt();
+    match direction {
+        Direction::HigherIsBetter => Some((center - half).max(0.0)),
+        Direction::LowerIsBetter => Some((center + half).min(1.0)),
+    }
+}
+
+/// 比例单元格文本：`95.0% (38/40), Wilson99 下界 80.4%`。
+/// total=0 时省略置信界，仅输出 `0.0% (0/0)`。
+fn ratio_cell(hits: usize, total: usize, direction: Direction) -> String {
+    let base = format!("{:.1}% ({}/{})", pct(hits, total), hits, total);
+    match wilson_bound_99(hits, total, direction) {
+        Some(bound) => {
+            let label = match direction {
+                Direction::HigherIsBetter => "下界",
+                Direction::LowerIsBetter => "上界",
+            };
+            format!("{}, Wilson99 {} {:.1}%", base, label, bound * 100.0)
+        }
+        None => base,
+    }
+}
+
 fn fmt_optional_rate(rate: Option<f64>) -> String {
     match rate {
         Some(v) => format!("{:.1}%", v),
@@ -1463,6 +1504,9 @@ struct CompareMetrics {
     // Denominator info (for scenario B)
     recovery_attempt_count: usize,
     total_tool_calls: usize,
+    // 各比例指标的 (分子, 分母)，从报告单元格 "(n/d)" 反解析；仅作观测信息，
+    // gate 判定路径不消费这些字段
+    rate_samples: HashMap<String, (usize, usize)>,
     // Failure type counts
     failure_type_counts: HashMap<String, usize>,
     // Missing fields
@@ -1573,11 +1617,26 @@ fn parse_report(content: &str) -> Result<CompareMetrics, String> {
                     let name = row[0].trim();
                     let ratio = parse_percentage(&row[2]);
                     match name {
-                        "success" => metrics.success_rate = ratio,
-                        "with llm fallback" => metrics.fallback_rate = ratio,
-                        "with context pack dropped" => metrics.context_drop_rate = ratio,
-                        "with session state" => metrics.state_present_rate = ratio,
-                        "with memory injected" => metrics.memory_injected_rate = ratio,
+                        "success" => {
+                            metrics.success_rate = ratio;
+                            record_rate_sample(&mut metrics, "success_rate", &row[2]);
+                        }
+                        "with llm fallback" => {
+                            metrics.fallback_rate = ratio;
+                            record_rate_sample(&mut metrics, "fallback_rate", &row[2]);
+                        }
+                        "with context pack dropped" => {
+                            metrics.context_drop_rate = ratio;
+                            record_rate_sample(&mut metrics, "context_drop_rate", &row[2]);
+                        }
+                        "with session state" => {
+                            metrics.state_present_rate = ratio;
+                            record_rate_sample(&mut metrics, "state_present_rate", &row[2]);
+                        }
+                        "with memory injected" => {
+                            metrics.memory_injected_rate = ratio;
+                            record_rate_sample(&mut metrics, "memory_injected_rate", &row[2]);
+                        }
                         "with persistent state updated" => {
                             metrics.persistent_state_updated_rate = ratio;
                             metrics.persistent_state_updated_count =
@@ -1611,6 +1670,9 @@ fn parse_report(content: &str) -> Result<CompareMetrics, String> {
                     }
                     let count = extract_usize_from_cell(&row[1]);
                     metrics.failure_type_counts.insert(name.to_string(), count);
+                    if name == "unknown_failure" && row.len() >= 3 {
+                        record_rate_sample(&mut metrics, "unknown_failure_rate", &row[2]);
+                    }
                 }
             }
             "Tool Use Statistics" => {
@@ -1622,6 +1684,7 @@ fn parse_report(content: &str) -> Result<CompareMetrics, String> {
                     let name = row[0].trim();
                     if name == "tool success" {
                         metrics.tool_success_rate = parse_percentage(&row[2]);
+                        record_rate_sample(&mut metrics, "tool_success_rate", &row[2]);
                     } else if name == "total tool calls" {
                         metrics.total_tool_calls = extract_usize_from_cell(&row[1]);
                     }
@@ -1646,6 +1709,9 @@ fn parse_report(content: &str) -> Result<CompareMetrics, String> {
                             metrics.planning_stall_rate =
                                 Some(count as f64 / metrics.total_runs as f64 * 100.0);
                         }
+                        if row.len() >= 3 {
+                            record_rate_sample(&mut metrics, "planning_stall_rate", &row[2]);
+                        }
                     }
                 }
             }
@@ -1658,6 +1724,7 @@ fn parse_report(content: &str) -> Result<CompareMetrics, String> {
                     let name = row[0].trim();
                     if name == "recovery_success" {
                         metrics.recovery_success_rate = parse_percentage(&row[2]);
+                        record_rate_sample(&mut metrics, "recovery_success_rate", &row[2]);
                     } else if name == "recovery_attempt_count" {
                         metrics.recovery_attempt_count = extract_usize_from_cell(&row[1]);
                     }
@@ -1777,8 +1844,30 @@ fn extract_usize_after_colon(line: &str) -> usize {
 
 fn parse_percentage(s: &str) -> Option<f64> {
     let s = s.trim();
-    let s = s.trim_end_matches('%');
+    // 兼容新格式 "12.5% (5/40), Wilson99 上界 24.1%"：取第一个 '%' 之前的数值
+    let s = match s.find('%') {
+        Some(idx) => s[..idx].trim(),
+        None => s,
+    };
     s.parse().ok()
+}
+
+/// 从比例单元格解析 `(n/d)` 分母信息；旧格式无括号时返回 None。
+fn parse_count_total(s: &str) -> Option<(usize, usize)> {
+    let start = s.find('(')?;
+    let end = s[start..].find(')')? + start;
+    let inner = &s[start + 1..end];
+    let mut parts = inner.split('/');
+    let n = parts.next()?.trim().parse().ok()?;
+    let d = parts.next()?.trim().parse().ok()?;
+    Some((n, d))
+}
+
+/// 单元格含 "(n/d)" 时记录到 rate_samples；解析不出（旧格式）则不记录，走现有逻辑。
+fn record_rate_sample(metrics: &mut CompareMetrics, key: &str, cell: &str) {
+    if let Some(sample) = parse_count_total(cell) {
+        metrics.rate_samples.insert(key.to_string(), sample);
+    }
 }
 
 fn extract_usize_from_cell(s: &str) -> usize {
@@ -2618,6 +2707,104 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Wilson bound tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_wilson_bound_99_reference_values() {
+        // n=200, x=6 (p=3%), z=2.326 单侧上界，独立公式核算值
+        let upper = wilson_bound_99(6, 200, Direction::LowerIsBetter).unwrap();
+        assert!((upper - 0.072706).abs() < 1e-4, "upper={}", upper);
+        // HigherIsBetter 取下界：x=38, n=40 (p=95%)
+        let lower = wilson_bound_99(38, 40, Direction::HigherIsBetter).unwrap();
+        assert!((lower - 0.804008).abs() < 1e-4, "lower={}", lower);
+    }
+
+    #[test]
+    fn test_wilson_bound_99_edge_cases() {
+        // n=0：无界
+        assert!(wilson_bound_99(0, 0, Direction::HigherIsBetter).is_none());
+        assert!(wilson_bound_99(0, 0, Direction::LowerIsBetter).is_none());
+        // p=0：下界=0，上界=z²/(n+z²)
+        let lower = wilson_bound_99(0, 40, Direction::HigherIsBetter).unwrap();
+        let upper = wilson_bound_99(0, 40, Direction::LowerIsBetter).unwrap();
+        assert!(lower.abs() < 1e-12, "lower={}", lower);
+        assert!((upper - 0.119142).abs() < 1e-4, "upper={}", upper);
+        // p=1：上界=1，下界=n/(n+z²)
+        let lower = wilson_bound_99(40, 40, Direction::HigherIsBetter).unwrap();
+        let upper = wilson_bound_99(40, 40, Direction::LowerIsBetter).unwrap();
+        assert!((lower - 0.880858).abs() < 1e-4, "lower={}", lower);
+        assert!((upper - 1.0).abs() < 1e-12, "upper={}", upper);
+    }
+
+    #[test]
+    fn test_parse_percentage_new_and_old_format() {
+        // 旧格式
+        assert!((parse_percentage("12.5%").unwrap() - 12.5).abs() < 1e-9);
+        // 新格式：带分母与 Wilson 界
+        let v = parse_percentage("12.5% (5/40), Wilson99 上界 24.1%").unwrap();
+        assert!((v - 12.5).abs() < 1e-9);
+        assert!(parse_percentage("-").is_none());
+    }
+
+    #[test]
+    fn test_parse_count_total_formats() {
+        assert_eq!(
+            parse_count_total("12.5% (5/40), Wilson99 上界 24.1%"),
+            Some((5, 40))
+        );
+        // 兼容带空格的 "(n / d)" 形态
+        assert_eq!(parse_count_total("85.0% (17 / 20)"), Some((17, 20)));
+        // 旧格式无括号
+        assert_eq!(parse_count_total("12.5%"), None);
+        assert_eq!(parse_count_total("-"), None);
+    }
+
+    #[test]
+    fn test_parse_report_old_format_has_no_rate_samples() {
+        // 旧报告（无分母无区间）解析行为不变：rate 照常读出，rate_samples 为空
+        let metrics = parse_report(&minimal_report()).unwrap();
+        assert!((metrics.success_rate.unwrap() - 75.0).abs() < 0.01);
+        assert!((metrics.tool_success_rate.unwrap() - 82.1).abs() < 0.1);
+        assert!(metrics.rate_samples.is_empty());
+    }
+
+    #[test]
+    fn test_parse_report_new_format_roundtrip() {
+        // build_report 产出带 (n/d) + Wilson99 的单元格，parse_report 应还原 rate 与分母
+        let mut s1 = make_summary("run-1", vec![]);
+        s1.success = true;
+        s1.llm_fallback = true;
+        s1.tool_call_count = 2;
+        s1.tool_success_count = 2;
+        let mut s2 = make_summary("run-2", vec![]);
+        s2.success = false;
+        s2.tool_call_count = 2;
+        s2.tool_success_count = 1;
+
+        let report = build_report(&[s1, s2], false, &HashSet::new(), None);
+        assert!(report.contains("Wilson99"), "report:\n{}", report);
+
+        let metrics = parse_report(&report).unwrap();
+        assert!((metrics.success_rate.unwrap() - 50.0).abs() < 0.01);
+        assert!((metrics.fallback_rate.unwrap() - 50.0).abs() < 0.01);
+        assert!((metrics.tool_success_rate.unwrap() - 75.0).abs() < 0.01);
+        // planning_stall_rate 由 count/total_runs 推导，与单元格分母一致
+        assert!(metrics.planning_stall_rate.unwrap().abs() < 0.01);
+        assert_eq!(metrics.rate_samples.get("success_rate"), Some(&(1, 2)));
+        assert_eq!(metrics.rate_samples.get("fallback_rate"), Some(&(1, 2)));
+        assert_eq!(metrics.rate_samples.get("tool_success_rate"), Some(&(3, 4)));
+        assert_eq!(
+            metrics.rate_samples.get("planning_stall_rate"),
+            Some(&(0, 2))
+        );
+        assert_eq!(
+            metrics.rate_samples.get("recovery_success_rate"),
+            Some(&(0, 0))
+        );
+    }
+
     #[test]
     fn test_parse_report_basic() {
         let report = minimal_report();
@@ -3180,6 +3367,7 @@ mod tests {
             baseline_hits: 20,
             recovery_attempt_count: 5,
             total_tool_calls: 30,
+            rate_samples: HashMap::new(),
             persistent_state_updated_count: 2,
             persistent_state_updated_rate: Some(10.0),
             failure_type_counts: HashMap::new(),
@@ -3203,6 +3391,7 @@ mod tests {
             baseline_hits: 19,
             recovery_attempt_count: 6,
             total_tool_calls: 35,
+            rate_samples: HashMap::new(),
             persistent_state_updated_count: 5,
             persistent_state_updated_rate: Some(22.7),
             failure_type_counts: HashMap::new(),
@@ -3633,8 +3822,12 @@ mod tests {
         );
 
         let report = build_report(&[summary1, summary2], false, &HashSet::new(), None);
-        // 4 attempts, 2 successes = 50% recovery success rate
-        assert!(report.contains("| recovery_success | 2 | 50.0% |"));
+        // 4 attempts, 2 successes = 50% recovery success rate（新格式带分母与 Wilson99 下界）
+        assert!(
+            report.contains("| recovery_success | 2 | 50.0% (2/4), Wilson99 下界 12.1% |"),
+            "report:\n{}",
+            report
+        );
         assert!(report.contains("| recovery_attempt_count | 4 | - |"));
         // recovery by failure type
         assert!(report.contains("| transient | 2 | 1 | 1 |"));

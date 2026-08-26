@@ -1,7 +1,7 @@
 # Trace Evaluation Comparison Report
 
-- **对比窗口**: before=2026-04-18 after=2026-04-21
-- **样本数**: before=20 after=20
+- **对比窗口**: before=2026-04-18 after=2026-08-26
+- **样本数**: before=20 after=21
 - **baseline 覆盖**: before=100.0% after=100.0%
 - **综合判定**: PASS
 
@@ -9,13 +9,13 @@
 
 | # | 指标 | before | after | 变动 | 判定 | 说明 |
 | ---: | --- | ---: | ---: | ---: | --- | --- |
-| 1 | success_rate | 75.0% | 75.0% | 0.0pp | PASS | 无退化 |
-| 2 | fallback_rate | 35.0% | 35.0% | 0.0pp | PASS | 无退化 |
-| 3 | context_drop_rate | 15.0% | 15.0% | 0.0pp | PASS | 无退化 |
-| 4 | state_present_rate | 15.0% | 15.0% | 0.0pp | PASS | 无退化 |
-| 5 | memory_injected_rate | 20.0% | 20.0% | 0.0pp | PASS | 无退化 |
+| 1 | success_rate | 75.0% | 76.2% | +1.2pp | PASS | 无退化 |
+| 2 | fallback_rate | 35.0% | 33.3% | -1.7pp | PASS | 无退化 |
+| 3 | context_drop_rate | 15.0% | 14.3% | -0.7pp | PASS | 无退化 |
+| 4 | state_present_rate | 15.0% | 19.0% | +4.0pp | PASS | 无退化 |
+| 5 | memory_injected_rate | 20.0% | 19.0% | -1.0pp | PASS | 无退化 |
 | 6 | recovery_success_rate | 16.7% | 16.7% | 0.0pp | PASS | 无退化 |
-| 7 | unknown_failure_rate | 5.0% | 5.0% | 0.0pp | PASS | 无退化 |
+| 7 | unknown_failure_rate | 5.0% | 4.8% | -0.2pp | PASS | 无退化 |
 
 **核心指标统计**: PASS=7 WARN=0 FAIL=0
 
@@ -24,8 +24,15 @@
 | # | 指标 | before | after | 变动 | 判定 | 说明 |
 | ---: | --- | ---: | ---: | ---: | --- | --- |
 | 8 | tool_success_rate | 82.1% | 82.1% | 0.0pp | PASS | 无退化 |
-| 9 | planning_stall_rate | 5.0% | 5.0% | 0.0pp | PASS | 无退化 |
-| 10 | avg_step_count | 3.2 | 3.2 | 0.0步 | PASS | 无退化 |
+| 9 | planning_stall_rate | 5.0% | 4.8% | -0.2pp | PASS | 无退化 |
+| 10 | avg_step_count | 3.2 | 3.1 | -0.1步 | PASS | 无退化 |
+
+## Persistent State Update Trend
+
+| metric | before | after | delta |
+| --- | ---: | ---: | ---: |
+| count | 0 | 3 | +3 |
+| rate | N/A | 14.3% | N/A |
 
 ## 判定依据
 

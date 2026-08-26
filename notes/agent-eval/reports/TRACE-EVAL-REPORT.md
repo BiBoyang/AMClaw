@@ -1,23 +1,31 @@
 # Trace Evaluation Report
 
-- generated: 2026-04-21T23:16:26.634510+00:00
-- total traces: 20
+- generated: 2026-08-26T10:10:24.231038+00:00
+- total traces: 21
 - baseline_file: notes/agent-eval/baselines/EVAL-BASELINE-SAMPLES-2026-04-18.md
 - baseline_run_ids: 20
-- interesting traces: 15
+- interesting traces: 18
 
 ## Summary Statistics
 
 | metric | count | ratio |
 | --- | ---: | ---: |
-| total | 20 | 100% |
-| success | 15 | 75.0% |
-| with memory injected | 4 | 20.0% |
-| with memory dropped | 2 | 10.0% |
-| with session state | 3 | 15.0% |
-| with context pack dropped | 3 | 15.0% |
-| with llm fallback | 7 | 35.0% |
-| with failures | 6 | 30.0% |
+| total | 21 | 100% |
+| success | 16 | 76.2% (16/21), Wilson99 下界 50.8% |
+| with memory injected | 4 | 19.0% (4/21), Wilson99 下界 6.5% |
+| with memory dropped | 2 | 9.5% |
+| with session state | 4 | 19.0% (4/21), Wilson99 下界 6.5% |
+| with context pack dropped | 3 | 14.3% (3/21), Wilson99 上界 39.0% |
+| with llm fallback | 7 | 33.3% (7/21), Wilson99 上界 58.4% |
+| with failures | 6 | 28.6% |
+| with persistent state updated | 3 | 14.3% |
+
+## Persistent State Update Breakdown
+
+| updated | traces | success | success_rate |
+| --- | ---: | ---: | ---: |
+| true | 3 | 3 | 100.0% |
+| false | 18 | 13 | 72.2% |
 
 ## Baseline Coverage
 
@@ -31,8 +39,8 @@
 
 | metric | value |
 | --- | --- |
-| latency_p50_ms | 0 |
-| latency_p95_ms | 0 |
+| latency_p50_ms | 1 |
+| latency_p95_ms | 1 |
 | fallback_rate | 0.0% |
 | candidate_hit_ratio | 0.0% (0 / 0) |
 
@@ -41,30 +49,31 @@
 | retriever | traces | avg_candidates | avg_hits | avg_latency_ms |
 | --- | ---: | ---: | ---: | ---: |
 | (unknown) | 20 | 0.0 | 0.0 | 0.0 |
+| rule_v1 | 1 | 0.0 | 0.0 | 1.0 |
 
 ### By Retrieval Mode
 
 | mode | traces | avg_candidates | avg_hits | avg_latency_ms |
 | --- | ---: | ---: | ---: | ---: |
-| (unknown) | 20 | 0.0 | 0.0 | 0.0 |
+| (unknown) | 21 | 0.0 | 0.0 | 0.0 |
 
 ## Failure Type Distribution
 
 | failure_type | count | ratio |
 | --- | ---: | ---: |
-| tool_call_error | 2 | 10.0% |
-| fallback_exhausted | 1 | 5.0% |
-| llm_auth_error | 1 | 5.0% |
-| planning_stall_or_drift | 1 | 5.0% |
-| unknown_failure | 1 | 5.0% |
+| tool_call_error | 2 | 9.5% |
+| fallback_exhausted | 1 | 4.8% |
+| llm_auth_error | 1 | 4.8% |
+| planning_stall_or_drift | 1 | 4.8% |
+| unknown_failure | 1 | 4.8% (1/21), Wilson99 上界 27.4% |
 
 ## Tool Use Statistics
 
 | metric | count | ratio |
 | --- | ---: | ---: |
-| traces with tool calls | 17 | 85.0% |
+| traces with tool calls | 17 | 81.0% |
 | total tool calls | 28 | - |
-| tool success | 23 | 82.1% |
+| tool success | 23 | 82.1% (23/28), Wilson99 下界 60.7% |
 | tool failure | 5 | 17.9% |
 
 ### Tool Error Type TopN
@@ -90,27 +99,27 @@
 
 | metric | value |
 | --- | --- |
-| step_count min / max / avg | 1 / 12 / 3.2 |
+| step_count min / max / avg | 1 / 12 / 3.1 |
 | unfinished_plan (failed + steps > 5) | 1 |
-| stall_or_drift hits | 1 |
+| stall_or_drift hits | 1 | 4.8% (1/21), Wilson99 上界 27.4% |
 
 ### Step Count Distribution
 
 | step_range | trace_count | ratio |
 | --- | ---: | ---: |
-| 1 | 3 | 15.0% |
-| 2 | 7 | 35.0% |
-| 3-5 | 8 | 40.0% |
-| 6-10 | 1 | 5.0% |
-| 10+ | 1 | 5.0% |
+| 1 | 4 | 19.0% |
+| 2 | 7 | 33.3% |
+| 3-5 | 8 | 38.1% |
+| 6-10 | 1 | 4.8% |
+| 10+ | 1 | 4.8% |
 
 ## Recovery Statistics
 
 | metric | count | ratio |
 | --- | ---: | ---: |
-| traces_with_recovery | 6 | 30.0% |
+| traces_with_recovery | 6 | 28.6% |
 | recovery_attempt_count | 6 | - |
-| recovery_success | 1 | 16.7% |
+| recovery_success | 1 | 16.7% (1/6), Wilson99 下界 2.3% |
 | recovery_failure | 5 | 83.3% |
 
 ### Recovery by Failure Type
@@ -125,28 +134,29 @@
 
 ## Per-Trace Detail
 
-| run_id | success | baseline | steps | mem(r/i/d) | state | ctx_drop | failures | reasons | input |
-| --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- |
-| `d4444444` | ✗ | ✓ | 3 | 0/0/0 | · | · | 1 | failed, has_failures, llm_fallback | 执行高级分析任务 |
-| `d3333333` | ✗ | ✓ | 12 | 0/0/0 | · | · | 1 | failed, has_failures | 帮我完成一个复杂的多步骤任务 |
-| `c2222222` | ✓ | ✓ | 4 | 2/0/2 | · | ✓ | 0 | memory_dropped, context_pack_dropped, memory_retrieved_but_none_injected | 根据之前的讨论修改代码 |
-| `c3333333` | ✓ | ✓ | 3 | 0/0/0 | · | ✓ | 0 | context_pack_dropped | 继续 |
-| `a1111111` | ✓ | ✓ | 3 | 2/2/0 | ✓ | · | 0 |  | 查我上次提到的项目计划 |
-| `d5555555` | ✓ | ✓ | 4 | 0/0/0 | · | · | 1 | has_failures | 写入文件 /tmp/test.txt |
-| `d6666666` | ✗ | ✓ | 1 | 0/0/0 | · | · | 1 | failed, has_failures | 做一些未知的事情 |
-| `a2222222` | ✓ | ✓ | 1 | 0/0/0 | · | · | 0 |  | 你好 |
-| `b1111111` | ✓ | ✓ | 2 | 0/0/0 | · | · | 0 | llm_fallback | 创建文件 demo/test.txt :: hello world |
-| `b2222222` | ✓ | ✓ | 2 | 0/0/0 | · | · | 0 | llm_fallback | 写一段代码示例 |
-| `a3333333` | ✓ | ✓ | 4 | 1/1/0 | · | · | 0 |  | 读取 config.toml 并告诉我数据库路径 |
-| `a4444444` | ✓ | ✓ | 3 | 0/0/0 | ✓ | · | 0 |  | 继续上次的任务 |
-| `c1111111` | ✓ | ✓ | 6 | 5/2/3 | · | ✓ | 0 | memory_dropped, context_pack_dropped | 总结这些长文档的核心观点：README.md DESIGN-0.1.0.md P... |
-| `a5555555` | ✓ | ✓ | 5 | 3/3/0 | ✓ | · | 0 |  | 帮我整理今天的任务列表并写入 tasks.md |
-| `d1111111` | ✗ | ✓ | 2 | 0/0/0 | · | · | 1 | failed, has_failures | 读取不存在的文件 /etc/passwd |
-| `d2222222` | ✗ | ✓ | 1 | 0/0/0 | · | · | 1 | failed, has_failures | 帮我分析这段代码 |
-| `ece3aad2` | ✓ | ✓ | 2 | 0/0/0 | · | · | 0 | llm_fallback | 读文件 README.md |
-| `21cced62` | ✓ | ✓ | 2 | 0/0/0 | · | · | 0 | llm_fallback | 读文件 README.md |
-| `9aa8cdec` | ✓ | ✓ | 2 | 0/0/0 | · | · | 0 | llm_fallback | 读文件 README.md |
-| `9633a8ee` | ✓ | ✓ | 2 | 0/0/0 | · | · | 0 | llm_fallback | 读文件 README.md |
+| run_id | success | baseline | steps | mem(r/i/d) | state | state_upd | ctx_drop | failures | reasons | input |
+| --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- |
+| `06fb6ae7` | ✓ | · | 1 | 0/0/0 | ✓ | · | · | 0 |  | 你好 |
+| `d4444444` | ✗ | ✓ | 3 | 0/0/0 | · | · | · | 1 | failed, has_failures, llm_fallback | 执行高级分析任务 |
+| `d3333333` | ✗ | ✓ | 12 | 0/0/0 | · | · | · | 1 | failed, has_failures | 帮我完成一个复杂的多步骤任务 |
+| `c2222222` | ✓ | ✓ | 4 | 2/0/2 | · | · | ✓ | 0 | memory_dropped, context_pack_dropped, memory_retrieved_but_none_injected | 根据之前的讨论修改代码 |
+| `c3333333` | ✓ | ✓ | 3 | 0/0/0 | · | · | ✓ | 0 | context_pack_dropped | 继续 |
+| `a1111111` | ✓ | ✓ | 3 | 2/2/0 | ✓ | ✓ | · | 0 | state_updated | 查我上次提到的项目计划 |
+| `d5555555` | ✓ | ✓ | 4 | 0/0/0 | · | · | · | 1 | has_failures | 写入文件 /tmp/test.txt |
+| `d6666666` | ✗ | ✓ | 1 | 0/0/0 | · | · | · | 1 | failed, has_failures | 做一些未知的事情 |
+| `a2222222` | ✓ | ✓ | 1 | 0/0/0 | · | · | · | 0 |  | 你好 |
+| `b1111111` | ✓ | ✓ | 2 | 0/0/0 | · | · | · | 0 | llm_fallback | 创建文件 demo/test.txt :: hello world |
+| `b2222222` | ✓ | ✓ | 2 | 0/0/0 | · | · | · | 0 | llm_fallback | 写一段代码示例 |
+| `a3333333` | ✓ | ✓ | 4 | 1/1/0 | · | · | · | 0 |  | 读取 config.toml 并告诉我数据库路径 |
+| `a4444444` | ✓ | ✓ | 3 | 0/0/0 | ✓ | ✓ | · | 0 | state_updated | 继续上次的任务 |
+| `c1111111` | ✓ | ✓ | 6 | 5/2/3 | · | · | ✓ | 0 | memory_dropped, context_pack_dropped | 总结这些长文档的核心观点：README.md DESIGN-0.1.0.md P... |
+| `a5555555` | ✓ | ✓ | 5 | 3/3/0 | ✓ | ✓ | · | 0 | state_updated | 帮我整理今天的任务列表并写入 tasks.md |
+| `d1111111` | ✗ | ✓ | 2 | 0/0/0 | · | · | · | 1 | failed, has_failures | 读取不存在的文件 /etc/passwd |
+| `d2222222` | ✗ | ✓ | 1 | 0/0/0 | · | · | · | 1 | failed, has_failures | 帮我分析这段代码 |
+| `ece3aad2` | ✓ | ✓ | 2 | 0/0/0 | · | · | · | 0 | llm_fallback | 读文件 README.md |
+| `21cced62` | ✓ | ✓ | 2 | 0/0/0 | · | · | · | 0 | llm_fallback | 读文件 README.md |
+| `9aa8cdec` | ✓ | ✓ | 2 | 0/0/0 | · | · | · | 0 | llm_fallback | 读文件 README.md |
+| `9633a8ee` | ✓ | ✓ | 2 | 0/0/0 | · | · | · | 0 | llm_fallback | 读文件 README.md |
 
 ## Interesting Traces Deep Dive
 
@@ -159,6 +169,7 @@
 - **duration**: 5000ms, **steps**: 3
 - **memory**: retrieved=0, injected=0, dropped=0, total_chars=0
 - **session_state**: false
+- **persistent_state_updated**: false
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=2, success=0, failed=2
 - **tool_calls**: total=0, success=0
@@ -175,6 +186,7 @@
 - **duration**: 5000ms, **steps**: 12
 - **memory**: retrieved=0, injected=0, dropped=0, total_chars=0
 - **session_state**: false
+- **persistent_state_updated**: false
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=5, success=5, failed=0
 - **tool_calls**: total=3, success=1
@@ -190,6 +202,7 @@
 - **duration**: 5000ms, **steps**: 4
 - **memory**: retrieved=2, injected=0, dropped=2, total_chars=0
 - **session_state**: false
+- **persistent_state_updated**: false
 - **context_pack**: dropped=true, reasons=["context_budget_exceeded", "dropped_sections: state, history_tail"]
 - **llm_calls**: total=1, success=1, failed=0
 - **tool_calls**: total=2, success=2
@@ -204,11 +217,27 @@
 - **duration**: 5000ms, **steps**: 3
 - **memory**: retrieved=0, injected=0, dropped=0, total_chars=0
 - **session_state**: false
+- **persistent_state_updated**: false
 - **context_pack**: dropped=true, reasons=["history_truncated", "older_turns_removed: 3"]
 - **llm_calls**: total=1, success=1, failed=0
 - **tool_calls**: total=1, success=1
 - **recovery**: attempts=0, success=0, actions=[], results=[]
 - **interest_reasons**: context_pack_dropped
+
+### `a1111111-1111-1111-1111-111111111111`
+
+- **user_input**: 查我上次提到的项目计划
+- **success**: true
+- **in_baseline**: true
+- **duration**: 5000ms, **steps**: 3
+- **memory**: retrieved=2, injected=2, dropped=0, total_chars=450
+- **session_state**: true
+- **persistent_state_updated**: true
+- **context_pack**: dropped=false, reasons=[]
+- **llm_calls**: total=2, success=2, failed=0
+- **tool_calls**: total=2, success=2
+- **recovery**: attempts=0, success=0, actions=[], results=[]
+- **interest_reasons**: state_updated
 
 ### `d5555555-5555-5555-5555-555555555555`
 
@@ -218,6 +247,7 @@
 - **duration**: 5000ms, **steps**: 4
 - **memory**: retrieved=0, injected=0, dropped=0, total_chars=0
 - **session_state**: false
+- **persistent_state_updated**: false
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=2, success=2, failed=0
 - **tool_calls**: total=2, success=1
@@ -234,6 +264,7 @@
 - **duration**: 5000ms, **steps**: 1
 - **memory**: retrieved=0, injected=0, dropped=0, total_chars=0
 - **session_state**: false
+- **persistent_state_updated**: false
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=1, success=1, failed=0
 - **tool_calls**: total=1, success=0
@@ -249,6 +280,7 @@
 - **duration**: 5000ms, **steps**: 2
 - **memory**: retrieved=0, injected=0, dropped=0, total_chars=0
 - **session_state**: false
+- **persistent_state_updated**: false
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=1, success=0, failed=1
 - **tool_calls**: total=1, success=1
@@ -263,11 +295,27 @@
 - **duration**: 5000ms, **steps**: 2
 - **memory**: retrieved=0, injected=0, dropped=0, total_chars=0
 - **session_state**: false
+- **persistent_state_updated**: false
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=1, success=0, failed=1
 - **tool_calls**: total=1, success=1
 - **recovery**: attempts=0, success=0, actions=[], results=[]
 - **interest_reasons**: llm_fallback
+
+### `a4444444-4444-4444-4444-444444444444`
+
+- **user_input**: 继续上次的任务
+- **success**: true
+- **in_baseline**: true
+- **duration**: 5000ms, **steps**: 3
+- **memory**: retrieved=0, injected=0, dropped=0, total_chars=0
+- **session_state**: true
+- **persistent_state_updated**: true
+- **context_pack**: dropped=false, reasons=[]
+- **llm_calls**: total=1, success=1, failed=0
+- **tool_calls**: total=1, success=1
+- **recovery**: attempts=0, success=0, actions=[], results=[]
+- **interest_reasons**: state_updated
 
 ### `c1111111-1111-1111-1111-111111111111`
 
@@ -277,11 +325,27 @@
 - **duration**: 5000ms, **steps**: 6
 - **memory**: retrieved=5, injected=2, dropped=3, total_chars=2400
 - **session_state**: false
+- **persistent_state_updated**: false
 - **context_pack**: dropped=true, reasons=["memory_budget_exceeded", "section_priority_reorder"]
 - **llm_calls**: total=2, success=2, failed=0
 - **tool_calls**: total=4, success=4
 - **recovery**: attempts=0, success=0, actions=[], results=[]
 - **interest_reasons**: memory_dropped, context_pack_dropped
+
+### `a5555555-5555-5555-5555-555555555555`
+
+- **user_input**: 帮我整理今天的任务列表并写入 tasks.md
+- **success**: true
+- **in_baseline**: true
+- **duration**: 5000ms, **steps**: 5
+- **memory**: retrieved=3, injected=3, dropped=0, total_chars=680
+- **session_state**: true
+- **persistent_state_updated**: true
+- **context_pack**: dropped=false, reasons=[]
+- **llm_calls**: total=3, success=3, failed=0
+- **tool_calls**: total=3, success=3
+- **recovery**: attempts=0, success=0, actions=[], results=[]
+- **interest_reasons**: state_updated
 
 ### `d1111111-1111-1111-1111-111111111111`
 
@@ -292,6 +356,7 @@
 - **duration**: 5000ms, **steps**: 2
 - **memory**: retrieved=0, injected=0, dropped=0, total_chars=0
 - **session_state**: false
+- **persistent_state_updated**: false
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=1, success=1, failed=0
 - **tool_calls**: total=1, success=0
@@ -308,6 +373,7 @@
 - **duration**: 5000ms, **steps**: 1
 - **memory**: retrieved=0, injected=0, dropped=0, total_chars=0
 - **session_state**: false
+- **persistent_state_updated**: false
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=1, success=0, failed=1
 - **tool_calls**: total=0, success=0
@@ -323,6 +389,7 @@
 - **duration**: 3ms, **steps**: 2
 - **memory**: retrieved=0, injected=0, dropped=0, total_chars=0
 - **session_state**: false
+- **persistent_state_updated**: false
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=1, success=0, failed=1
 - **tool_calls**: total=1, success=1
@@ -337,6 +404,7 @@
 - **duration**: 5ms, **steps**: 2
 - **memory**: retrieved=0, injected=0, dropped=0, total_chars=0
 - **session_state**: false
+- **persistent_state_updated**: false
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=1, success=0, failed=1
 - **tool_calls**: total=1, success=1
@@ -351,6 +419,7 @@
 - **duration**: 4ms, **steps**: 2
 - **memory**: retrieved=0, injected=0, dropped=0, total_chars=0
 - **session_state**: false
+- **persistent_state_updated**: false
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=1, success=0, failed=1
 - **tool_calls**: total=1, success=1
@@ -365,6 +434,7 @@
 - **duration**: 4ms, **steps**: 2
 - **memory**: retrieved=0, injected=0, dropped=0, total_chars=0
 - **session_state**: false
+- **persistent_state_updated**: false
 - **context_pack**: dropped=false, reasons=[]
 - **llm_calls**: total=1, success=0, failed=1
 - **tool_calls**: total=1, success=1
@@ -381,11 +451,14 @@
 | `d3333333` | (待填) | (low/mid/high) | (待填) |
 | `c2222222` | (待填) | (low/mid/high) | (待填) |
 | `c3333333` | (待填) | (low/mid/high) | (待填) |
+| `a1111111` | (待填) | (low/mid/high) | (待填) |
 | `d5555555` | (待填) | (low/mid/high) | (待填) |
 | `d6666666` | (待填) | (low/mid/high) | (待填) |
 | `b1111111` | (待填) | (low/mid/high) | (待填) |
 | `b2222222` | (待填) | (low/mid/high) | (待填) |
+| `a4444444` | (待填) | (low/mid/high) | (待填) |
 | `c1111111` | (待填) | (low/mid/high) | (待填) |
+| `a5555555` | (待填) | (low/mid/high) | (待填) |
 | `d1111111` | (待填) | (low/mid/high) | (待填) |
 | `d2222222` | (待填) | (low/mid/high) | (待填) |
 | `ece3aad2` | (待填) | (low/mid/high) | (待填) |

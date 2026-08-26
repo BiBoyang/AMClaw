@@ -48,31 +48,44 @@
 
 1. `src/main.rs`
    - 进程入口与信号处理
-   - 加载环境变量与 `config.toml`
-   - 调用微信运行入口
+   - 加载环境变量与 `config.toml`，启动调度器并调用微信运行入口
 2. `src/chat_adapter/`
    - 现有实现：登录、二维码过期刷新、轮询、会话接线、消息收发、任务命令接线
+   - 当前同时承担进程内组合根（装配 agent_core / pipeline / task_executor / reporter / 调度器）与业务命令 handler 集中地
 3. `src/chat_gateway/`
-   - 架构目标：多聊天应用接入层（替代/演进当前 chat_adapter 模块）
+   - 架构目标：多聊天应用接入层（替代/演进当前 chat_adapter 模块；当前为空目录，仅保留规划文档）
 4. `src/command_router/`
-   - 现有实现：聊天文本路由、URL 提取、裸域名链接识别、任务命令分流
+   - 现有实现：聊天文本路由、URL 提取、裸域名链接识别、任务命令分流（`route_text` 为唯一解析入口）
    - 架构目标：消息命令解析与 URL 提取
 5. `src/task_store/`
-   - 现有实现：SQLite 初始化、消息去重、入站文本落库、任务与文章状态持久化
+   - 现有实现：SQLite 初始化、消息去重、入站文本落库、任务与文章状态持久化、用户记忆与 embedding 缓存持久化
    - 架构目标：任务与文章持久化
 6. `src/scheduler/`
-   - 架构目标：定时任务触发
-7. `src/pipeline/`
+   - 现有实现：每日 / 每周报告定时触发与调度 watchdog
+7. `src/task_executor/`
+   - 现有实现：mpsc channel 将 pipeline 任务解耦到独立 worker 线程，避免慢任务阻塞轮询
+8. `src/pipeline/`
    - 现有实现：消费 `pending` 任务，执行 HTTP / 浏览器抓取，生成 HTML / 截图 / Markdown 归档
-   - 架构目标：快照、抽取、分类、归档流程
-8. `src/agent_core/`
-   - 架构目标：LLM 编排与调用入口
-9. `src/tool_registry/`
-   - 架构目标：工具注册与能力边界
-10. `src/mode_policy/`
-    - 架构目标：restricted/unrestricted 策略判定
-11. `src/reporter/`
-    - 架构目标：日报生成与回执摘要
+   - 架构目标：快照、抽取、分类、归档流程的阶段化拆分
+9. `src/agent_core/`
+   - 现有实现：Plan-aware ReAct runtime、LLM 调用、失败语义、最小 watchdog、agent trace 落盘
+   - 架构目标：更完整的 planner / executor / watchdog / controller 分层
+10. `src/retriever/`
+    - 现有实现：Retriever 契约、规则 / 混合 / 影子检索与 EmbeddingProvider 抽象
+11. `src/context_pack.rs`
+    - 现有实现：结构化上下文包（section budget + 渲染），prompt 组装统一入口
+12. `src/session_router.rs`
+    - 现有实现：会话合并缓冲与 flush 路由
+13. `src/session_summary.rs`
+    - 现有实现：会话文本摘要策略（truncate / semantic）
+14. `src/tool_registry/`
+    - 现有实现：工具白名单、工作区路径边界校验与统一执行入口
+15. `src/mode_policy/`
+    - 现有实现：restricted / unrestricted 工具动作与 URL 门禁
+16. `src/reporter/`
+    - 现有实现：日报 / 周报 Markdown 生成与摘要
+17. `src/bin/`
+    - 离线评测与实验 CLI（trace_eval / context_eval 等），不承载主服务逻辑
 
 ## 开发与校验
 

@@ -334,61 +334,25 @@ impl super::WeChatBot {
     }
 
     pub(super) fn build_daily_report_query_reply(&self, day: Option<&str>) -> String {
-        let day = day
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| self.reporter.current_day());
+        let day = normalize_report_query_target(day, self.reporter.current_day());
         match self.reporter.generate_for_day(&day) {
-            Ok(report) => {
-                // 如果 summary 太短（空任务场景），尝试补上 markdown 文件中的详细内容
-                let detailed = std::fs::read_to_string(&report.markdown_path)
-                    .ok()
-                    .map(|content| sanitize_report_markdown_for_wechat(&content));
-                if let Some(content) = detailed {
-                    // 微信单条消息限制约 4096 字符，截断到安全长度
-                    if content.chars().count() > 3800 {
-                        let truncated: String = content.chars().take(3800).collect();
-                        format!(
-                            "{truncated}\n\n...(已截断，共 {item_count} 条)",
-                            item_count = report.item_count
-                        )
-                    } else {
-                        content
-                    }
-                } else {
-                    report.summary
-                }
-            }
+            Ok(report) => render_report_reply_for_wechat(
+                &report.markdown_path,
+                &report.summary,
+                report.item_count,
+            ),
             Err(err) => format!("生成日报失败: {err}"),
         }
     }
 
     pub(super) fn build_weekly_report_query_reply(&self, week: Option<&str>) -> String {
-        let week = week
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| self.reporter.current_week());
+        let week = normalize_report_query_target(week, self.reporter.current_week());
         match self.reporter.generate_weekly_for_week(&week) {
-            Ok(report) => {
-                let detailed = std::fs::read_to_string(&report.markdown_path)
-                    .ok()
-                    .map(|content| sanitize_report_markdown_for_wechat(&content));
-                if let Some(content) = detailed {
-                    if content.chars().count() > 3800 {
-                        let truncated: String = content.chars().take(3800).collect();
-                        format!(
-                            "{truncated}\n\n...(已截断，共 {item_count} 条)",
-                            item_count = report.item_count
-                        )
-                    } else {
-                        content
-                    }
-                } else {
-                    report.summary
-                }
-            }
+            Ok(report) => render_report_reply_for_wechat(
+                &report.markdown_path,
+                &report.summary,
+                report.item_count,
+            ),
             Err(err) => format!("生成周报失败: {err}"),
         }
     }
@@ -610,6 +574,37 @@ impl super::WeChatBot {
             );
         }
         (format!("Echo: {user_text}"), None, None, None)
+    }
+}
+
+/// 归一化报告查询目标：空/空白入参回退到当前周期。
+fn normalize_report_query_target(input: Option<&str>, fallback: String) -> String {
+    input
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or(fallback)
+}
+
+/// 渲染报告回复：优先读 markdown 全文并适配微信（超长截断），读不到时回退 summary。
+fn render_report_reply_for_wechat(
+    markdown_path: &std::path::Path,
+    summary: &str,
+    item_count: usize,
+) -> String {
+    let detailed = std::fs::read_to_string(markdown_path)
+        .ok()
+        .map(|content| sanitize_report_markdown_for_wechat(&content));
+    if let Some(content) = detailed {
+        // 微信单条消息限制约 4096 字符，截断到安全长度
+        if content.chars().count() > 3800 {
+            let truncated: String = content.chars().take(3800).collect();
+            format!("{truncated}\n\n...(已截断，共 {item_count} 条)")
+        } else {
+            content
+        }
+    } else {
+        summary.to_string()
     }
 }
 

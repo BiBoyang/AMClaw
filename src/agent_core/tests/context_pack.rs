@@ -1,8 +1,8 @@
 use super::super::{
-    derive_runtime_session_state, load_business_context_snapshot, select_previous_observations,
-    AgentCore, AgentObservation, AgentRunContext, AgentRunTrace, BusinessContextSnapshot,
-    ContextAssembler, ContextPreviewMode, ExecutionPlan, GoalSignal, MemoryBudget, ObservationKind,
-    PlannedDecision, RuntimeSessionStateSnapshot,
+    build_context_pack, derive_runtime_session_state, load_business_context_snapshot,
+    select_previous_observations, AgentCore, AgentObservation, AgentRunContext, AgentRunTrace,
+    BusinessContextSnapshot, ContextAssembler, ContextPreviewMode, ExecutionPlan, GoalSignal,
+    MemoryBudget, ObservationKind, PlannedDecision, RuntimeSessionStateSnapshot,
 };
 use super::{temp_db_path, temp_workspace};
 use crate::context_pack::{ContextSectionChangeReason, ContextSectionKind};
@@ -12,6 +12,7 @@ use crate::session_summary::{
     SessionSummaryStrategy, SESSION_TEXT_SUMMARY_MAX_CHARS,
 };
 use crate::task_store::TaskStore;
+use serde_json::Value;
 
 #[test]
 fn context_assembler_includes_runtime_fields_and_observation() {
@@ -571,4 +572,78 @@ fn preview_context_verbose_includes_section_content_and_memory_drop_details() {
     assert!(preview.contains("single_item_too_long"));
     assert!(preview.contains("## Section Content Preview"));
     // 低价值 SessionState（仅有默认 goal）已被过滤，不再断言 session_state section
+}
+
+#[test]
+fn trace_context_pack_fields_present_after_run() {
+    let root = temp_workspace();
+    let agent = AgentCore::new(root.clone()).expect("初始化 agent 失败");
+
+    agent.run("读文件 missing.txt").expect_err("应当返回错误");
+
+    let trace_root = root.join("data").join("agent_traces");
+    let day_dir = std::fs::read_dir(&trace_root)
+        .expect("应存在 trace 根目录")
+        .next()
+        .expect("应存在日期目录")
+        .expect("读取日期目录失败")
+        .path();
+    let trace_path = std::fs::read_dir(day_dir)
+        .expect("应存在 trace 文件")
+        .filter_map(|entry| entry.ok().map(|v| v.path()))
+        .find(|path| path.extension().and_then(|v| v.to_str()) == Some("json"))
+        .expect("应存在至少一个 json trace 文件");
+    let payload: Value =
+        serde_json::from_str(&std::fs::read_to_string(&trace_path).expect("读取 trace 文件失败"))
+            .expect("trace JSON 应合法");
+
+    assert_eq!(payload["context_pack_present"], true);
+    assert!(payload["context_pack_section_count"].as_u64().unwrap_or(0) > 0);
+    assert!(payload["context_pack_total_chars"].as_u64().unwrap_or(0) > 0);
+    assert!(payload["context_pack_drop_reasons"].is_array());
+}
+
+#[test]
+fn trace_context_pack_fields_populated_on_budget_trim() {
+    let workspace = temp_workspace();
+    let trace = AgentRunTrace::new(
+        &workspace,
+        "请帮我处理一个很长的上下文请求",
+        AgentRunContext::wechat_chat("user-budget", "commit", vec![])
+            .with_session_text("session ".repeat(240)),
+    );
+    let observation = AgentObservation::tool_result(
+        1,
+        "read_file",
+        &"observation ".repeat(240),
+        Some(ObservationKind::Text),
+    );
+    let runtime_session_state = RuntimeSessionStateSnapshot {
+        goal: Some("推进一个需要大量上下文的信息整理任务".to_string()),
+        current_subtask: Some("先整理线索，再决定是否继续调工具".to_string()),
+        constraints: vec!["避免重复无效动作".to_string(); 4],
+        confirmed_facts: vec!["已有较长 session_text 和 latest_observation".to_string(); 4],
+        done_items: vec!["已完成初步读取".to_string(); 3],
+        next_step: Some("优先收敛上下文而不是继续膨胀 prompt".to_string()),
+        open_questions: vec!["哪些 section 可以先被丢弃".to_string(); 3],
+        goal_signal: GoalSignal::PersistentHigh,
+    };
+    let mut pack = build_context_pack(
+        &trace,
+        "请帮我处理一个很长的上下文请求",
+        Some(&observation),
+        Some(&runtime_session_state),
+        &[
+            format!("read: {}", "tool ".repeat(120)),
+            format!("write: {}", "tool ".repeat(120)),
+        ],
+        None,
+        SessionSummaryStrategy::Semantic,
+        false,
+    );
+    pack.set_max_total_chars(1500);
+    pack.apply_total_budget();
+
+    assert!(pack.budget_summary().final_total_chars <= 1500);
+    assert!(!pack.drop_reasons().is_empty());
 }

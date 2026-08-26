@@ -20,3 +20,4 @@
 - `SESSION-2026-05-08.md`：S17 文档收口（S11~S16 实现同步到 README / DEVELOPMENT.md / agent-eval README / session 记录）。
 - `SESSION-2026-06-13.md`：S21 文档整理、S22 task_store 测试拆分、S23 agent_core 测试拆分 checkpoint 收尾。
 - `SESSION-2026-08-26.md`：S23 测试拆分闭环、Phase 4 写入入口与清尾、Phase 5 标注基建、trace_eval JSON sidecar 与 clippy 清零。
+- `SESSION-2026-08-27.md`：全项目架构复审落地——失败词表映射修复死指标、retriever/task_store 去死、agent_core 判定与契约同源、日报双触发统一与推送补发。

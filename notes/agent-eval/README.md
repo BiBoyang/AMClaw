@@ -10,6 +10,9 @@
   - `EVAL-METRICS-SPEC-2026-04-18.md`：指标口径规范。
   - `EVAL-FAILURE-TAXONOMY-2026-04-18.md`：失败归因字典。
   - `EVAL-COMPARISON-RULES-2026-04-18.md`：PASS/WARN/FAIL 对比判定规则。
+  - `SEMANTIC-FAILURE-ANNOTATION-GUIDE-2026-08-26.md`：context/memory 语义失败人工标注指引（五类二元标签 + 假失败筛除）。
+- `annotations/`
+  - `SEMANTIC-FAILURE-ANNOTATIONS-v1.md`：语义失败标注批次文件（模板，待真实样本积累后启用）。
 - `baselines/`
   - `EVAL-BASELINE-SAMPLES-2026-04-18.md`：固定 baseline 样本集。
   - `TRACE-EVAL-BASELINE-2026-04-18.md`：当前 trace compare 默认 baseline 报告。

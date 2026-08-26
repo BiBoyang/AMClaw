@@ -90,10 +90,13 @@
 - [x] CI soft gate 已改为 JSON 消费（替代脆弱 grep）
 - [x] `scripts/trace_soft_gate.sh` 已抽离并带回归测试
 - [x] Gate 策略文档与 `GATE_MODE` 切换机制已落地（S19）
-- [ ] 从真实 trace 中抽样并标注失败类型（`forgot_known_fact` / `missed_retrieval` / `wrong_retrieval` / `state_drift` / `repeated_work`）
+- [x] 语义失败标注基建已落地（2026-08-26）：标注指引（五类二元标签 + 假失败筛除 + 先依据后判定）`notes/agent-eval/specs/SEMANTIC-FAILURE-ANNOTATION-GUIDE-2026-08-26.md`，批次模板 `notes/agent-eval/annotations/SEMANTIC-FAILURE-ANNOTATIONS-v1.md`
+- [x] trace_eval 报告层带分母 `n/d` 与单侧 99% Wilson 置信界（2026-08-26；gate 判定暂不消费区间，分两步走）
+- [x] 重校纪律已写入 `GATE-POLICY-SPEC-2026-05-08.md`（模型/干预变更即重校、标注集保质期、假失败对称面）
+- [ ] 从真实 trace 中抽样并标注失败类型（等样本量到位后按指引执行）
 - [ ] 比较机制变更前后差异（需 baseline 完备后启动）
 
-> 2026-08-26 现状：真实 trace 样本仅约 5 条（baseline 20 条中 16 条为合成），离路线图要求的 20~50 条真实 run 差距大。当前最优先动作是让 bot 真实跑起来积累样本；标注 schema 与 trace_eval 聚合维度待样本量到位后再做。
+> 2026-08-26 现状：真实 trace 样本仅约 5 条（baseline 20 条中 16 条为合成），离路线图要求的 20~50 条真实 run 差距大。当前最优先动作是让 bot 真实跑起来积累样本；样本到 20+ 条后启动第一批标注。
 
 ## 当前明确不优先做
 

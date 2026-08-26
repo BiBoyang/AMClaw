@@ -26,7 +26,9 @@ mod types;
 mod watchdog;
 
 #[allow(unused_imports)]
-pub(crate) use self::command_parse::{map_llm_plan, parse_llm_plan, parse_user_command, LlmPlan};
+pub(crate) use self::command_parse::{
+    is_agent_command, map_llm_plan, parse_llm_plan, parse_user_command, LlmPlan,
+};
 #[allow(unused_imports)]
 pub(crate) use self::context_assembly::{
     append_context_section_overview, append_session_state_lines, build_context_pack,
@@ -36,7 +38,7 @@ pub(crate) use self::context_assembly::{
     ContextAssembler, ContextCompactionConfig, DropReason, GoalSignal, MemoryBudget,
     RuntimeSessionStateSnapshot, SessionState,
 };
-pub(crate) use self::llm_client::{is_llm_auth_error, LlmClient, LlmConfig};
+pub(crate) use self::llm_client::{LlmClient, LlmConfig};
 #[cfg(test)]
 pub(crate) use self::logging::build_agent_log_payload;
 pub(crate) use self::logging::{log_agent_info, log_agent_warn};
@@ -51,6 +53,7 @@ pub(crate) use self::trace::{
 };
 pub(crate) use self::types::{
     normalize_optional_text, observation_kind_for_action, resulting_source_name,
+    tool_names_from_descriptions,
 };
 pub(crate) use self::watchdog::{
     classify_tool_execution_failure, default_expected_observation_for_decision,
@@ -384,8 +387,6 @@ pub struct AgentCore {
     planning_policy: PlanningPolicy,
     // 可插拔检索器（默认 RuleRetriever）
     retriever: Box<dyn Retriever + Send + Sync>,
-    // 运行时模式策略
-    mode: crate::mode_policy::AgentMode,
     #[cfg(test)]
     scripted_decisions: RefCell<VecDeque<PlannedDecision>>,
 }
@@ -413,6 +414,9 @@ enum LoopControl {
 ///
 /// 鉴权/传输类失败属于环境或运维问题，不是可复用的"经验教训"，沉淀会污染 lesson 记忆。
 /// 命中时返回 L1 类别名（`llm_auth_error` / `llm_transport_error`），否则返回 `None`。
+///
+/// 本函数是 auth/transport 判定的唯一来源：lesson 沉淀过滤与 LLM provider fallback
+/// （`is_llm_auth_error`）共用同一组关键字，避免同一错误在两条链路判定不一致。
 fn classify_env_failure(error_detail: &str) -> Option<&'static str> {
     let lower = error_detail.to_lowercase();
     const AUTH_KEYWORDS: [&str; 4] = ["401", "unauthorized", "invalid api key", "authentication"];
@@ -435,6 +439,16 @@ fn classify_env_failure(error_detail: &str) -> Option<&'static str> {
         return Some("llm_transport_error");
     }
     None
+}
+
+/// LLM 鉴权失败判定：`classify_env_failure` auth 口径的薄包装，供 provider fallback
+/// 与 chat_adapter 用户提示复用。
+///
+/// 注意：相比早期只认 "HTTP 401" / "Authentication Fails" 两个字面量的实现，本判定更宽
+/// （追加 unauthorized / invalid api key / authentication 等关键字，且大小写不敏感）。
+/// 更多鉴权类错误会触发 provider fallback 与鉴权提示——这是有意的修复，与 lesson 过滤口径保持一致。
+pub(crate) fn is_llm_auth_error(err: &str) -> bool {
+    classify_env_failure(err) == Some("llm_auth_error")
 }
 
 /// 环境性失败过滤：命中鉴权/传输特征时记一条 skip 日志并返回 true（不沉淀 lesson）。
@@ -605,7 +619,6 @@ impl AgentCore {
             Some(agent_config.embedding_provider.as_str()),
             agent_config.retriever_rollout_enabled,
             &agent_config.retriever_rollout_allow_users,
-            crate::mode_policy::AgentMode::from_config(&agent_config.mode),
         )
     }
 
@@ -638,7 +651,6 @@ impl AgentCore {
             None,
             false,
             &[],
-            crate::mode_policy::AgentMode::Restricted,
         )
     }
 
@@ -652,7 +664,6 @@ impl AgentCore {
         embedding_provider: Option<&str>,
         retriever_rollout_enabled: bool,
         retriever_rollout_allow_users: &[String],
-        agent_mode: crate::mode_policy::AgentMode,
     ) -> Result<Self> {
         if max_steps == 0 {
             bail!("max_steps 必须大于 0");
@@ -687,7 +698,6 @@ impl AgentCore {
             max_replans: DEFAULT_MAX_REPLANS,
             planning_policy: PlanningPolicy::Reactive,
             retriever,
-            mode: agent_mode,
             #[cfg(test)]
             scripted_decisions: RefCell::new(VecDeque::new()),
         })
@@ -908,28 +918,9 @@ impl AgentCore {
     ) -> Result<LoopControl> {
         let action_source = resulting_source_name(&action);
 
-        // restricted 运行时门禁检查
-        let decision = crate::mode_policy::check_tool_action(self.mode, &action_source);
-        if !decision.allowed {
-            log_agent_warn(
-                "tool_action_policy_denied",
-                vec![
-                    ("step", json!(step)),
-                    ("action", json!(action_source)),
-                    ("reason", json!(decision.reason)),
-                ],
-            );
-            let failure = FailureDecision {
-                kind: StepFailureKind::ManualIntervention,
-                action: FailureAction::Replan,
-                replan_scope: Some(ReplanScope::CurrentStep),
-                detail: decision.reason,
-                source: action_source.clone(),
-                user_message: None,
-            };
-            trace.record_failure(step, &failure);
-            return self.handle_recorded_failure(step, failure, trace);
-        }
+        // 工具白名单的真实防线在 map_llm_plan（未知 action 直接 bail）与 tool_registry
+        // 路径边界校验；原 mode_policy::check_tool_action 的拒绝列表（run_command 等）
+        // 对真实 action 名（tool:read 等）永不命中，属死门禁，已删除。
 
         for attempt in 0..=MAX_STEP_RETRIES {
             let tool_trace = trace.start_tool_call(step, &action);
@@ -1181,12 +1172,13 @@ impl AgentCore {
             trace.record_session_state_snapshot(runtime_session_state.clone());
         }
         trace.record_final_runtime_session_state(&runtime_session_state);
+        let available_tools = self.tool_registry.available_tool_descriptions();
         let context_pack = build_context_pack(
             trace,
             user_input,
             observation,
             Some(&runtime_session_state),
-            &self.tool_registry.available_tool_descriptions(),
+            &available_tools,
             business_context.as_ref(),
             self.context_compaction.session_summary_strategy,
             self.context_compaction.include_previous_observations,
@@ -1244,7 +1236,12 @@ impl AgentCore {
 
         let mut llm_auth_err: Option<anyhow::Error> = None;
         if let Some(client) = &self.llm_client {
-            match client.plan(self.planning_policy, &planner_input, trace) {
+            match client.plan(
+                self.planning_policy,
+                &planner_input,
+                &available_tools,
+                trace,
+            ) {
                 Ok(planned) => {
                     log_agent_info(
                         "agent_planner_selected",

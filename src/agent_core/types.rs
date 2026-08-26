@@ -26,3 +26,18 @@ pub(crate) fn observation_kind_for_action(action: &ToolAction) -> Option<Observa
         ToolAction::ReadArticleArchive { .. } => Some(ObservationKind::ArchiveContent),
     }
 }
+
+/// 从 `ToolRegistry::available_tool_descriptions`（格式 "name: 描述，参数: ..."）提取
+/// action 名列表，作为 prompt 契约（system prompt / ResponseContract）的单一来源。
+pub(crate) fn tool_names_from_descriptions(descriptions: &[String]) -> Vec<String> {
+    descriptions
+        .iter()
+        .filter_map(|desc| {
+            desc.split(':')
+                .next()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        })
+        .collect()
+}

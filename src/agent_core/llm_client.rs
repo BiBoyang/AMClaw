@@ -1,6 +1,7 @@
 use super::{
-    log_agent_info, log_agent_warn, AgentRunTrace, PlannedDecision, PlannerInput, PlanningPolicy,
-    DEFAULT_MOONSHOT_MODEL, DEFAULT_OPENAI_MODEL, LLM_PROVIDER_PRIORITY,
+    is_llm_auth_error, log_agent_info, log_agent_warn, tool_names_from_descriptions, AgentRunTrace,
+    PlannedDecision, PlannerInput, PlanningPolicy, DEFAULT_MOONSHOT_MODEL, DEFAULT_OPENAI_MODEL,
+    LLM_PROVIDER_PRIORITY,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::Client;
@@ -92,11 +93,18 @@ impl LlmClient {
         &self,
         planning_policy: PlanningPolicy,
         planner_input: &PlannerInput,
+        available_tools: &[String],
         trace: &mut AgentRunTrace,
     ) -> Result<PlannedDecision> {
         let mut last_auth_err: Option<anyhow::Error> = None;
         for (idx, config) in self.configs.iter().enumerate() {
-            match self.plan_with_config(config, planning_policy, planner_input, trace) {
+            match self.plan_with_config(
+                config,
+                planning_policy,
+                planner_input,
+                available_tools,
+                trace,
+            ) {
                 Ok(decision) => {
                     if idx > 0 {
                         log_agent_info(
@@ -112,6 +120,9 @@ impl LlmClient {
                 }
                 Err(err) => {
                     let err_text = err.to_string();
+                    // auth 判定与 classify_env_failure 同口径（宽口径，见 is_llm_auth_error 注释）：
+                    // 比早期 "HTTP 401"/"Authentication Fails" 字面量覆盖更多鉴权失败形态，
+                    // 命中即换下一个 provider——这是有意的修复。
                     if is_llm_auth_error(&err_text) && idx + 1 < self.configs.len() {
                         log_agent_warn(
                             "agent_llm_auth_failed",
@@ -141,9 +152,10 @@ impl LlmClient {
         config: &LlmConfig,
         planning_policy: PlanningPolicy,
         planner_input: &PlannerInput,
+        available_tools: &[String],
         trace: &mut AgentRunTrace,
     ) -> Result<PlannedDecision> {
-        let system_prompt = build_system_prompt(planning_policy);
+        let system_prompt = build_system_prompt(planning_policy, available_tools);
         let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
         let mut body = json!({
             "model": config.model,
@@ -163,7 +175,7 @@ impl LlmClient {
         } else {
             body["temperature"] = json!(0.0);
         }
-        let llm_call = trace.start_llm_call(config, system_prompt, planner_input, &body);
+        let llm_call = trace.start_llm_call(config, &system_prompt, planner_input, &body);
         let mut last_status = 0u16;
         let mut last_text = String::new();
         let mut payload_text: Option<String> = None;
@@ -343,14 +355,37 @@ fn key_tail(api_key: &str) -> String {
     }
 }
 
-pub(crate) fn is_llm_auth_error(err: &str) -> bool {
-    err.contains("HTTP 401") || err.contains("Authentication Fails")
+/// 单工具的参数提示，供 system prompt 动态拼接；未知名称不产生提示。
+fn tool_parameter_hint(tool_name: &str) -> Option<&'static str> {
+    match tool_name {
+        "read" => Some("read 只需要 path"),
+        "write" => Some("write 需要 path 与 content"),
+        "create" => Some("create 需要 path 与 content"),
+        "get_task_status" => Some("get_task_status 需要 task_id"),
+        "list_recent_tasks" => Some("list_recent_tasks 可选 limit"),
+        "list_manual_tasks" => Some("list_manual_tasks 可选 limit"),
+        "read_article_archive" => Some("read_article_archive 需要 task_id"),
+        _ => None,
+    }
 }
 
-fn build_system_prompt(planning_policy: PlanningPolicy) -> &'static str {
+/// system prompt 的 action 清单与参数提示从真实可用工具（`available_tool_descriptions`）生成，
+/// 避免 task_store 数据源缺失时广告实际不可用的 action。
+fn build_system_prompt(planning_policy: PlanningPolicy, available_tools: &[String]) -> String {
     match planning_policy {
         PlanningPolicy::Reactive => {
-            "你是一个工具规划器，采用最小 ReAct 风格工作：先根据上下文判断下一步，再决定是调用一个工具还是直接给出最终结果。每轮最多只调用一个工具。只输出 JSON，不要解释。格式为 {\"action\":\"read|write|create|get_task_status|list_recent_tasks|list_manual_tasks|read_article_archive|final\",\"path\":\"...\",\"content\":\"...\",\"task_id\":\"...\",\"limit\":5,\"answer\":\"...\",\"plan\":[\"步骤1\",\"步骤2\"],\"progress_note\":\"当前做到哪\",\"expected_kind\":\"text|json_object|file_mutation|task_status|task_list|archive_content\",\"done_rule\":\"tool_success|non_empty_output|required_json_field\",\"required_field\":\"field_name\",\"expected_fields\":[\"field_a\",\"field_b\"],\"minimum_novelty\":\"different_from_last\"}。read 只需要 path；write/create 需要 path 与 content；get_task_status 需要 task_id；list_recent_tasks/list_manual_tasks 可选 limit；read_article_archive 需要 task_id；final 需要 answer。plan、progress_note、expected_kind、done_rule、required_field、expected_fields、minimum_novelty 都是可选字段，用于表达当前计划、进度和期望观测。"
+            let mut actions = tool_names_from_descriptions(available_tools);
+            actions.push("final".to_string());
+            let action_list = actions.join("|");
+            let mut hints: Vec<String> = tool_names_from_descriptions(available_tools)
+                .iter()
+                .filter_map(|name| tool_parameter_hint(name).map(str::to_string))
+                .collect();
+            hints.push("final 需要 answer".to_string());
+            let hint_text = hints.join("；");
+            format!(
+                "你是一个工具规划器，采用最小 ReAct 风格工作：先根据上下文判断下一步，再决定是调用一个工具还是直接给出最终结果。每轮最多只调用一个工具。只输出 JSON，不要解释。格式为 {{\"action\":\"{action_list}\",\"path\":\"...\",\"content\":\"...\",\"task_id\":\"...\",\"limit\":5,\"answer\":\"...\",\"plan\":[\"步骤1\",\"步骤2\"],\"progress_note\":\"当前做到哪\",\"expected_kind\":\"text|json_object|file_mutation|task_status|task_list|archive_content\",\"done_rule\":\"tool_success|non_empty_output|required_json_field\",\"required_field\":\"field_name\",\"expected_fields\":[\"field_a\",\"field_b\"],\"minimum_novelty\":\"different_from_last\"}}。{hint_text}。plan、progress_note、expected_kind、done_rule、required_field、expected_fields、minimum_novelty 都是可选字段，用于表达当前计划、进度和期望观测。"
+            )
         }
     }
 }

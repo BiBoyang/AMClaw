@@ -1,24 +1,6 @@
 use anyhow::{bail, Result};
 use serde_json::Value;
 
-pub(super) fn is_agent_command(text: &str) -> bool {
-    let raw = text.trim();
-    raw.starts_with("读文件 ")
-        || raw.starts_with("创建文件 ")
-        || raw.starts_with("写文件 ")
-        || raw.starts_with("read ")
-        || raw.starts_with("create ")
-        || raw.starts_with("write ")
-        || raw.starts_with("帮我运行：")
-        || raw.starts_with("帮我运行:")
-        || raw.starts_with("请帮我运行：")
-        || raw.starts_with("请帮我运行:")
-}
-
-pub(super) fn is_llm_auth_error(err: &str) -> bool {
-    err.contains("HTTP 401") || err.contains("Authentication Fails")
-}
-
 pub(super) fn sanitize_report_markdown_for_wechat(content: &str) -> String {
     content
         .lines()

@@ -1346,11 +1346,18 @@ impl ContextAssembler {
             tool_lines,
         ));
 
+        // ResponseContract 的 action 清单与 system prompt 同源：从真实可用工具生成，
+        // 避免 task_store 数据源缺失时广告实际不可用的 action。
+        let mut contract_actions = super::tool_names_from_descriptions(available_tools);
+        contract_actions.push("final".to_string());
         pack.push(ContextSection::new(
             ContextSectionKind::ResponseContract,
             vec![
                 String::new(),
-                "你必须采用最小 ReAct 风格：根据当前上下文决定“继续调一个工具”或“直接结束”。请只输出 JSON，格式为 {\"action\":\"read|write|create|get_task_status|list_recent_tasks|list_manual_tasks|read_article_archive|final\",...,\"expected_fields\":[\"field_a\"],\"minimum_novelty\":\"different_from_last\"}。".to_string(),
+                format!(
+                    "你必须采用最小 ReAct 风格：根据当前上下文决定“继续调一个工具”或“直接结束”。请只输出 JSON，格式为 {{\"action\":\"{}\",...,\"expected_fields\":[\"field_a\"],\"minimum_novelty\":\"different_from_last\"}}。",
+                    contract_actions.join("|")
+                ),
             ],
         ));
 

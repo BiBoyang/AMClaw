@@ -88,6 +88,30 @@ pub(crate) struct LlmPlan {
     pub(crate) minimum_novelty: Option<String>,
 }
 
+/// 文件操作类规则命令前缀（与 `parse_user_command` 的匹配链一一对应）
+const FILE_COMMAND_PREFIXES: [&str; 6] = [
+    "读文件 ",
+    "创建文件 ",
+    "写文件 ",
+    "read ",
+    "create ",
+    "write ",
+];
+/// 运行引导前缀（`normalize_user_command` 剥掉后再匹配文件操作前缀）
+const RUN_WRAPPER_PREFIXES: [&str; 4] = ["帮我运行：", "帮我运行:", "请帮我运行：", "请帮我运行:"];
+
+/// 判断文本是否为 agent 规则命令。
+///
+/// 与 `parse_user_command` / `normalize_user_command` 共用同一组前缀常量，
+/// 供 chat_adapter 在 agent 失败分流时复用，避免双拷贝漂移。
+pub(crate) fn is_agent_command(text: &str) -> bool {
+    let raw = text.trim();
+    FILE_COMMAND_PREFIXES
+        .iter()
+        .chain(RUN_WRAPPER_PREFIXES.iter())
+        .any(|prefix| raw.starts_with(prefix))
+}
+
 pub(crate) fn parse_user_command(input: &str) -> Result<AgentDecision> {
     let text = normalize_user_command(input);
     if let Some(path) = text.strip_prefix("读文件 ") {
@@ -130,17 +154,10 @@ pub(crate) fn parse_user_command(input: &str) -> Result<AgentDecision> {
 
 fn normalize_user_command(input: &str) -> &str {
     let text = input.trim();
-    if let Some(rest) = text.strip_prefix("帮我运行：") {
-        return rest.trim();
-    }
-    if let Some(rest) = text.strip_prefix("帮我运行:") {
-        return rest.trim();
-    }
-    if let Some(rest) = text.strip_prefix("请帮我运行：") {
-        return rest.trim();
-    }
-    if let Some(rest) = text.strip_prefix("请帮我运行:") {
-        return rest.trim();
+    for prefix in RUN_WRAPPER_PREFIXES {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            return rest.trim();
+        }
     }
     text
 }

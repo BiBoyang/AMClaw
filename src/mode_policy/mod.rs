@@ -1,9 +1,9 @@
 /// Agent 运行模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentMode {
-    /// 受限模式：对高风险操作进行门禁拦截
+    /// 受限模式：对 URL 抓取进行门禁拦截（仅 HTTP/HTTPS 且禁止本地/私网地址）
     Restricted,
-    /// 非受限模式：允许更宽范围的操作
+    /// 非受限模式：允许更宽范围的 URL 抓取
     Unrestricted,
 }
 
@@ -41,22 +41,6 @@ impl PolicyDecision {
     }
 }
 
-/// 检查工具动作是否允许在指定模式下执行。
-pub fn check_tool_action(mode: AgentMode, action: &str) -> PolicyDecision {
-    match mode {
-        AgentMode::Unrestricted => PolicyDecision::allow("unrestricted 模式放行所有工具动作"),
-        AgentMode::Restricted => {
-            // restricted 模式下禁止的高风险动作
-            let denied_actions: &[&str] = &["run_command", "execute_shell", "exec"];
-            if denied_actions.iter().any(|&a| action.contains(a)) {
-                PolicyDecision::deny(format!("restricted 模式禁止执行高风险工具动作: {action}"))
-            } else {
-                PolicyDecision::allow("restricted 模式下允许的工具动作")
-            }
-        }
-    }
-}
-
 /// 检查 URL 是否允许在指定模式下抓取。
 pub fn check_url(mode: AgentMode, url: &str) -> PolicyDecision {
     match mode {
@@ -82,25 +66,6 @@ pub fn check_url(mode: AgentMode, url: &str) -> PolicyDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn restricted_denies_run_command() {
-        let decision = check_tool_action(AgentMode::Restricted, "run_command ls");
-        assert!(!decision.allowed);
-        assert!(decision.reason.contains("restricted"));
-    }
-
-    #[test]
-    fn restricted_allows_read() {
-        let decision = check_tool_action(AgentMode::Restricted, "read");
-        assert!(decision.allowed);
-    }
-
-    #[test]
-    fn unrestricted_allows_all_tools() {
-        let decision = check_tool_action(AgentMode::Unrestricted, "run_command rm -rf /");
-        assert!(decision.allowed);
-    }
 
     #[test]
     fn restricted_denies_localhost_url() {

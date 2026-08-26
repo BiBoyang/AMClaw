@@ -90,6 +90,20 @@ impl TaskExecutor {
                                 ("panic", json!(panic_msg)),
                             ],
                         );
+                        // best-effort：panic 发生在 claim 之后时任务停在 processing，
+                        // 标失败避免卡到 lease 过期；标失败本身失败（或任务不在
+                        // processing，no-op）只记日志，不影响 worker 继续消费。
+                        if let Err(err) = task_store
+                            .mark_task_failed(&task_id, &format!("worker panic: {panic_msg}"))
+                        {
+                            log_task_executor_warn(
+                                "worker_task_panic_mark_failed_error",
+                                vec![
+                                    ("task_id", json!(task_id)),
+                                    ("detail", json!(err.to_string())),
+                                ],
+                            );
+                        }
                     }
                 }
 
@@ -208,13 +222,6 @@ fn process_task(
     task_id: &str,
     worker_id: &str,
 ) -> Result<()> {
-    #[cfg(test)]
-    {
-        if should_panic_for_task(task_id) {
-            panic!("injected test panic for task {}", task_id);
-        }
-    }
-
     // 1. 原子领取任务（pending 或 lease 过期的 processing -> processing）
     const LEASE_SECS: u64 = 300;
     if !task_store.claim_task(task_id, worker_id, LEASE_SECS)? {
@@ -226,6 +233,15 @@ fn process_task(
             ],
         );
         return Ok(());
+    }
+
+    // 测试注入点放在 claim 之后：模拟"任务已推进到 processing 后 panic"的真实场景，
+    // 以覆盖 panic 分支的 mark_task_failed 行为。
+    #[cfg(test)]
+    {
+        if should_panic_for_task(task_id) {
+            panic!("injected test panic for task {}", task_id);
+        }
     }
 
     // 2. 获取任务详情
@@ -392,6 +408,22 @@ mod tests {
         );
         assert_eq!(executor.pending_count.load(Ordering::SeqCst), 0);
         assert!(executor.inflight.lock().unwrap().is_empty());
+
+        // panic 任务应被标为 failed，而不是卡在 processing 直到 lease 过期
+        let panic_status = task_store
+            .get_task_status(&panic_task.task_id)
+            .expect("查询 panic 任务失败")
+            .expect("panic 任务应存在");
+        assert_eq!(panic_status.status, "failed");
+        assert!(
+            panic_status
+                .last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("worker panic"),
+            "panic 任务的 last_error 应记录 panic 信息，实际: {:?}",
+            panic_status.last_error
+        );
 
         // 验证第二个任务被成功归档
         let safe_status = task_store

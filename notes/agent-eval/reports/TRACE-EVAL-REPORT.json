@@ -1,0 +1,79 @@
+{
+  "schema_version": "trace_eval_report_v1",
+  "report_date": "2026-08-26",
+  "total_runs": 21,
+  "baseline_run_ids": 20,
+  "baseline_hits": 20,
+  "recovery_attempt_count": 6,
+  "total_tool_calls": 28,
+  "avg_step_count": 3.0952380952380953,
+  "failure_type_counts": {
+    "fallback_exhausted": 1,
+    "llm_auth_error": 1,
+    "planning_stall_or_drift": 1,
+    "tool_call_error": 2,
+    "unknown_failure": 1
+  },
+  "rates": {
+    "context_drop_rate": {
+      "rate": 14.3,
+      "hits": 3,
+      "total": 21,
+      "wilson99_bound": 39.04817440915672
+    },
+    "fallback_rate": {
+      "rate": 33.3,
+      "hits": 7,
+      "total": 21,
+      "wilson99_bound": 58.35522805134242
+    },
+    "memory_injected_rate": {
+      "rate": 19.0,
+      "hits": 4,
+      "total": 21,
+      "wilson99_bound": 6.518253271298477
+    },
+    "persistent_state_updated_rate": {
+      "rate": 14.3,
+      "hits": 3,
+      "total": 21,
+      "wilson99_bound": 4.155751214339231
+    },
+    "planning_stall_rate": {
+      "rate": 4.8,
+      "hits": 1,
+      "total": 21,
+      "wilson99_bound": 27.400264709007395
+    },
+    "recovery_success_rate": {
+      "rate": 16.7,
+      "hits": 1,
+      "total": 6,
+      "wilson99_bound": 2.3329333247961492
+    },
+    "state_present_rate": {
+      "rate": 19.0,
+      "hits": 4,
+      "total": 21,
+      "wilson99_bound": 6.518253271298477
+    },
+    "success_rate": {
+      "rate": 76.2,
+      "hits": 16,
+      "total": 21,
+      "wilson99_bound": 50.815108113450535
+    },
+    "tool_success_rate": {
+      "rate": 82.1,
+      "hits": 23,
+      "total": 28,
+      "wilson99_bound": 60.67055620649482
+    },
+    "unknown_failure_rate": {
+      "rate": 4.8,
+      "hits": 1,
+      "total": 21,
+      "wilson99_bound": 27.400264709007395
+    }
+  }
+}

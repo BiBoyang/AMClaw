@@ -1,6 +1,6 @@
 # Trace Evaluation Report
 
-- generated: 2026-08-26T10:10:24.231038+00:00
+- generated: 2026-08-26T14:45:32.145684+00:00
 - total traces: 21
 - baseline_file: notes/agent-eval/baselines/EVAL-BASELINE-SAMPLES-2026-04-18.md
 - baseline_run_ids: 20

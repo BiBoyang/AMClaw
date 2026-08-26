@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -332,7 +332,13 @@ fn main() {
         baseline_path.as_deref(),
     );
     fs::write(&output_path, report).expect("写入报告失败");
+    // 同步写 JSON sidecar（同名 .json），供 compare 结构化消费；markdown 内容不变
+    let sidecar = build_report_sidecar(&summaries, &baseline_run_ids);
+    let sidecar_json = serde_json::to_string_pretty(&sidecar).expect("序列化报告 sidecar 失败");
+    let sidecar_file = sidecar_path(&output_path);
+    fs::write(&sidecar_file, sidecar_json).expect("写入报告 sidecar 失败");
     println!("报告已生成: {}", output_path.display());
+    println!("报告 sidecar 已生成: {}", sidecar_file.display());
     println!(
         "总计 trace: {}，值得关注: {}",
         summaries.len(),
@@ -1875,6 +1881,263 @@ fn extract_usize_from_cell(s: &str) -> usize {
 }
 
 // -------------------------------------------------------------------------
+// JSON sidecar（报告结构化伴生文件）
+// -------------------------------------------------------------------------
+
+/// sidecar schema 版本号；compare 只消费认识的版本，否则回退 markdown 解析。
+const REPORT_SIDECAR_SCHEMA_VERSION: &str = "trace_eval_report_v1";
+
+/// 单个比例指标：rate 为百分比（0..100），与 markdown 单元格 `{:.1}%` 同一舍入；
+/// wilson99_bound 为单侧 99% 置信界（HigherIsBetter 指标为下界，LowerIsBetter 指标为上界；
+/// total=0 时为 None）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct RateMetric {
+    rate: f64,
+    hits: usize,
+    total: usize,
+    wilson99_bound: Option<f64>,
+}
+
+/// 报告 JSON sidecar：与同名 .md 报告配套落盘，供 compare 结构化消费。
+/// 比例指标以现有指标名为 key（success_rate 等）；均值类指标（avg_step_count）只有值。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReportSidecar {
+    schema_version: String,
+    report_date: String,
+    total_runs: usize,
+    baseline_run_ids: usize,
+    baseline_hits: usize,
+    recovery_attempt_count: usize,
+    total_tool_calls: usize,
+    avg_step_count: f64,
+    failure_type_counts: BTreeMap<String, usize>,
+    rates: BTreeMap<String, RateMetric>,
+}
+
+/// 报告路径对应的 JSON sidecar 路径（`REPORT.md` -> `REPORT.json`）。
+fn sidecar_path(report_path: &Path) -> PathBuf {
+    report_path.with_extension("json")
+}
+
+/// 报告比例指标的方向（与 compare 规则一致）：HigherIsBetter 取 Wilson 下界。
+fn rate_metric_direction(name: &str) -> Direction {
+    match name {
+        "success_rate"
+        | "state_present_rate"
+        | "memory_injected_rate"
+        | "recovery_success_rate"
+        | "tool_success_rate"
+        | "persistent_state_updated_rate" => Direction::HigherIsBetter,
+        _ => Direction::LowerIsBetter,
+    }
+}
+
+fn insert_rate_metric(
+    rates: &mut BTreeMap<String, RateMetric>,
+    name: &str,
+    hits: usize,
+    total: usize,
+) {
+    let bound = wilson_bound_99(hits, total, rate_metric_direction(name)).map(|b| b * 100.0);
+    // rate 与 markdown 单元格的 `{:.1}%` 保持同一舍入结果，保证混合 compare
+    // （一侧 sidecar、一侧旧 markdown 报告）时数值完全一致，不翻转判定
+    let exact = pct(hits, total);
+    let rate = format!("{:.1}", exact).parse::<f64>().unwrap_or(exact);
+    rates.insert(
+        name.to_string(),
+        RateMetric {
+            rate,
+            hits,
+            total,
+            wilson99_bound: bound,
+        },
+    );
+}
+
+/// 从 summaries 构建报告 JSON sidecar（指标口径与 build_report 的 markdown 单元格一致）。
+fn build_report_sidecar(
+    summaries: &[TraceSummary],
+    baseline_run_ids: &HashSet<String>,
+) -> ReportSidecar {
+    let total = summaries.len();
+    let mut rates = BTreeMap::new();
+
+    insert_rate_metric(
+        &mut rates,
+        "success_rate",
+        summaries.iter().filter(|s| s.success).count(),
+        total,
+    );
+    insert_rate_metric(
+        &mut rates,
+        "fallback_rate",
+        summaries.iter().filter(|s| s.llm_fallback).count(),
+        total,
+    );
+    insert_rate_metric(
+        &mut rates,
+        "context_drop_rate",
+        summaries.iter().filter(|s| s.context_pack_dropped).count(),
+        total,
+    );
+    insert_rate_metric(
+        &mut rates,
+        "state_present_rate",
+        summaries.iter().filter(|s| s.state_present).count(),
+        total,
+    );
+    insert_rate_metric(
+        &mut rates,
+        "memory_injected_rate",
+        summaries.iter().filter(|s| s.memory_injected > 0).count(),
+        total,
+    );
+    insert_rate_metric(
+        &mut rates,
+        "persistent_state_updated_rate",
+        summaries
+            .iter()
+            .filter(|s| s.persistent_state_updated)
+            .count(),
+        total,
+    );
+
+    let total_tool_calls: usize = summaries.iter().map(|s| s.tool_call_count).sum();
+    let total_tool_success: usize = summaries.iter().map(|s| s.tool_success_count).sum();
+    insert_rate_metric(
+        &mut rates,
+        "tool_success_rate",
+        total_tool_success,
+        total_tool_calls,
+    );
+
+    let stall_drift_count = summaries
+        .iter()
+        .filter(|s| {
+            s.failure_types
+                .iter()
+                .any(|ft| ft == "planning_stall_or_drift")
+        })
+        .count();
+    insert_rate_metric(&mut rates, "planning_stall_rate", stall_drift_count, total);
+
+    let recovery_attempt_count: usize = summaries.iter().map(|s| s.recovery_attempt_count).sum();
+    let recovery_successes: usize = summaries.iter().map(|s| s.recovery_success_count).sum();
+    insert_rate_metric(
+        &mut rates,
+        "recovery_success_rate",
+        recovery_successes,
+        recovery_attempt_count,
+    );
+
+    let mut failure_type_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for summary in summaries {
+        for failure_type in &summary.failure_types {
+            *failure_type_counts.entry(failure_type.clone()).or_insert(0) += 1;
+        }
+    }
+    let unknown_count = failure_type_counts
+        .get("unknown_failure")
+        .copied()
+        .unwrap_or(0);
+    insert_rate_metric(&mut rates, "unknown_failure_rate", unknown_count, total);
+
+    let avg_step_count = if total > 0 {
+        summaries.iter().map(|s| s.step_count).sum::<usize>() as f64 / total as f64
+    } else {
+        0.0
+    };
+
+    ReportSidecar {
+        schema_version: REPORT_SIDECAR_SCHEMA_VERSION.to_string(),
+        report_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        total_runs: total,
+        baseline_run_ids: baseline_run_ids.len(),
+        baseline_hits: summaries.iter().filter(|s| s.in_baseline).count(),
+        recovery_attempt_count,
+        total_tool_calls,
+        avg_step_count,
+        failure_type_counts,
+        rates,
+    }
+}
+
+/// 从 JSON sidecar 构建 CompareMetrics；schema 版本不认识或 JSON 损坏时返回 Err，
+/// 由调用方回退到 markdown 文本解析。
+fn parse_sidecar(content: &str) -> Result<CompareMetrics, String> {
+    let sidecar: ReportSidecar =
+        serde_json::from_str(content).map_err(|e| format!("JSON 解析失败: {}", e))?;
+    if sidecar.schema_version != REPORT_SIDECAR_SCHEMA_VERSION {
+        return Err(format!(
+            "不认识的 schema_version: {}",
+            sidecar.schema_version
+        ));
+    }
+    Ok(compare_metrics_from_sidecar(&sidecar))
+}
+
+fn compare_metrics_from_sidecar(sidecar: &ReportSidecar) -> CompareMetrics {
+    let mut metrics = CompareMetrics {
+        report_date: sidecar.report_date.clone(),
+        total_runs: sidecar.total_runs,
+        baseline_run_ids: sidecar.baseline_run_ids,
+        baseline_hits: sidecar.baseline_hits,
+        recovery_attempt_count: sidecar.recovery_attempt_count,
+        total_tool_calls: sidecar.total_tool_calls,
+        avg_step_count: Some(sidecar.avg_step_count),
+        failure_type_counts: sidecar
+            .failure_type_counts
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect(),
+        ..Default::default()
+    };
+    for (name, sample) in &sidecar.rates {
+        let rate = Some(sample.rate);
+        match name.as_str() {
+            "success_rate" => metrics.success_rate = rate,
+            "fallback_rate" => metrics.fallback_rate = rate,
+            "context_drop_rate" => metrics.context_drop_rate = rate,
+            "state_present_rate" => metrics.state_present_rate = rate,
+            "memory_injected_rate" => metrics.memory_injected_rate = rate,
+            "recovery_success_rate" => metrics.recovery_success_rate = rate,
+            "unknown_failure_rate" => metrics.unknown_failure_rate = rate,
+            "tool_success_rate" => metrics.tool_success_rate = rate,
+            "planning_stall_rate" => metrics.planning_stall_rate = rate,
+            "persistent_state_updated_rate" => {
+                metrics.persistent_state_updated_rate = rate;
+                metrics.persistent_state_updated_count = sample.hits;
+            }
+            // 未知指标（可能来自更新版本）：忽略，保持向前兼容
+            _ => continue,
+        }
+        metrics
+            .rate_samples
+            .insert(name.clone(), (sample.hits, sample.total));
+    }
+    metrics
+}
+
+/// 加载 compare 输入：优先消费同名 `.json` sidecar（schema 认识时）；
+/// sidecar 缺失、损坏或版本不认识时回退到现有 markdown 文本解析，行为与之前一致。
+fn load_compare_metrics(report_path: &Path) -> Result<CompareMetrics, String> {
+    let sidecar_file = sidecar_path(report_path);
+    if let Ok(content) = fs::read_to_string(&sidecar_file) {
+        match parse_sidecar(&content) {
+            Ok(metrics) => return Ok(metrics),
+            Err(reason) => eprintln!(
+                "sidecar {} 不可用（{}），回退 markdown 解析",
+                sidecar_file.display(),
+                reason
+            ),
+        }
+    }
+    let content = fs::read_to_string(report_path)
+        .map_err(|e| format!("读取报告失败 {}: {}", report_path.display(), e))?;
+    parse_report(&content)
+}
+
+// -------------------------------------------------------------------------
 // Single metric evaluation
 // -------------------------------------------------------------------------
 
@@ -2361,32 +2624,17 @@ fn run_compare_mode(
     gate_strict: bool,
     gate_json: bool,
 ) {
-    let before_content = match fs::read_to_string(before_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("读取 before 报告失败 {}: {}", before_path.display(), e);
-            std::process::exit(1);
-        }
-    };
-    let after_content = match fs::read_to_string(after_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("读取 after 报告失败 {}: {}", after_path.display(), e);
-            std::process::exit(1);
-        }
-    };
-
-    let before = match parse_report(&before_content) {
+    let before = match load_compare_metrics(before_path) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("解析 before 报告失败: {}", e);
+            eprintln!("加载 before 报告失败: {}", e);
             std::process::exit(1);
         }
     };
-    let after = match parse_report(&after_content) {
+    let after = match load_compare_metrics(after_path) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("解析 after 报告失败: {}", e);
+            eprintln!("加载 after 报告失败: {}", e);
             std::process::exit(1);
         }
     };
@@ -2803,6 +3051,217 @@ mod tests {
             metrics.rate_samples.get("recovery_success_rate"),
             Some(&(0, 0))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // JSON sidecar tests
+    // -----------------------------------------------------------------------
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "trace_eval_sidecar_test_{}_{}",
+            name,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sidecar_sample_summaries() -> Vec<TraceSummary> {
+        let mut s1 = make_summary("run-1", vec![]);
+        s1.success = true;
+        s1.llm_fallback = true;
+        s1.state_present = true;
+        s1.memory_injected = 2;
+        s1.persistent_state_updated = true;
+        s1.tool_call_count = 2;
+        s1.tool_success_count = 2;
+        s1.step_count = 3;
+        let mut s2 = make_summary("run-2", vec![]);
+        s2.success = false;
+        s2.context_pack_dropped = true;
+        s2.tool_call_count = 2;
+        s2.tool_success_count = 1;
+        s2.step_count = 5;
+        vec![s1, s2]
+    }
+
+    #[test]
+    fn test_sidecar_roundtrip_matches_markdown_parse() {
+        // sidecar 写出 -> 读回，与同一批 summaries 的 markdown 解析结果一致
+        let summaries = sidecar_sample_summaries();
+        let sidecar = build_report_sidecar(&summaries, &HashSet::new());
+        assert_eq!(sidecar.schema_version, REPORT_SIDECAR_SCHEMA_VERSION);
+
+        let json = serde_json::to_string_pretty(&sidecar).unwrap();
+        let from_sidecar = parse_sidecar(&json).unwrap();
+        let from_markdown =
+            parse_report(&build_report(&summaries, false, &HashSet::new(), None)).unwrap();
+
+        assert_eq!(from_sidecar.total_runs, from_markdown.total_runs);
+        assert_eq!(
+            from_sidecar.persistent_state_updated_count,
+            from_markdown.persistent_state_updated_count
+        );
+        assert_eq!(from_sidecar.recovery_attempt_count, 0);
+        assert_eq!(from_sidecar.total_tool_calls, 4);
+        // sidecar rate 与 markdown 单元格同一舍入，应精确一致
+        for (name, sidecar_val, markdown_val) in [
+            (
+                "success_rate",
+                from_sidecar.success_rate,
+                from_markdown.success_rate,
+            ),
+            (
+                "fallback_rate",
+                from_sidecar.fallback_rate,
+                from_markdown.fallback_rate,
+            ),
+            (
+                "context_drop_rate",
+                from_sidecar.context_drop_rate,
+                from_markdown.context_drop_rate,
+            ),
+            (
+                "state_present_rate",
+                from_sidecar.state_present_rate,
+                from_markdown.state_present_rate,
+            ),
+            (
+                "memory_injected_rate",
+                from_sidecar.memory_injected_rate,
+                from_markdown.memory_injected_rate,
+            ),
+            (
+                "recovery_success_rate",
+                from_sidecar.recovery_success_rate,
+                from_markdown.recovery_success_rate,
+            ),
+            (
+                "unknown_failure_rate",
+                from_sidecar.unknown_failure_rate,
+                from_markdown.unknown_failure_rate,
+            ),
+            (
+                "tool_success_rate",
+                from_sidecar.tool_success_rate,
+                from_markdown.tool_success_rate,
+            ),
+            (
+                "planning_stall_rate",
+                from_sidecar.planning_stall_rate,
+                from_markdown.planning_stall_rate,
+            ),
+        ] {
+            let diff = (sidecar_val.unwrap() - markdown_val.unwrap()).abs();
+            assert!(diff < 1e-9, "{}: sidecar vs markdown diff={}", name, diff);
+        }
+        assert!((from_sidecar.avg_step_count.unwrap() - 4.0).abs() < 1e-9);
+        // 分母信息与 markdown 反解析一致
+        for key in [
+            "success_rate",
+            "fallback_rate",
+            "tool_success_rate",
+            "planning_stall_rate",
+            "recovery_success_rate",
+        ] {
+            assert_eq!(
+                from_sidecar.rate_samples.get(key),
+                from_markdown.rate_samples.get(key),
+                "rate_samples[{}]",
+                key
+            );
+        }
+        // sidecar 数据齐全，无缺失字段
+        assert!(from_sidecar.missing_fields.is_empty());
+        // wilson 界：total=0 时为 None，total>0 时有值
+        assert!(from_sidecar
+            .rate_samples
+            .contains_key("persistent_state_updated_rate"));
+        let success_metric =
+            &build_report_sidecar(&summaries, &HashSet::new()).rates["success_rate"];
+        assert!(success_metric.wilson99_bound.is_some());
+        let recovery_metric = &sidecar.rates["recovery_success_rate"];
+        assert!(recovery_metric.wilson99_bound.is_none());
+    }
+
+    #[test]
+    fn test_load_compare_metrics_falls_back_to_markdown_without_sidecar() {
+        // 无 sidecar 的旧报告：走 markdown 解析，行为与之前完全一致
+        let dir = temp_test_dir("fallback");
+        let report_path = dir.join("old-report.md");
+        fs::write(&report_path, minimal_report()).unwrap();
+
+        let loaded = load_compare_metrics(&report_path).unwrap();
+        let parsed = parse_report(&minimal_report()).unwrap();
+        assert_eq!(loaded.total_runs, parsed.total_runs);
+        assert!((loaded.success_rate.unwrap() - parsed.success_rate.unwrap()).abs() < 1e-9);
+        assert!(
+            (loaded.tool_success_rate.unwrap() - parsed.tool_success_rate.unwrap()).abs() < 1e-9
+        );
+        assert!(loaded.rate_samples.is_empty());
+        assert_eq!(loaded.report_date, "2026-04-18");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sidecar_unknown_schema_version_falls_back() {
+        // schema_version 不认识：parse_sidecar 明确报错，load 回退 markdown（更安全的选项）
+        let sidecar = build_report_sidecar(&sidecar_sample_summaries(), &HashSet::new());
+        let json = serde_json::to_string(&sidecar)
+            .unwrap()
+            .replace(REPORT_SIDECAR_SCHEMA_VERSION, "trace_eval_report_v999");
+        let err = parse_sidecar(&json).unwrap_err();
+        assert!(err.contains("trace_eval_report_v999"), "err={}", err);
+
+        let dir = temp_test_dir("schema");
+        let report_path = dir.join("report.md");
+        fs::write(&report_path, minimal_report()).unwrap();
+        fs::write(report_path.with_extension("json"), &json).unwrap();
+        let loaded = load_compare_metrics(&report_path).unwrap();
+        // 回退到 markdown 解析结果，而非 sidecar 内容
+        assert_eq!(loaded.total_runs, 20);
+        assert!((loaded.success_rate.unwrap() - 75.0).abs() < 0.01);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_compare_metrics_ignores_broken_sidecar() {
+        // sidecar 存在但 JSON 损坏：回退 markdown 解析
+        let dir = temp_test_dir("broken");
+        let report_path = dir.join("report.md");
+        fs::write(&report_path, minimal_report()).unwrap();
+        fs::write(report_path.with_extension("json"), "not a json").unwrap();
+
+        let loaded = load_compare_metrics(&report_path).unwrap();
+        assert_eq!(loaded.total_runs, 20);
+        assert!((loaded.success_rate.unwrap() - 75.0).abs() < 0.01);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_compare_metrics_prefers_sidecar() {
+        // sidecar 存在且 schema 认识：优先消费 sidecar，不再依赖 markdown 文本
+        let dir = temp_test_dir("prefer");
+        let report_path = dir.join("report.md");
+        fs::write(&report_path, "故意写非报告内容，证明未被读取").unwrap();
+        let sidecar = build_report_sidecar(&sidecar_sample_summaries(), &HashSet::new());
+        fs::write(
+            report_path.with_extension("json"),
+            serde_json::to_string_pretty(&sidecar).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_compare_metrics(&report_path).unwrap();
+        assert_eq!(loaded.total_runs, 2);
+        assert!((loaded.success_rate.unwrap() - 50.0).abs() < 1e-9);
+        assert_eq!(loaded.rate_samples.get("tool_success_rate"), Some(&(3, 4)));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

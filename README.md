@@ -311,10 +311,10 @@ cargo run --bin trace_eval
 ```
 
 - 扫描 `data/agent_traces/` 目录下的所有 trace JSON，生成统计报告。
-- 默认输出报告到 `notes/agent-eval/reports/TRACE-EVAL-REPORT.md`。
+- 默认输出报告到 `notes/agent-eval/reports/TRACE-EVAL-REPORT.md`，同时写同名 JSON sidecar（`TRACE-EVAL-REPORT.json`，schema 版本 `trace_eval_report_v1`）供 compare 结构化消费。
 - 默认关联 `notes/agent-eval/baselines/EVAL-BASELINE-SAMPLES-2026-04-18.md` 做 baseline 命中统计。
 - 支持 `--date`、`--dir`、`--output`、`--baseline`、`--no-baseline`、`--only-interesting` 参数。
-- 支持 `--compare-before <path>`、`--compare-after <path>`、`--compare-output <path>` 对比两份已有报告，输出 PASS/WARN/FAIL 结论。缺少 `--compare-before` 或 `--compare-after` 时报错退出。
+- 支持 `--compare-before <path>`、`--compare-after <path>`、`--compare-output <path>` 对比两份已有报告，输出 PASS/WARN/FAIL 结论。缺少 `--compare-before` 或 `--compare-after` 时报错退出。对比时优先读取报告同名 `.json` sidecar；sidecar 缺失、损坏或 schema 版本不认识时自动回退 markdown 文本解析（兼容无 sidecar 的旧报告）。
 - Gate 模式：`--gate` 输出精简结果并返回退出码（PASS=0, FAIL=1, N/A=2；WARN 默认=0，`--gate-strict` 下 WARN=2）。可用作 CI / 收尾阶段的自动化门禁。指标规范见 `notes/agent-eval/specs/EVAL-GATE-SPEC-2026-04-20.md`；策略规范（soft/hard 模式、升级/回退条件）见 `notes/agent-eval/specs/GATE-POLICY-SPEC-2026-05-08.md`。
   - 文本输出协议（按顺序，`--gate`，默认）：
     - `OVERALL=PASS|WARN|FAIL|N/A`

@@ -409,9 +409,56 @@ enum LoopControl {
     Finish(String),
 }
 
+/// 环境性失败分类：对齐 `notes/agent-eval/specs/EVAL-FAILURE-TAXONOMY-2026-04-18.md` 的 L1 口径。
+///
+/// 鉴权/传输类失败属于环境或运维问题，不是可复用的"经验教训"，沉淀会污染 lesson 记忆。
+/// 命中时返回 L1 类别名（`llm_auth_error` / `llm_transport_error`），否则返回 `None`。
+fn classify_env_failure(error_detail: &str) -> Option<&'static str> {
+    let lower = error_detail.to_lowercase();
+    const AUTH_KEYWORDS: [&str; 4] = ["401", "unauthorized", "invalid api key", "authentication"];
+    const TRANSPORT_KEYWORDS: [&str; 6] = [
+        "timeout",
+        "connection",
+        "dns",
+        "send request",
+        "sending request",
+        "transport",
+    ];
+    // 优先级与 taxonomy 固定映射顺序一致：先 auth 后 transport
+    if AUTH_KEYWORDS.iter().any(|keyword| lower.contains(keyword)) {
+        return Some("llm_auth_error");
+    }
+    if TRANSPORT_KEYWORDS
+        .iter()
+        .any(|keyword| lower.contains(keyword))
+    {
+        return Some("llm_transport_error");
+    }
+    None
+}
+
+/// 环境性失败过滤：命中鉴权/传输特征时记一条 skip 日志并返回 true（不沉淀 lesson）。
+fn should_skip_env_lesson(user_id: &str, detail: &str) -> bool {
+    match classify_env_failure(detail) {
+        Some(category) => {
+            log_agent_info(
+                "memory_lesson_env_filtered",
+                vec![
+                    ("user_id", json!(user_id)),
+                    ("category", json!(category)),
+                    ("detail_preview", json!(summarize_for_markdown(detail, 120))),
+                ],
+            );
+            true
+        }
+        None => false,
+    }
+}
+
 /// 失败收场时沉淀一条 `Lesson` 类型长期记忆（Phase 4）。
 ///
 /// - 内容 = 失败原因的简短文本，走 `govern_memory_write` 享受 validate/dedup/promote 治理。
+/// - 环境性失败（鉴权/传输，见 `classify_env_failure`）不沉淀，只记 `memory_lesson_env_filtered` 日志。
 /// - best-effort：缺少 db_path/user_id、内容为空、或写入失败时只记日志，绝不影响主链路成败。
 pub(crate) fn persist_failure_lesson(
     db_path: Option<&Path>,
@@ -424,7 +471,34 @@ pub(crate) fn persist_failure_lesson(
     if user_id.trim().is_empty() || error_detail.trim().is_empty() {
         return;
     }
+    if should_skip_env_lesson(user_id, error_detail) {
+        return;
+    }
     let content = format!("失败教训: {}", summarize_for_markdown(error_detail, 200));
+    write_lesson_memory(db_path, user_id, &content);
+}
+
+/// 升级人工（ask_user）收场时沉淀一条 `Lesson` 类型长期记忆（Phase 4）。
+///
+/// - 内容语义是"升级人工处理"而非"失败"：`升级人工: <原因摘要>`。
+/// - 与失败收场同口径：环境性原因不沉淀，写入走 `govern_memory_write`（dedup 兜底重复升级）。
+/// - best-effort：缺少 db_path/user_id、内容为空、或写入失败时只记日志，绝不影响主链路成败。
+pub(crate) fn persist_ask_user_lesson(db_path: Option<&Path>, user_id: Option<&str>, reason: &str) {
+    let (Some(db_path), Some(user_id)) = (db_path, user_id) else {
+        return;
+    };
+    if user_id.trim().is_empty() || reason.trim().is_empty() {
+        return;
+    }
+    if should_skip_env_lesson(user_id, reason) {
+        return;
+    }
+    let content = format!("升级人工: {}", summarize_for_markdown(reason, 200));
+    write_lesson_memory(db_path, user_id, &content);
+}
+
+/// lesson 记忆写入共享链路：open store → govern_memory_write → 按决策记日志。
+fn write_lesson_memory(db_path: &Path, user_id: &str, content: &str) {
     let mut store = match TaskStore::open(db_path) {
         Ok(store) => store,
         Err(err) => {
@@ -442,7 +516,7 @@ pub(crate) fn persist_failure_lesson(
     let mut write_state = MemoryWriteState::default();
     let decision = store.govern_memory_write(
         user_id,
-        &content,
+        content,
         MemoryType::Lesson,
         MemoryType::Lesson.default_priority(),
         &mut write_state,
@@ -456,7 +530,7 @@ pub(crate) fn persist_failure_lesson(
                     ("memory_id", json!(record.id)),
                     (
                         "content_preview",
-                        json!(summarize_for_markdown(&content, 120)),
+                        json!(summarize_for_markdown(content, 120)),
                     ),
                 ],
             );
@@ -1022,6 +1096,14 @@ impl AgentCore {
                     FailureAction::AskUser,
                 );
                 trace.controller_state.record_ask_user();
+                // 升级人工收场：沉淀一条 Lesson 记忆（best-effort，不影响主链路成败）
+                // 原因 = replan 预算耗尽 + 最后一次失败详情，保证 lesson 语义可读
+                let escalate_reason = format!("replan 预算耗尽，最后失败: {}", failure.detail);
+                persist_ask_user_lesson(
+                    self.task_store_db_path.as_deref(),
+                    trace.user_id.as_deref(),
+                    &escalate_reason,
+                );
                 Ok(LoopControl::Finish(
                     exhausted
                         .user_message
@@ -1037,6 +1119,12 @@ impl AgentCore {
                     effective_action,
                 );
                 trace.controller_state.record_ask_user();
+                // 升级人工收场：沉淀一条 Lesson 记忆（best-effort，不影响主链路成败）
+                persist_ask_user_lesson(
+                    self.task_store_db_path.as_deref(),
+                    trace.user_id.as_deref(),
+                    &failure.detail,
+                );
                 Ok(LoopControl::Finish(
                     failure
                         .user_message

@@ -11,13 +11,13 @@
 | `explicit` | 用户明确要求系统记住的内容 | 100 | "记住 ..." / "记一下 ..." |
 | `project_fact` | 项目级事实（模块职责、在做主题、约束、边界） | 85 | 匹配主题/在做前缀的聊天文本（自动提炼归位） |
 | `user_preference` | 用户偏好（回复风格、输出形式、工作方式） | 80 | 匹配偏好前缀的聊天文本（自动提炼归位） |
-| `lesson` | 经验教训（失败模式、有效处理方式） | 75 | agent run 失败收场时自动沉淀 |
+| `lesson` | 经验教训（失败模式、有效处理方式） | 75 | agent run 失败收场或升级人工（ask_user）收场时自动沉淀；环境性失败（鉴权/传输）过滤不沉淀 |
 | `auto` | 系统自动提炼的未归位内容（兜底类型） | 60 | 历史数据与未归位候选 |
 
 - 显式记忆优先级始终高于自动记忆；完整优先级链：explicit > project_fact > user_preference > lesson > auto。
 - 自动提炼内容保留文本前缀标记：`偏好: ...` 或 `主题: ...`，保证与历史 auto 记忆的 dedup/promote 连续性（同一内容再出现时会 promote 既有 auto 记录，而非重复写入）。
 - prompt 渲染时由类型标签（`[偏好]` / `[项目]`）承担语义标注，与文本前缀重复时去掉文本前缀，不做双重标注；DB 中内容保持不变。
-- lesson 内容由 agent_core 在 run 失败时以 `失败教训: <原因摘要>` 形式写入，走统一 `govern_memory_write` 治理；写入失败只记日志，不影响主链路。
+- lesson 内容由 agent_core 在 run 失败时以 `失败教训: <原因摘要>`、升级人工（ask_user）收场时以 `升级人工: <原因摘要>` 形式写入，走统一 `govern_memory_write` 治理；命中环境性失败特征（鉴权/传输）时不沉淀；写入失败只记日志，不影响主链路。
 
 ## 2. 统计阶段
 
@@ -102,6 +102,7 @@ ORDER BY priority DESC,
 | chat_adapter 日志 | `user_memory_explicit_skipped` | 显式记忆写入跳过 |
 | chat_adapter 日志 | `user_memory_explicit_promoted` | 显式记忆提升已有 auto |
 | agent_core 结构化日志 | `memory_lesson_recorded` | 失败收场时 lesson 记忆写入成功 |
+| agent_core 结构化日志 | `memory_lesson_env_filtered` | 环境性失败（鉴权/传输）被过滤、不沉淀 lesson（含 category 字段） |
 | agent_core 结构化日志 | `memory_lesson_skipped` | lesson 写入被治理跳过（含 skip_reason） |
 | agent_core 结构化日志 | `memory_lesson_promoted` | lesson 提升已有低优先级记忆 |
 | agent_core 结构化日志 | `memory_lesson_persist_failed` | lesson 写入链路自身失败（只记日志，不影响主链路） |

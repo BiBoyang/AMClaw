@@ -1,6 +1,8 @@
 use super::super::{
-    load_business_context_snapshot, persist_failure_lesson, project_session_state_to_trace,
-    AgentRunContext, AgentRunTrace, DropReason, MemoryBudget, SessionState,
+    classify_env_failure, load_business_context_snapshot, persist_ask_user_lesson,
+    persist_failure_lesson, project_session_state_to_trace, AgentCore, AgentRunContext,
+    AgentRunTrace, DropReason, FailureAction, FailureDecision, LoopControl, MemoryBudget,
+    SessionState, StepFailureKind,
 };
 use super::{temp_db_path, temp_workspace};
 use crate::retriever::rule::RuleRetriever;
@@ -487,7 +489,7 @@ fn failure_lesson_is_persisted_as_lesson_memory() {
     persist_failure_lesson(
         Some(db_path.as_path()),
         Some("user-fail"),
-        "工具执行失败: io timeout",
+        "工具执行失败: 文件读取失败",
     );
 
     let store = TaskStore::open(&db_path).expect("打开 task store 失败");
@@ -498,7 +500,7 @@ fn failure_lesson_is_persisted_as_lesson_memory() {
     assert_eq!(memories[0].memory_type, MemoryType::Lesson);
     assert_eq!(memories[0].priority, 75);
     assert!(memories[0].content.starts_with("失败教训: "));
-    assert!(memories[0].content.contains("io timeout"));
+    assert!(memories[0].content.contains("文件读取失败"));
 }
 
 /// Phase 4：相同失败原因重复沉淀时应被 dedup，不产生第二条记忆。
@@ -540,6 +542,161 @@ fn failure_lesson_skips_when_context_missing() {
         .list_user_memories("user-fail", 10)
         .expect("查询 user_memory 失败");
     assert!(memories.is_empty(), "上下文缺失时不应写入任何记忆");
+}
+
+/// Phase 4：环境性失败分类应对齐 failure taxonomy 的 L1 口径。
+#[test]
+fn env_failure_classification_matches_taxonomy_l1() {
+    // 鉴权类（小写匹配）
+    assert_eq!(
+        classify_env_failure("LLM 调用失败: HTTP 401 Authentication Fails"),
+        Some("llm_auth_error")
+    );
+    assert_eq!(
+        classify_env_failure("request failed: Unauthorized"),
+        Some("llm_auth_error")
+    );
+    assert_eq!(
+        classify_env_failure("error: invalid API key"),
+        Some("llm_auth_error")
+    );
+    // 传输类
+    assert_eq!(
+        classify_env_failure("模型请求失败: connection timeout"),
+        Some("llm_transport_error")
+    );
+    assert_eq!(
+        classify_env_failure("error sending request for url"),
+        Some("llm_transport_error")
+    );
+    assert_eq!(
+        classify_env_failure("dns error: failed to lookup address"),
+        Some("llm_transport_error")
+    );
+    // auth 优先于 transport（taxonomy 固定映射顺序）
+    assert_eq!(
+        classify_env_failure("HTTP 401 after connection retry"),
+        Some("llm_auth_error")
+    );
+    // 普通任务错误不命中
+    assert_eq!(classify_env_failure("工具执行失败: 文件读取失败"), None);
+    assert_eq!(classify_env_failure("达到最大步骤，未能收敛"), None);
+}
+
+/// Phase 4：鉴权类环境失败不应沉淀 lesson（记 memory_lesson_env_filtered 日志）。
+#[test]
+fn auth_failure_lesson_is_filtered() {
+    let db_path = temp_db_path();
+    persist_failure_lesson(
+        Some(db_path.as_path()),
+        Some("user-env"),
+        "LLM 调用失败: HTTP 401 Authentication Fails: invalid api key",
+    );
+
+    let store = TaskStore::open(&db_path).expect("打开 task store 失败");
+    let memories = store
+        .list_user_memories("user-env", 10)
+        .expect("查询 user_memory 失败");
+    assert!(memories.is_empty(), "鉴权类环境失败不应沉淀 lesson");
+}
+
+/// Phase 4：传输类环境失败不应沉淀 lesson（记 memory_lesson_env_filtered 日志）。
+#[test]
+fn transport_failure_lesson_is_filtered() {
+    let db_path = temp_db_path();
+    persist_failure_lesson(
+        Some(db_path.as_path()),
+        Some("user-env"),
+        "模型请求失败: connection timeout",
+    );
+
+    let store = TaskStore::open(&db_path).expect("打开 task store 失败");
+    let memories = store
+        .list_user_memories("user-env", 10)
+        .expect("查询 user_memory 失败");
+    assert!(memories.is_empty(), "传输类环境失败不应沉淀 lesson");
+}
+
+/// Phase 4：AskUser 升级收场应沉淀一条"升级人工" Lesson 记忆。
+#[test]
+fn ask_user_escalation_persists_lesson() {
+    let db_path = temp_db_path();
+    let workspace = temp_workspace();
+    let agent = AgentCore::with_max_steps_and_task_store_db_path(
+        workspace.clone(),
+        3,
+        Some(db_path.clone()),
+    )
+    .expect("初始化 agent 失败");
+    let mut trace = AgentRunTrace::new(
+        &workspace,
+        "ask user",
+        AgentRunContext::wechat_chat("user-ask", "commit", vec![]),
+    );
+
+    let control = agent
+        .handle_recorded_failure(
+            1,
+            FailureDecision {
+                kind: StepFailureKind::ManualIntervention,
+                action: FailureAction::AskUser,
+                replan_scope: None,
+                detail: "缺少任务编号，无法继续".to_string(),
+                source: "test".to_string(),
+                user_message: Some("请补充 task_id".to_string()),
+            },
+            &mut trace,
+        )
+        .expect("ask_user 应直接返回");
+    assert!(matches!(control, LoopControl::Finish(_)));
+
+    let store = TaskStore::open(&db_path).expect("打开 task store 失败");
+    let memories = store
+        .list_user_memories("user-ask", 10)
+        .expect("查询 user_memory 失败");
+    assert_eq!(memories.len(), 1);
+    assert_eq!(memories[0].memory_type, MemoryType::Lesson);
+    assert!(memories[0].content.starts_with("升级人工: "));
+    assert!(memories[0].content.contains("缺少任务编号"));
+}
+
+/// Phase 4：重复升级人工应被 dedup，不产生第二条记忆。
+#[test]
+fn ask_user_escalation_dedups_repeated() {
+    let db_path = temp_db_path();
+    persist_ask_user_lesson(
+        Some(db_path.as_path()),
+        Some("user-ask"),
+        "缺少任务编号，无法继续",
+    );
+    persist_ask_user_lesson(
+        Some(db_path.as_path()),
+        Some("user-ask"),
+        "缺少任务编号，无法继续",
+    );
+
+    let store = TaskStore::open(&db_path).expect("打开 task store 失败");
+    let memories = store
+        .list_user_memories("user-ask", 10)
+        .expect("查询 user_memory 失败");
+    assert_eq!(memories.len(), 1, "重复升级人工应被去重");
+}
+
+/// Phase 4：鉴权失败导致的 ask_user 升级不应沉淀 lesson（环境过滤同样生效）。
+#[test]
+fn ask_user_escalation_filters_env_auth() {
+    let db_path = temp_db_path();
+    persist_ask_user_lesson(
+        Some(db_path.as_path()),
+        Some("user-ask"),
+        "LLM 调用失败: HTTP 401 Authentication Fails",
+    );
+
+    let store = TaskStore::open(&db_path).expect("打开 task store 失败");
+    let memories = store
+        .list_user_memories("user-ask", 10)
+        .expect("查询 user_memory 失败");
+    assert!(memories.is_empty(), "鉴权失败导致的升级不应沉淀 lesson");
 }
 
 /// project_session_state_to_trace 应把 dropped 明细（id/preview/reason）投影进 trace。

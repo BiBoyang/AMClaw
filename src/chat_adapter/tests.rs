@@ -1559,3 +1559,106 @@ fn runtime_session_state_merge_returns_false_when_equivalent() {
     assert_eq!(persistent.open_questions(), vec!["还缺什么"]);
     assert_eq!(persistent.updated_at, "2026-04-01T00:00:00Z");
 }
+
+/// Phase 4：偏好类聊天文本应归位为 user_preference（而非 auto）。
+#[test]
+fn auto_memory_preference_text_typed_as_user_preference() {
+    let db_path = temp_db_path();
+    let mut bot = test_bot(&db_path);
+
+    bot.handle_message(WireMessage {
+        from_user_id: "user-a".to_string(),
+        text: "我喜欢短回复".to_string(),
+        message_id: Some(super::types::FlexibleId::Str(
+            "msg-typed-pref-1".to_string(),
+        )),
+        message_type: Some(1),
+        ..WireMessage::default()
+    });
+
+    let memories = bot
+        .task_store
+        .list_user_memories("user-a", 10)
+        .expect("查询 user_memory 失败");
+    assert_eq!(memories.len(), 1);
+    assert_eq!(memories[0].content, "偏好: 短回复");
+    assert_eq!(
+        memories[0].memory_type,
+        crate::task_store::MemoryType::UserPreference
+    );
+    assert_eq!(memories[0].priority, 80);
+}
+
+/// Phase 4：主题/在做类聊天文本应归位为 project_fact（而非 auto）。
+#[test]
+fn auto_memory_topic_text_typed_as_project_fact() {
+    let db_path = temp_db_path();
+    let mut bot = test_bot(&db_path);
+
+    bot.handle_message(WireMessage {
+        from_user_id: "user-a".to_string(),
+        text: "我在做 Rust Agent".to_string(),
+        message_id: Some(super::types::FlexibleId::Str(
+            "msg-typed-topic-1".to_string(),
+        )),
+        message_type: Some(1),
+        ..WireMessage::default()
+    });
+
+    let memories = bot
+        .task_store
+        .list_user_memories("user-a", 10)
+        .expect("查询 user_memory 失败");
+    assert_eq!(memories.len(), 1);
+    assert_eq!(memories[0].content, "主题: Rust Agent");
+    assert_eq!(
+        memories[0].memory_type,
+        crate::task_store::MemoryType::ProjectFact
+    );
+    assert_eq!(memories[0].priority, 85);
+}
+
+/// Phase 4：归位后的候选与历史 auto 记忆内容相同（含 `偏好: ` 前缀）时，
+/// 应走 promote 提升既有记录，而不是重复写入。
+#[test]
+fn auto_memory_retyped_candidate_promotes_legacy_auto() {
+    let db_path = temp_db_path();
+    let mut bot = test_bot(&db_path);
+
+    // 历史形态：Phase 4 之前写入的 auto 记忆
+    let mut ws = crate::task_store::MemoryWriteState::default();
+    let decision = bot.task_store.govern_memory_write(
+        "user-a",
+        "偏好: 简洁回复",
+        crate::task_store::MemoryType::Auto,
+        60,
+        &mut ws,
+    );
+    let original_id = match decision {
+        crate::task_store::WriteDecision::Written(r) => r.id,
+        other => panic!("应写入 legacy auto memory: {:?}", other),
+    };
+
+    // 同一偏好再次从聊天进入，归位为 user_preference，应 promote 既有 auto
+    bot.handle_message(WireMessage {
+        from_user_id: "user-a".to_string(),
+        text: "我喜欢简洁回复".to_string(),
+        message_id: Some(super::types::FlexibleId::Str(
+            "msg-typed-promote-1".to_string(),
+        )),
+        message_type: Some(1),
+        ..WireMessage::default()
+    });
+
+    let memories = bot
+        .task_store
+        .list_user_memories("user-a", 10)
+        .expect("查询 user_memory 失败");
+    assert_eq!(memories.len(), 1, "promote 不应产生第二条记忆");
+    assert_eq!(memories[0].id, original_id);
+    assert_eq!(
+        memories[0].memory_type,
+        crate::task_store::MemoryType::UserPreference
+    );
+    assert_eq!(memories[0].priority, 80);
+}

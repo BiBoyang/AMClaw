@@ -20,6 +20,12 @@
 
 结论：v0.3.2 "Context & Memory Minimal" 已收口；v0.3.3 结构性能力（session state / context pack / gate 策略）已落地。
 
+## 本阶段收口（截至 2026-08-26）
+
+- Phase 1 代码侧确认已落地：auto/explicit 写入分离、retrieved/injected 统计拆分、`use_count` 语义固定（= 被确认 useful 次数）；语义字典已补全五类型定义与新日志事件口径
+- Phase 4 写入入口已落地：偏好/主题类自动提炼归位为 `user_preference` / `project_fact`；agent run 失败收场自动沉淀 `lesson`；prompt 渲染侧去双重标注
+- S23-4：`agent_core` 的 retriever_selection / rollout 测试已拆到 `src/agent_core/tests/retriever_selection.rs`（13 个测试，纯移动）
+
 ## v0.3.2 DoD 逐项确认
 
 1. ✅ 显式记忆可命中：`记住 我喜欢短摘要` 后，下一轮问答可体现偏好
@@ -36,9 +42,9 @@
 
 ### 方向
 
-1. 收口现有 memory 语义与观测（Phase 1 剩余）
-2. 扩少量高价值长期 memory（Phase 4，当前最优先）
-3. 用 trace 驱动评测闭环稳定化（Phase 5 剩余）
+1. ~~收口现有 memory 语义与观测（Phase 1 剩余）~~ ✅ 代码侧已完成（2026-08-26）
+2. ~~扩少量高价值长期 memory（Phase 4）~~ ✅ 写入入口已落地（2026-08-26）
+3. 用 trace 驱动评测闭环稳定化（Phase 5 剩余，**当前最优先**）
 4. 把 `state/controller` 从 budget 扩到更完整的策略控制
 
 统一路线文档：
@@ -47,14 +53,12 @@
 
 ## v0.3.3 推荐执行顺序
 
-### Phase 1：收口 `Memory v3` 语义
+### Phase 1：收口 `Memory v3` 语义 ✅（代码侧 2026-08-26 确认完成）
 
-优先要做：
-
-1. 统一自动记忆与显式记忆的写入语义
-2. 区分 `retrieved_memory_count` / `injected_memory_count`
-3. 明确 `use_count` 的真实含义
-4. 保持日志、trace、文档三者口径一致
+- [x] 统一自动记忆与显式记忆的写入语义（`handle_user_memory_write` → Explicit / `maybe_persist_auto_memory` → 归位类型，见 `src/chat_adapter/command_handlers.rs`）
+- [x] 区分 `retrieved_memory_count` / `injected_memory_count`（`memory_retrieved_count` / `memory_hit_count` 已入 trace 与日志）
+- [x] 明确 `use_count` 的真实含义（= 被确认 useful 次数，见语义字典 §3）
+- [x] 日志、trace、文档三者口径一致（语义字典已于 2026-08-26 补全五类型与新事件）
 
 ### Phase 2：补显式 `SessionState` ✅
 
@@ -70,13 +74,15 @@
 - [x] trace 保留结构化 pack（`context_pack_present` / `context_pack_section_count` 等）与最终渲染 prompt
 - [x] section budget 与 trim/drop reason 已可观测
 
-### Phase 4：扩长期 Memory 类型
+### Phase 4：扩长期 Memory 类型 ✅（2026-08-26）
 
-只优先考虑三类：
+三类均已落地（枚举 / 优先级链 / 写入入口 / prompt 标签）：
 
-1. `user_preference`
-2. `project_fact`
-3. `lesson`
+1. `user_preference`：偏好类自动提炼归位（"我喜欢/我偏好"等触发词）
+2. `project_fact`：主题/在做类自动提炼归位（"我关注/我在做"等触发词）
+3. `lesson`：agent run 失败收场时自动沉淀（`persist_failure_lesson`，best-effort）
+
+遗留可选项：EscalatedToAskUser 收场目前不沉淀 lesson；环境性失败（如 LLM 鉴权失败）也会沉淀 lesson，如觉噪声可加过滤。
 
 ### Phase 5：建立 Trace 驱动评测闭环（部分完成）
 
@@ -86,6 +92,8 @@
 - [x] Gate 策略文档与 `GATE_MODE` 切换机制已落地（S19）
 - [ ] 从真实 trace 中抽样并标注失败类型（`forgot_known_fact` / `missed_retrieval` / `wrong_retrieval` / `state_drift` / `repeated_work`）
 - [ ] 比较机制变更前后差异（需 baseline 完备后启动）
+
+> 2026-08-26 现状：真实 trace 样本仅约 5 条（baseline 20 条中 16 条为合成），离路线图要求的 20~50 条真实 run 差距大。当前最优先动作是让 bot 真实跑起来积累样本；标注 schema 与 trace_eval 聚合维度待样本量到位后再做。
 
 ## 当前明确不优先做
 

@@ -1,5 +1,6 @@
 use super::super::{
-    load_business_context_snapshot, AgentRunContext, AgentRunTrace, DropReason, MemoryBudget,
+    load_business_context_snapshot, persist_failure_lesson, AgentRunContext, AgentRunTrace,
+    DropReason, MemoryBudget,
 };
 use super::{temp_db_path, temp_workspace};
 use crate::retriever::rule::RuleRetriever;
@@ -477,4 +478,66 @@ fn trace_contains_typed_memory_observability_fields() {
     assert!(rendered.contains("memory_hit_count"));
     assert!(rendered.contains("memory_retrieved_count"));
     assert!(rendered.contains("memory_dropped_count"));
+}
+
+/// Phase 4：agent run 失败收场时应沉淀一条 Lesson 记忆。
+#[test]
+fn failure_lesson_is_persisted_as_lesson_memory() {
+    let db_path = temp_db_path();
+    persist_failure_lesson(
+        Some(db_path.as_path()),
+        Some("user-fail"),
+        "工具执行失败: io timeout",
+    );
+
+    let store = TaskStore::open(&db_path).expect("打开 task store 失败");
+    let memories = store
+        .list_user_memories("user-fail", 10)
+        .expect("查询 user_memory 失败");
+    assert_eq!(memories.len(), 1);
+    assert_eq!(memories[0].memory_type, MemoryType::Lesson);
+    assert_eq!(memories[0].priority, 75);
+    assert!(memories[0].content.starts_with("失败教训: "));
+    assert!(memories[0].content.contains("io timeout"));
+}
+
+/// Phase 4：相同失败原因重复沉淀时应被 dedup，不产生第二条记忆。
+#[test]
+fn failure_lesson_dedups_repeated_failure() {
+    let db_path = temp_db_path();
+    persist_failure_lesson(
+        Some(db_path.as_path()),
+        Some("user-fail"),
+        "达到最大步骤，未能收敛",
+    );
+    persist_failure_lesson(
+        Some(db_path.as_path()),
+        Some("user-fail"),
+        "达到最大步骤，未能收敛",
+    );
+
+    let store = TaskStore::open(&db_path).expect("打开 task store 失败");
+    let memories = store
+        .list_user_memories("user-fail", 10)
+        .expect("查询 user_memory 失败");
+    assert_eq!(memories.len(), 1, "重复失败教训应被去重");
+}
+
+/// Phase 4：缺少 db_path / user_id 或错误内容为空时应静默跳过，不 panic、不落库。
+#[test]
+fn failure_lesson_skips_when_context_missing() {
+    let db_path = temp_db_path();
+    // 无 db_path
+    persist_failure_lesson(None, Some("user-fail"), "some error");
+    // 无 user_id
+    persist_failure_lesson(Some(db_path.as_path()), None, "some error");
+    // 空 user_id / 空错误内容
+    persist_failure_lesson(Some(db_path.as_path()), Some("  "), "some error");
+    persist_failure_lesson(Some(db_path.as_path()), Some("user-fail"), "   ");
+
+    let store = TaskStore::open(&db_path).expect("打开 task store 失败");
+    let memories = store
+        .list_user_memories("user-fail", 10)
+        .expect("查询 user_memory 失败");
+    assert!(memories.is_empty(), "上下文缺失时不应写入任何记忆");
 }

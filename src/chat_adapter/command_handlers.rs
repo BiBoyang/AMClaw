@@ -404,15 +404,15 @@ impl super::WeChatBot {
             | command_router::RouteIntent::ChatPending { text } => text.as_str(),
             _ => return,
         };
-        let Some(memory) = extract_auto_memory_candidate(text) else {
+        let Some((memory, memory_type)) = extract_auto_memory_candidate(text) else {
             return;
         };
         let mut write_state = crate::task_store::MemoryWriteState::default();
         let decision = self.task_store.govern_memory_write(
             user_id,
             &memory,
-            crate::task_store::MemoryType::Auto,
-            60,
+            memory_type,
+            memory_type.default_priority(),
             &mut write_state,
         );
         match &decision {
@@ -421,6 +421,7 @@ impl super::WeChatBot {
                     "user_memory_auto_recorded",
                     vec![
                         ("user_id", json!(user_id)),
+                        ("memory_type", json!(memory_type.as_str())),
                         (
                             "memory_preview",
                             json!(summarize_text_for_log(&memory, 120)),
@@ -433,12 +434,22 @@ impl super::WeChatBot {
                     "user_memory_auto_skipped",
                     vec![
                         ("user_id", json!(user_id)),
+                        ("memory_type", json!(memory_type.as_str())),
                         ("skip_reason", json!(reason.to_string())),
                     ],
                 );
             }
-            crate::task_store::WriteDecision::Promoted { .. } => {
-                // auto 不会 promote（只有 explicit 能 promote auto）
+            crate::task_store::WriteDecision::Promoted { id, reason } => {
+                // 归位后的类型（user_preference/project_fact）可 promote 历史 auto 记忆
+                log_chat_info(
+                    "user_memory_auto_promoted",
+                    vec![
+                        ("user_id", json!(user_id)),
+                        ("memory_id", json!(id)),
+                        ("memory_type", json!(memory_type.as_str())),
+                        ("promote_reason", json!(reason.to_string())),
+                    ],
+                );
             }
         }
     }
@@ -602,7 +613,15 @@ impl super::WeChatBot {
     }
 }
 
-fn extract_auto_memory_candidate(input: &str) -> Option<String> {
+/// 从聊天文本提炼记忆候选，返回 (内容, 归位后的记忆类型)。
+///
+/// 类型归位（Phase 4）：
+/// - 偏好类触发词 → `MemoryType::UserPreference`
+/// - 主题/在做类触发词 → `MemoryType::ProjectFact`
+///
+/// 内容保留 `偏好: ` / `主题: ` 文本前缀以保证与历史 auto 记忆的 dedup/promote 连续性；
+/// prompt 渲染侧会去掉与类型标签重复的文本前缀，避免双重标注。
+fn extract_auto_memory_candidate(input: &str) -> Option<(String, crate::task_store::MemoryType)> {
     let text = input.trim();
     if text.is_empty() {
         return None;
@@ -612,7 +631,10 @@ fn extract_auto_memory_candidate(input: &str) -> Option<String> {
         if let Some(rest) = text.strip_prefix(prefix) {
             let value = rest.trim();
             if !value.is_empty() {
-                return Some(format!("偏好: {value}"));
+                return Some((
+                    format!("偏好: {value}"),
+                    crate::task_store::MemoryType::UserPreference,
+                ));
             }
         }
     }
@@ -630,7 +652,10 @@ fn extract_auto_memory_candidate(input: &str) -> Option<String> {
         if let Some(rest) = text.strip_prefix(prefix) {
             let value = rest.trim();
             if !value.is_empty() {
-                return Some(format!("主题: {value}"));
+                return Some((
+                    format!("主题: {value}"),
+                    crate::task_store::MemoryType::ProjectFact,
+                ));
             }
         }
     }

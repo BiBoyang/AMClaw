@@ -1326,7 +1326,10 @@ impl ContextAssembler {
                         "- {} (priority={}) {}",
                         memory.memory_type.label_prefix(),
                         memory.priority,
-                        sanitize_for_prompt(&memory.content)
+                        sanitize_for_prompt(strip_redundant_type_prefix(
+                            memory.memory_type,
+                            &memory.content
+                        ))
                     ));
                 }
                 pack.push(ContextSection::new(
@@ -1356,8 +1359,19 @@ impl ContextAssembler {
     }
 }
 
+/// 避免 prompt 双重标注：typed memory 的内容若仍带提炼期文本前缀
+/// （`偏好: ` / `主题: `），渲染时去掉文本前缀，由类型的 label_prefix 承担语义标注。
+/// 内容本身在 DB 中保持不变，保证与历史 auto 记忆的 dedup/promote 连续性。
+fn strip_redundant_type_prefix(memory_type: MemoryType, content: &str) -> &str {
+    let prefix = match memory_type {
+        MemoryType::UserPreference => "偏好: ",
+        MemoryType::ProjectFact => "主题: ",
+        _ => return content,
+    };
+    content.strip_prefix(prefix).unwrap_or(content)
+}
+
 /// Build a ContextPack from runtime state (public entry point).
-///
 /// This is the single-entry API for constructing structured context packs.
 /// All prompt assembly should go through this path.
 #[allow(clippy::too_many_arguments)]

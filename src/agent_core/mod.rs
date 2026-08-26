@@ -1,7 +1,10 @@
 use crate::config::AgentConfig;
 use crate::context_pack::*;
 use crate::retriever::Retriever;
-use crate::task_store::UserSessionStateRecord;
+use crate::session_summary::summarize_for_markdown;
+use crate::task_store::{
+    MemoryType, MemoryWriteState, TaskStore, UserSessionStateRecord, WriteDecision,
+};
 use crate::tool_registry::{ToolAction, ToolRegistry};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
@@ -404,6 +407,80 @@ enum LoopControl {
     Finish(String),
 }
 
+/// 失败收场时沉淀一条 `Lesson` 类型长期记忆（Phase 4）。
+///
+/// - 内容 = 失败原因的简短文本，走 `govern_memory_write` 享受 validate/dedup/promote 治理。
+/// - best-effort：缺少 db_path/user_id、内容为空、或写入失败时只记日志，绝不影响主链路成败。
+pub(crate) fn persist_failure_lesson(
+    db_path: Option<&Path>,
+    user_id: Option<&str>,
+    error_detail: &str,
+) {
+    let (Some(db_path), Some(user_id)) = (db_path, user_id) else {
+        return;
+    };
+    if user_id.trim().is_empty() || error_detail.trim().is_empty() {
+        return;
+    }
+    let content = format!("失败教训: {}", summarize_for_markdown(error_detail, 200));
+    let mut store = match TaskStore::open(db_path) {
+        Ok(store) => store,
+        Err(err) => {
+            log_agent_warn(
+                "memory_lesson_persist_failed",
+                vec![
+                    ("user_id", json!(user_id)),
+                    ("error_kind", json!("task_store_open_failed")),
+                    ("detail", json!(err.to_string())),
+                ],
+            );
+            return;
+        }
+    };
+    let mut write_state = MemoryWriteState::default();
+    let decision = store.govern_memory_write(
+        user_id,
+        &content,
+        MemoryType::Lesson,
+        MemoryType::Lesson.default_priority(),
+        &mut write_state,
+    );
+    match &decision {
+        WriteDecision::Written(record) => {
+            log_agent_info(
+                "memory_lesson_recorded",
+                vec![
+                    ("user_id", json!(user_id)),
+                    ("memory_id", json!(record.id)),
+                    (
+                        "content_preview",
+                        json!(summarize_for_markdown(&content, 120)),
+                    ),
+                ],
+            );
+        }
+        WriteDecision::Skipped { reason, .. } => {
+            log_agent_info(
+                "memory_lesson_skipped",
+                vec![
+                    ("user_id", json!(user_id)),
+                    ("skip_reason", json!(reason.to_string())),
+                ],
+            );
+        }
+        WriteDecision::Promoted { id, reason } => {
+            log_agent_info(
+                "memory_lesson_promoted",
+                vec![
+                    ("user_id", json!(user_id)),
+                    ("memory_id", json!(id)),
+                    ("promote_reason", json!(reason.to_string())),
+                ],
+            );
+        }
+    }
+}
+
 impl AgentCore {
     #[allow(dead_code)]
     pub fn new(workspace_root: impl Into<PathBuf>) -> Result<Self> {
@@ -606,7 +683,15 @@ impl AgentCore {
 
         match &result {
             Ok(answer) => trace.finish_success(answer, started.elapsed()),
-            Err(err) => trace.finish_error(&err.to_string(), started.elapsed()),
+            Err(err) => {
+                trace.finish_error(&err.to_string(), started.elapsed());
+                // 失败收场：沉淀一条 Lesson 记忆（best-effort，不影响主链路成败）
+                persist_failure_lesson(
+                    self.task_store_db_path.as_deref(),
+                    trace.user_id.as_deref(),
+                    &err.to_string(),
+                );
+            }
         }
 
         let trace_json_path = match trace.persist() {

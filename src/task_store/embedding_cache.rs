@@ -9,6 +9,10 @@ impl super::TaskStore {
     // -------------------------------------------------------------------------
 
     /// 计算文本的稳定哈希（用于缓存 key）。
+    ///
+    /// 风险标注：DefaultHasher（SipHash）的输出不保证跨 Rust 版本稳定，
+    /// 升级工具链后旧缓存 key 会静默失效（仅表现为缓存 miss 后重新计算，不影响正确性）。
+    /// 当前为不引入新依赖（sha2/xxhash 等）而保留现状；如需长期稳定的缓存 key 再切换。
     fn text_hash(text: &str) -> String {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -166,6 +170,7 @@ impl super::TaskStore {
     }
 
     /// 清除 embedding_cache 中指定模型的全部条目（用于模型切换时手动清理）。
+    #[cfg(test)]
     pub fn clear_embedding_cache(&self, model_name: &str) -> Result<usize> {
         let count = self
             .conn
@@ -185,6 +190,7 @@ impl super::TaskStore {
     }
 
     /// 获取 embedding_cache 的统计信息：(总条目数, 唯一模型数)。
+    #[cfg(test)]
     pub fn embedding_cache_stats(&self) -> Result<(usize, usize)> {
         let total: i64 = self
             .conn

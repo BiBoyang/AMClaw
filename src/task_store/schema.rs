@@ -49,6 +49,7 @@ impl super::TaskStore {
                 FOREIGN KEY (message_id) REFERENCES message_dedup(message_id)
             );
 
+            -- 已废弃：全仓无任何读写代码，保留仅为兼容旧库（避免迁移风险）
             CREATE TABLE IF NOT EXISTS daily_reports (
                 date        TEXT PRIMARY KEY,
                 report_path TEXT NOT NULL,
@@ -201,23 +202,6 @@ impl super::TaskStore {
             "open_questions_json",
             "TEXT",
         )?;
-        // v3 outbound_pending_chunks 表创建（兼容旧库）
-        self.conn
-            .execute(
-                r#"
-                CREATE TABLE IF NOT EXISTS outbound_pending_chunks (
-                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id       TEXT NOT NULL,
-                    context_token TEXT NOT NULL,
-                    chunk_text    TEXT NOT NULL,
-                    chunk_index   INTEGER NOT NULL,
-                    chunk_total   INTEGER NOT NULL,
-                    created_at    DATETIME NOT NULL
-                )
-                "#,
-                [],
-            )
-            .context("创建 outbound_pending_chunks 表失败")?;
         Ok(())
     }
 }

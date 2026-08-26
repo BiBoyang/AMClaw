@@ -252,6 +252,7 @@ impl super::TaskStore {
     }
 
     /// 清空用户会话结构化状态
+    #[cfg(test)]
     pub fn clear_user_session_state(&mut self, user_id: &str) -> Result<()> {
         self.conn
             .execute(

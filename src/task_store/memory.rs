@@ -263,12 +263,19 @@ impl super::TaskStore {
                 write_state.record(decision.clone());
                 decision
             }
-            Err(_) => {
+            Err(err) => {
                 let decision = WriteDecision::Skipped {
                     content_preview,
                     reason: SkipReason::StorageError,
                 };
                 write_state.record(decision.clone());
+                super::log_task_store_warn(
+                    "memory_write_failed",
+                    vec![
+                        ("error_kind", json!("storage_write_failed")),
+                        ("detail", json!(err.to_string())),
+                    ],
+                );
                 decision
             }
         }

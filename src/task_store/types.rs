@@ -2,7 +2,6 @@ use thiserror::Error;
 
 /// task_store 模块的错误类型
 #[derive(Debug, Error)]
-#[allow(dead_code)]
 pub enum TaskStoreError {
     #[error("无效 URL: {0}")]
     InvalidUrl(String),
@@ -12,8 +11,6 @@ pub enum TaskStoreError {
     UnsupportedScheme(String),
     #[error("{0}")]
     Validation(String),
-    #[error("数据库错误: {0}")]
-    Database(#[from] rusqlite::Error),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

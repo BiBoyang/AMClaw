@@ -20,8 +20,6 @@ pub use self::types::{
     TaskStatusRecord, TaskStoreError, UserMemoryRecord, UserSessionStateRecord, WriteDecision,
 };
 
-/// 最大单条内容长度（写入时校验）
-
 #[derive(Debug)]
 pub struct TaskStore {
     conn: Connection,

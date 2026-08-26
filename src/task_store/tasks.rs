@@ -4,9 +4,11 @@ use rusqlite::{params, OptionalExtension};
 use serde_json::json;
 use uuid::Uuid;
 
+#[cfg(test)]
+use super::PendingTaskRecord;
 use super::{
     ArchivedTaskRecord, ClaimableTaskRecord, LinkTaskRecord, MarkTaskArchivedInput,
-    PendingTaskRecord, RecentTaskRecord, TaskContentRecord, TaskStatusRecord,
+    RecentTaskRecord, TaskContentRecord, TaskStatusRecord,
 };
 
 impl super::TaskStore {
@@ -233,6 +235,7 @@ impl super::TaskStore {
         Ok(tasks)
     }
 
+    #[cfg(test)]
     pub fn list_archived_tasks(&self, limit: usize) -> Result<Vec<ArchivedTaskRecord>> {
         let limit = i64::try_from(limit).context("archived task limit 超出范围")?;
         let mut stmt = self
@@ -409,6 +412,7 @@ impl super::TaskStore {
         Ok(Some(task))
     }
 
+    #[cfg(test)]
     pub fn list_pending_tasks(&self, limit: usize) -> Result<Vec<PendingTaskRecord>> {
         let limit = i64::try_from(limit).context("pending task limit 超出范围")?;
         let mut stmt = self
@@ -440,29 +444,6 @@ impl super::TaskStore {
             tasks.push(row.context("读取 pending 任务记录失败")?);
         }
         Ok(tasks)
-    }
-
-    pub fn get_pending_task(&self, task_id: &str) -> Result<Option<PendingTaskRecord>> {
-        self.conn
-            .query_row(
-                r#"
-                SELECT t.id, t.article_id, a.normalized_url, a.original_url
-                FROM tasks t
-                JOIN articles a ON a.id = t.article_id
-                WHERE t.id = ?1 AND t.status = 'pending'
-                "#,
-                [task_id],
-                |row| {
-                    Ok(PendingTaskRecord {
-                        task_id: row.get(0)?,
-                        article_id: row.get(1)?,
-                        normalized_url: row.get(2)?,
-                        original_url: row.get(3)?,
-                    })
-                },
-            )
-            .optional()
-            .context("查询指定 pending 任务失败")
     }
 
     /// 按 task_id 查询任意状态的任务（返回基础字段）。

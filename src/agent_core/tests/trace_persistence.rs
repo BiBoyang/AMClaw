@@ -1,4 +1,6 @@
-use super::super::{AgentCore, AgentRunContext, AgentRunTrace, AgentTraceIndexEntry};
+use super::super::{
+    AgentCore, AgentRunContext, AgentRunTrace, AgentTraceIndexEntry, DroppedMemoryItem,
+};
 use super::temp_workspace;
 use serde_json::Value;
 use std::fs::OpenOptions;
@@ -263,4 +265,105 @@ fn write_daily_index_markdown_skips_invalid_lines() {
         markdown.contains(&trace2.run_id),
         "index.md 应包含第二个 run_id"
     );
+}
+
+#[test]
+fn trace_json_roundtrip_contains_memory_dropped_details() {
+    let workspace = temp_workspace();
+    let mut trace = AgentRunTrace::new(&workspace, "测试", AgentRunContext::agent_demo());
+    trace.memory_dropped_count = 1;
+    trace.memory_dropped.push(DroppedMemoryItem {
+        id: "mem-drop-1".to_string(),
+        content_preview: "被预算裁掉的记忆预览".to_string(),
+        drop_reason: "budget_exceeded".to_string(),
+    });
+    trace.finish_success("结果", std::time::Duration::from_secs(1));
+    let json_path = trace.persist().expect("persist 失败");
+
+    // trace JSON 应包含 memory_dropped 明细
+    let payload: Value =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).expect("读取 trace 文件失败"))
+            .expect("trace JSON 应合法");
+    assert_eq!(payload["memory_dropped"][0]["id"], "mem-drop-1");
+    assert_eq!(
+        payload["memory_dropped"][0]["drop_reason"],
+        "budget_exceeded"
+    );
+    assert_eq!(
+        payload["memory_dropped"][0]["content_preview"],
+        "被预算裁掉的记忆预览"
+    );
+
+    // index.jsonl 行应可反序列化且保留明细
+    let index_path = json_path.parent().expect("应有父目录").join("index.jsonl");
+    let index_content = std::fs::read_to_string(&index_path).expect("读取 index.jsonl 失败");
+    let last_line = index_content.lines().last().expect("应至少有一行");
+    let entry: AgentTraceIndexEntry =
+        serde_json::from_str(last_line).expect("index 行应可反序列化");
+    assert_eq!(entry.memory_dropped.len(), 1);
+    assert_eq!(entry.memory_dropped[0].id, "mem-drop-1");
+    assert_eq!(entry.memory_dropped[0].drop_reason, "budget_exceeded");
+}
+
+#[test]
+fn trace_index_backcompat_missing_memory_dropped_defaults_to_empty() {
+    let legacy_line = r#"{
+            "trace_version":"agent_trace_v1",
+            "run_id":"run-legacy",
+            "started_at":"2026-04-01T00:00:00Z",
+            "finished_at":"2026-04-01T00:00:01Z",
+            "duration_ms":1,
+            "success":true,
+            "user_input":"legacy",
+            "user_input_chars":6,
+            "source_type":"agent_demo",
+            "trigger_type":null,
+            "user_id":null,
+            "message_ids":[],
+            "message_count":0,
+            "task_id":null,
+            "article_id":null,
+            "session_text_chars":0,
+            "context_token_present":false,
+            "step_count":1,
+            "llm_call_count":0,
+            "tool_call_count":0,
+            "observation_count":0,
+            "final_output_chars":null,
+            "error":null,
+            "llm_fallback_reason":null,
+            "memory_hit_count":0,
+            "memory_retrieved_count":0,
+            "memory_total_chars":0,
+            "memory_dropped_count":1,
+            "json_file":"legacy.json",
+            "markdown_file":"legacy.md"
+        }"#;
+
+    let entry: AgentTraceIndexEntry =
+        serde_json::from_str(legacy_line).expect("旧版 index 行应可反序列化");
+    assert_eq!(entry.memory_dropped_count, 1);
+    assert!(entry.memory_dropped.is_empty());
+}
+
+#[test]
+fn trace_markdown_renders_memory_dropped_details() {
+    let workspace = temp_workspace();
+    let mut trace = AgentRunTrace::new(&workspace, "测试", AgentRunContext::agent_demo());
+    trace.memory_dropped_count = 2;
+    trace.memory_dropped.push(DroppedMemoryItem {
+        id: "mem-drop-1".to_string(),
+        content_preview: "重复记忆预览".to_string(),
+        drop_reason: "deduplicated".to_string(),
+    });
+    trace.memory_dropped.push(DroppedMemoryItem {
+        id: "mem-drop-2".to_string(),
+        content_preview: "超长记忆预览".to_string(),
+        drop_reason: "single_item_too_long".to_string(),
+    });
+
+    let rendered = trace.to_markdown();
+    assert!(rendered.contains("## Dropped Memories"));
+    assert!(rendered.contains("- id=mem-drop-1 reason=deduplicated preview=重复记忆预览"));
+    assert!(rendered.contains("- id=mem-drop-2 reason=single_item_too_long preview=超长记忆预览"));
 }

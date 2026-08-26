@@ -1410,6 +1410,15 @@ pub(crate) fn project_session_state_to_trace(
         trace.memory_total_chars = session_state.injected_total_chars();
         trace.memory_injected_total_chars = session_state.injected_total_chars();
         trace.memory_dropped_count = session_state.dropped.len();
+        trace.memory_dropped = session_state
+            .dropped
+            .iter()
+            .map(|item| super::DroppedMemoryItem {
+                id: item.id.clone(),
+                content_preview: item.content_preview.clone(),
+                drop_reason: item.reason.as_str().to_string(),
+            })
+            .collect();
         trace.memory_ids = session_state.injected_ids();
     }
     if session_state.has_retrieval_observability() {

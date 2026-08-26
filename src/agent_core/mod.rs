@@ -46,7 +46,9 @@ pub(crate) use self::recovery::{
 };
 pub(crate) use self::retriever_factory::{select_retriever, RetrieverMode};
 #[allow(unused_imports)]
-pub(crate) use self::trace::{AgentRunTrace, AgentTraceIndexEntry, ObservationTrace};
+pub(crate) use self::trace::{
+    AgentRunTrace, AgentTraceIndexEntry, DroppedMemoryItem, ObservationTrace,
+};
 pub(crate) use self::types::{
     normalize_optional_text, observation_kind_for_action, resulting_source_name,
 };

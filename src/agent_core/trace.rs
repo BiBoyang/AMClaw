@@ -69,6 +69,7 @@ pub(crate) struct AgentRunTrace {
     pub(crate) memory_total_chars: usize, // 注入记忆的总字符数（= injected_total_chars）
     pub(crate) memory_injected_total_chars: usize, // 兼容字段：与 memory_total_chars 同值
     pub(crate) memory_dropped_count: usize, // 被裁剪掉的记忆条数
+    pub(crate) memory_dropped: Vec<DroppedMemoryItem>, // 被裁剪记忆的明细（id/preview/reason）
     pub(crate) memory_ids: Vec<String>, // 注入记忆的 ID 列表
     // --- Retriever-level observability ---
     pub(crate) retriever_name: String,           // 使用的检索器名称
@@ -95,6 +96,14 @@ pub(crate) struct AgentRunTrace {
     pub(super) user_session_state: Option<UserSessionStateRecord>,
     #[serde(skip_serializing)]
     pub(super) trace_dir_root: PathBuf,
+}
+
+/// 被预算裁剪掉的记忆明细（投影自 SessionState.dropped）
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub(crate) struct DroppedMemoryItem {
+    pub(crate) id: String,
+    pub(crate) content_preview: String,
+    pub(crate) drop_reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -326,6 +335,9 @@ pub(crate) struct AgentTraceIndexEntry {
     pub(crate) memory_dropped_count: usize,
 
     #[serde(default)]
+    pub(crate) memory_dropped: Vec<DroppedMemoryItem>,
+
+    #[serde(default)]
     pub(crate) recovery_attempt_count: usize,
 
     #[serde(default)]
@@ -431,6 +443,7 @@ impl AgentRunTrace {
             memory_total_chars: 0,
             memory_injected_total_chars: 0,
             memory_dropped_count: 0,
+            memory_dropped: Vec::new(),
             memory_ids: Vec::new(),
             retriever_name: String::new(),
             retrieval_candidate_count: 0,
@@ -931,6 +944,7 @@ impl AgentRunTrace {
             memory_total_chars: self.memory_total_chars,
             memory_injected_total_chars: self.memory_total_chars,
             memory_dropped_count: self.memory_dropped_count,
+            memory_dropped: self.memory_dropped.clone(),
             recovery_attempt_count: self.recovery_attempts.len(),
             recovery_success_count: self
                 .recovery_attempts
@@ -1109,13 +1123,28 @@ impl AgentRunTrace {
                 "- retrieval_scores_present: {}",
                 self.retrieval_scores_present
             ),
+        ];
+
+        if !self.memory_dropped.is_empty() {
+            lines.push(String::new());
+            lines.push("## Dropped Memories".to_string());
+            lines.push(String::new());
+            for item in &self.memory_dropped {
+                lines.push(format!(
+                    "- id={} reason={} preview={}",
+                    item.id, item.drop_reason, item.content_preview
+                ));
+            }
+        }
+
+        lines.extend([
             String::new(),
             "## User Input".to_string(),
             String::new(),
             "```text".to_string(),
             self.user_input.clone(),
             "```".to_string(),
-        ];
+        ]);
 
         lines.push(String::new());
         lines.push("## Upstream Messages".to_string());

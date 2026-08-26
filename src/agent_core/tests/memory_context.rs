@@ -1,10 +1,10 @@
 use super::super::{
-    load_business_context_snapshot, persist_failure_lesson, AgentRunContext, AgentRunTrace,
-    DropReason, MemoryBudget,
+    load_business_context_snapshot, persist_failure_lesson, project_session_state_to_trace,
+    AgentRunContext, AgentRunTrace, DropReason, MemoryBudget, SessionState,
 };
 use super::{temp_db_path, temp_workspace};
 use crate::retriever::rule::RuleRetriever;
-use crate::task_store::{MemoryType, TaskStore};
+use crate::task_store::{MemoryType, TaskStore, UserMemoryRecord};
 
 #[test]
 fn business_context_snapshot_reads_user_memories() {
@@ -540,4 +540,46 @@ fn failure_lesson_skips_when_context_missing() {
         .list_user_memories("user-fail", 10)
         .expect("查询 user_memory 失败");
     assert!(memories.is_empty(), "上下文缺失时不应写入任何记忆");
+}
+
+/// project_session_state_to_trace 应把 dropped 明细（id/preview/reason）投影进 trace。
+#[test]
+fn project_session_state_to_trace_projects_dropped_details() {
+    let workspace = temp_workspace();
+    let mut trace = AgentRunTrace::new(&workspace, "帮我总结", AgentRunContext::agent_demo());
+
+    let mut session_state = SessionState::default();
+    session_state.retrieved.push(UserMemoryRecord {
+        id: "mem-keep-1".to_string(),
+        user_id: "user-x".to_string(),
+        content: "保留的记忆".to_string(),
+        memory_type: MemoryType::UserPreference,
+        status: "active".to_string(),
+        priority: 80,
+        last_used_at: None,
+        use_count: 0,
+        retrieved_count: 0,
+        injected_count: 0,
+        useful: false,
+        created_at: "2026-08-26T00:00:00Z".to_string(),
+        updated_at: "2026-08-26T00:00:00Z".to_string(),
+    });
+    session_state
+        .dropped
+        .push(super::super::context_assembly::DroppedMemory {
+            id: "mem-drop-1".to_string(),
+            content_preview: "被预算裁掉的记忆预览".to_string(),
+            reason: DropReason::BudgetExceeded,
+        });
+
+    project_session_state_to_trace(&mut trace, &session_state);
+
+    assert_eq!(trace.memory_dropped_count, 1);
+    assert_eq!(trace.memory_dropped.len(), 1);
+    assert_eq!(trace.memory_dropped[0].id, "mem-drop-1");
+    assert_eq!(trace.memory_dropped[0].drop_reason, "budget_exceeded");
+    assert_eq!(
+        trace.memory_dropped[0].content_preview,
+        "被预算裁掉的记忆预览"
+    );
 }
